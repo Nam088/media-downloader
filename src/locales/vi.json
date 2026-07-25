@@ -5,6 +5,7 @@
   "nav": {
     "home": "Trang chủ",
     "history": "Lịch sử",
+    "logs": "Nhật ký",
     "settings": "Cài đặt"
   },
   "common": {
@@ -16,7 +17,9 @@
   "settings": {
     "theme_label": "Giao diện",
     "language_label": "Ngôn ngữ",
-    "default_output_directory_label": "Thư mục lưu mặc định"
+    "default_output_directory_label": "Thư mục lưu mặc định",
+    "show_logs_tab_label": "Hiện tab Nhật ký",
+    "show_logs_tab_hint": "Thêm tab Nhật ký hiển thị hoạt động gần đây của backend — hữu ích khi cần debug lượt tải bị lỗi"
   },
   "theme": {
     "toggle_label": "Đổi giao diện",
@@ -84,6 +87,9 @@
     "download_gallery_button": "Tải xuống",
     "added_to_queue": "Đã thêm vào hàng đợi tải",
     "gallery_item_count": "Tìm thấy {{count}} tệp",
+    "gallery_selected_count": "Đã chọn {{selected}}/{{total}} ảnh",
+    "gallery_select_all": "Chọn tất cả",
+    "gallery_select_none": "Bỏ chọn hết",
     "gallery_mode_label": "Muốn tải gì",
     "gallery_mode_files": "Tất cả tệp",
     "gallery_mode_files_hint": "Mọi ảnh và âm thanh, giữ nguyên gốc",
@@ -94,6 +100,13 @@
     "gallery_mode_slideshow": "Ghép thành video",
     "gallery_mode_slideshow_hint": "Ghép ảnh và âm thanh thành 1 video slideshow",
     "gallery_mode_slideshow_unavailable": "Không tìm thấy âm thanh — không thể ghép video cho liên kết này"
+  },
+  "logs": {
+    "description": "Hoạt động gần đây của backend — job lỗi, thử lại, và các quyết định dự phòng. Hữu ích để tìm hiểu vì sao một lượt tải không như mong đợi.",
+    "empty": "Chưa có mục nhật ký nào.",
+    "copy_all": "Sao chép tất cả",
+    "clear": "Xoá",
+    "copied": "Đã sao chép nhật ký"
   },
   "errors": {
     "UNSUPPORTED_PLATFORM": "Liên kết này không thuộc nền tảng được hỗ trợ.",

@@ -40,6 +40,11 @@ pub struct CreateJobInput {
     pub video_quality: Option<String>,
     #[serde(default)]
     pub gallery_mode: Option<GalleryModeInput>,
+    /// A user-picked subset of the preview's `gallery_items`, as 0-based
+    /// indices into that array, to actually download — `None`/omitted means
+    /// everything. See `models::DownloadJob.selected_gallery_indices`.
+    #[serde(default)]
+    pub selected_gallery_indices: Option<Vec<u32>>,
     pub output_directory: String,
     #[serde(default)]
     pub playlist_scope: Option<PlaylistScope>,
@@ -111,6 +116,15 @@ fn validate_quality(preview: &crate::models::MediaSource, input: &CreateJobInput
                     "gallery_mode is required for gallery downloads",
                 ));
             }
+            // Never trust frontend-supplied indices without bounds-checking
+            // them against this exact preview's real item count (FR-019) —
+            // same integrity rule as audio/video quality above.
+            if let Some(selected) = &input.selected_gallery_indices {
+                let item_count = preview.gallery_items.len() as u32;
+                if selected.is_empty() || !selected.iter().all(|index| *index < item_count) {
+                    return Err(AppError::invalid_quality_option());
+                }
+            }
         }
     }
     Ok(())
@@ -123,6 +137,7 @@ struct NewJobArgs {
     audio_quality: Option<String>,
     video_quality: Option<String>,
     gallery_mode: Option<GalleryModeInput>,
+    selected_gallery_indices: Option<Vec<u32>>,
     output_directory: String,
     is_playlist_item: bool,
     parent_playlist_id: Option<String>,
@@ -147,6 +162,7 @@ fn new_job(args: NewJobArgs) -> DownloadJob {
             GalleryModeInput::ImagesOnly => GalleryMode::ImagesOnly,
             GalleryModeInput::Slideshow => GalleryMode::Slideshow,
         }),
+        selected_gallery_indices: args.selected_gallery_indices,
         status: JobStatus::Queued,
         progress_percent: 0.0,
         speed_bytes_per_sec: None,
@@ -198,9 +214,17 @@ pub async fn create_download_job(
                 source_url: entry_url,
                 platform,
                 media_type: input.media_type,
-                audio_quality: None,
-                video_quality: None,
+                // A flat-playlist preview has no per-entry format list to
+                // validate against (see `validate_quality`'s early return
+                // for playlists), but the user can still pick a general
+                // quality preference in the form — passed through as-is to
+                // every fanned-out entry, exactly like a single-item job,
+                // rather than always forcing yt-dlp's own "best" regardless
+                // of what was actually selected.
+                audio_quality: input.audio_quality.clone(),
+                video_quality: input.video_quality.clone(),
                 gallery_mode: None,
+                selected_gallery_indices: None,
                 output_directory: input.output_directory.clone(),
                 is_playlist_item: true,
                 parent_playlist_id: Some(parent_playlist_id.clone()),
@@ -224,6 +248,7 @@ pub async fn create_download_job(
         audio_quality: input.audio_quality,
         video_quality: input.video_quality,
         gallery_mode: input.gallery_mode,
+        selected_gallery_indices: input.selected_gallery_indices,
         output_directory: input.output_directory,
         is_playlist_item: false,
         parent_playlist_id: None,

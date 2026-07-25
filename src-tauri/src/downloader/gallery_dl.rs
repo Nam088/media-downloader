@@ -56,12 +56,25 @@ pub struct GalleryEntry {
 /// `content`, Pixiv's is `title`, TikTok's is `desc`, ...), so there is no
 /// single universal field — `title` tries a handful of common candidate keys
 /// across every message's metadata and falls back to `"{category} post"`.
+///
+/// `queue_url` is set instead of `entries` when the source only yields a
+/// `Message.Queue` — some extractors (e.g. Imgur's "gallery" URL form, as
+/// opposed to its "album" form) don't resolve directly to files at all, just
+/// to another URL a (possibly different) extractor actually handles.
+/// `dump_gallery_json` follows this once on the caller's behalf so gallery
+/// posts like that don't come back looking empty/unsupported.
 #[derive(Debug, Clone)]
 pub struct GalleryDump {
     pub entries: Vec<GalleryEntry>,
     pub title: Option<String>,
     pub category: Option<String>,
+    pub queue_url: Option<String>,
 }
+
+/// `dump_gallery_json` follows at most this many `Message.Queue` hops before
+/// giving up, so a pathological queue-pointing-to-queue chain can't recurse
+/// unboundedly.
+const MAX_QUEUE_HOPS: u32 = 3;
 
 #[derive(Debug, Clone, Default)]
 pub struct GalleryProgressUpdate {
@@ -98,53 +111,103 @@ async fn spawn_gallery_dl(app: &AppHandle, args: Vec<String>) -> Result<Child, A
 /// fallback path when yt-dlp itself has no extractor for a URL (or the URL
 /// resolves to an image/gallery post yt-dlp can't represent, e.g. a TikTok
 /// slideshow — see `research.md` §2's gallery-dl amendment).
+///
+/// Some extractors (confirmed on Imgur's "gallery" URL form, as opposed to
+/// its "album" form) don't yield files directly — just a `Message.Queue`
+/// pointing at the URL that actually does. Rather than surface that as an
+/// empty/unsupported result, this follows it automatically, up to
+/// `MAX_QUEUE_HOPS` times. `on_spawn` may be called more than once (once per
+/// hop) — only the most recently spawned child is ever relevant for
+/// cancellation, since earlier ones have already exited by the time a next
+/// hop starts.
 pub async fn dump_gallery_json(
     app: &AppHandle,
     url: &str,
-    on_spawn: impl FnOnce(GalleryDlChild),
+    on_spawn: impl Fn(GalleryDlChild),
 ) -> Result<GalleryDump, AppError> {
-    let args = vec!["--dump-json".into(), "--no-download".into(), url.to_string()];
+    let mut current_url = url.to_string();
+    let mut last_dump = None;
 
-    let mut child = spawn_gallery_dl(app, args).await?;
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
-    let child = Arc::new(Mutex::new(child));
-    on_spawn(Arc::clone(&child));
+    for _ in 0..MAX_QUEUE_HOPS {
+        let args = vec!["--dump-json".into(), "--no-download".into(), current_url.clone()];
 
-    let stdout_task = tokio::spawn(read_all(stdout));
-    let stderr_task = tokio::spawn(read_all(stderr));
+        let mut child = spawn_gallery_dl(app, args).await?;
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
+        let child = Arc::new(Mutex::new(child));
+        on_spawn(Arc::clone(&child));
 
-    let status = child.lock().await.wait().await.map_err(AppError::internal)?;
-    let stdout_buf = stdout_task.await.map_err(AppError::internal)?;
-    let stderr_buf = stderr_task.await.map_err(AppError::internal)?;
+        let stdout_task = tokio::spawn(read_all(stdout));
+        let stderr_task = tokio::spawn(read_all(stderr));
 
-    if !status.success() {
-        return Err(classify_gallery_dl_error(&stderr_buf));
+        let status = child.lock().await.wait().await.map_err(AppError::internal)?;
+        let stdout_buf = stdout_task.await.map_err(AppError::internal)?;
+        let stderr_buf = stderr_task.await.map_err(AppError::internal)?;
+
+        if !status.success() {
+            return Err(classify_gallery_dl_error(&stderr_buf));
+        }
+
+        let dump = parse_dump_json(&stdout_buf)?;
+        match &dump.queue_url {
+            Some(next_url) if dump.entries.is_empty() => {
+                current_url = next_url.clone();
+                last_dump = Some(dump);
+            }
+            _ => return Ok(dump),
+        }
     }
 
-    parse_dump_json(&stdout_buf)
+    Ok(last_dump.unwrap_or(GalleryDump {
+        entries: Vec::new(),
+        title: None,
+        category: None,
+        queue_url: None,
+    }))
 }
 
-/// Downloads every item gallery-dl finds for `url` into `output_dir`
-/// (expected to already be a job-exclusive directory — gallery-dl's `-D`
-/// flag downloads directly into it with no `category/title/` nesting, so a
-/// shared folder like the user's chosen Downloads directory would otherwise
-/// mix unrelated files together with no reliable way to tell which ones this
-/// job created). Returns the final list of downloaded file paths.
+/// Downloads from `url` (the original post URL — NOT individual item URLs;
+/// see below) into `output_dir` (expected to already be a job-exclusive
+/// directory — gallery-dl's `-D` flag downloads directly into it with no
+/// `category/title/` nesting, so a shared folder like the user's chosen
+/// Downloads directory would otherwise mix unrelated files together with no
+/// reliable way to tell which ones this job created). `range` (gallery-dl's
+/// own `--range`, e.g. `"1,3,5"` or `"1-3"`) optionally narrows which of the
+/// post's own items get fetched, matching gallery-dl's own 1-based item
+/// numbering exactly — pass `None` for everything. Returns the final list
+/// of downloaded file paths.
+///
+/// Earlier version of this function accepted an explicit list of individual
+/// item URLs (extracted from an earlier `--dump-json`) and downloaded each
+/// directly instead of re-crawling the post — confirmed broken in
+/// production: TikTok's per-item CDN URLs are short-lived and signed
+/// per-request (re-submitting one in a fresh invocation 404s/"Unsupported
+/// URL"s), and gallery-dl's on-disk filename for a crawled item doesn't
+/// match its own `filename` metadata field closely enough to predict ahead
+/// of time either (confirmed empirically on both TikTok and Imgur — same
+/// item, two different resulting filenames depending on whether it was
+/// reached via a direct URL vs. a full crawl). `--range` avoids both
+/// problems entirely: it's gallery-dl's own selection mechanism, evaluated
+/// during a real crawl of `url`, not a client-side guess.
 pub async fn run_gallery_download(
     app: &AppHandle,
     url: &str,
+    range: Option<&str>,
     output_dir: &str,
     total_files: u32,
     mut on_progress: impl FnMut(GalleryProgressUpdate) + Send + 'static,
 ) -> Result<Vec<String>, AppError> {
-    let args = vec![
+    let mut args = vec![
         "-D".into(),
         output_dir.to_string(),
         "--Print".into(),
         format!("after:{FILE_DONE_MARKER}{{filename}}"),
-        url.to_string(),
     ];
+    if let Some(range) = range {
+        args.push("--range".into());
+        args.push(range.to_string());
+    }
+    args.push(url.to_string());
 
     let mut child = spawn_gallery_dl(app, args).await?;
     let stdout = child.stdout.take().expect("stdout was piped");
@@ -196,20 +259,28 @@ fn parse_dump_json(raw: &str) -> Result<GalleryDump, AppError> {
             entries: Vec::new(),
             title: None,
             category: None,
+            queue_url: None,
         });
     }
     let messages: Vec<serde_json::Value> = serde_json::from_str(trimmed).map_err(AppError::internal)?;
 
+    const MESSAGE_DIRECTORY: i64 = 2; // gallery_dl.extractor.message.Message.Directory
     const MESSAGE_URL: i64 = 3; // gallery_dl.extractor.message.Message.Url
+    const MESSAGE_QUEUE: i64 = 6; // gallery_dl.extractor.message.Message.Queue
 
     let mut entries = Vec::new();
     let mut title: Option<String> = None;
     let mut category: Option<String> = None;
+    let mut queue_url: Option<String> = None;
 
     for message in &messages {
         let Some(tuple) = message.as_array() else { continue };
         let Some(msg_type) = tuple.first().and_then(|v| v.as_i64()) else { continue };
-        let metadata = tuple.get(if msg_type == MESSAGE_URL { 2 } else { 1 });
+        // Directory is `[type, metadata]`; both Url and Queue carry a URL as
+        // their 2nd element and metadata as their 3rd (`[type, url, meta]`) —
+        // confirmed empirically against a real Imgur "gallery" URL, which
+        // yields exactly a Queue message shaped that way.
+        let metadata = tuple.get(if msg_type == MESSAGE_DIRECTORY { 1 } else { 2 });
 
         if category.is_none() {
             category = metadata
@@ -228,6 +299,13 @@ fn parse_dump_json(raw: &str) -> Result<GalleryDump, AppError> {
             });
         }
 
+        if msg_type == MESSAGE_QUEUE {
+            if queue_url.is_none() {
+                queue_url = tuple.get(1).and_then(|v| v.as_str()).map(String::from);
+            }
+            continue;
+        }
+
         if msg_type != MESSAGE_URL {
             continue;
         }
@@ -244,7 +322,7 @@ fn parse_dump_json(raw: &str) -> Result<GalleryDump, AppError> {
                 .map(String::from),
         });
     }
-    Ok(GalleryDump { entries, title, category })
+    Ok(GalleryDump { entries, title, category, queue_url })
 }
 
 async fn read_all(mut reader: impl tokio::io::AsyncRead + Unpin) -> String {
@@ -306,6 +384,38 @@ mod tests {
     #[test]
     fn empty_output_yields_an_empty_list_instead_of_an_error() {
         assert!(parse_dump_json("").unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn captures_a_queue_message_url_when_there_are_no_direct_entries() {
+        // Regression test: some extractors (confirmed on Imgur's "gallery"
+        // URL form) don't yield files directly, just a Message.Queue
+        // pointing at the URL that actually does — the shape is
+        // `[6, url, metadata]`, same as Message.Url's `[3, url, metadata]`.
+        let raw = json!([
+            [6, "https://example.com/resolved-album", {"category": "imgur", "subcategory": "gallery"}],
+        ])
+        .to_string();
+
+        let dump = parse_dump_json(&raw).unwrap();
+        assert!(dump.entries.is_empty());
+        assert_eq!(dump.queue_url.as_deref(), Some("https://example.com/resolved-album"));
+        assert_eq!(dump.category.as_deref(), Some("imgur"));
+    }
+
+    #[test]
+    fn ignores_queue_url_when_direct_entries_are_already_present() {
+        let raw = json!([
+            [3, "https://example.com/a.jpg", {"extension": "jpg"}],
+            [6, "https://example.com/unrelated", {"category": "x"}],
+        ])
+        .to_string();
+
+        let dump = parse_dump_json(&raw).unwrap();
+        assert_eq!(dump.entries.len(), 1);
+        // Still captured (harmless) — `dump_gallery_json` is what decides to
+        // ignore it when entries are already non-empty.
+        assert_eq!(dump.queue_url.as_deref(), Some("https://example.com/unrelated"));
     }
 
     #[test]

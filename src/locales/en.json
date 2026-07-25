@@ -5,6 +5,7 @@
   "nav": {
     "home": "Home",
     "history": "History",
+    "logs": "Logs",
     "settings": "Settings"
   },
   "common": {
@@ -16,7 +17,9 @@
   "settings": {
     "theme_label": "Theme",
     "language_label": "Language",
-    "default_output_directory_label": "Default save folder"
+    "default_output_directory_label": "Default save folder",
+    "show_logs_tab_label": "Show Logs tab",
+    "show_logs_tab_hint": "Adds a Logs tab with recent backend activity — useful for debugging a failed download"
   },
   "theme": {
     "toggle_label": "Change theme",
@@ -85,6 +88,9 @@
     "added_to_queue": "Added to the download queue",
     "gallery_item_count": "{{count}} file found",
     "gallery_item_count_other": "{{count}} files found",
+    "gallery_selected_count": "{{selected}} of {{total}} images selected",
+    "gallery_select_all": "Select all",
+    "gallery_select_none": "Select none",
     "gallery_mode_label": "What to download",
     "gallery_mode_files": "All files",
     "gallery_mode_files_hint": "Every image and audio track, as-is",
@@ -95,6 +101,13 @@
     "gallery_mode_slideshow": "Merged video",
     "gallery_mode_slideshow_hint": "Combine the images and audio into one slideshow video",
     "gallery_mode_slideshow_unavailable": "No audio track found — merged video isn't available for this link"
+  },
+  "logs": {
+    "description": "Recent backend activity — job failures, retries, and fallback decisions. Useful for figuring out why a download didn't behave as expected.",
+    "empty": "No log entries yet.",
+    "copy_all": "Copy all",
+    "clear": "Clear",
+    "copied": "Logs copied to clipboard"
   },
   "errors": {
     "UNSUPPORTED_PLATFORM": "This link is not from a supported platform.",

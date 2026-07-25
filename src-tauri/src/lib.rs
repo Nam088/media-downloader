@@ -2,6 +2,7 @@ mod commands;
 mod db;
 mod downloader;
 mod error;
+mod logging;
 mod models;
 mod platform;
 
@@ -10,6 +11,7 @@ use std::sync::Arc;
 use commands::media::{ActivePreviews, PreviewCache};
 use db::Db;
 use downloader::queue::DownloadQueue;
+use logging::LogBuffer;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -26,6 +28,7 @@ pub fn run() {
             app.manage(queue);
             app.manage(PreviewCache::default());
             app.manage(ActivePreviews::default());
+            app.manage(LogBuffer::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -41,6 +44,8 @@ pub fn run() {
             commands::history::list_queue,
             commands::history::list_history,
             commands::history::open_containing_folder,
+            logging::get_logs,
+            logging::clear_logs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

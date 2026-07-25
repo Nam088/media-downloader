@@ -65,6 +65,7 @@ export interface DownloadJob {
   audio_quality: string | null;
   video_quality: string | null;
   gallery_mode: GalleryMode | null;
+  selected_gallery_indices: number[] | null;
   status: JobStatus;
   progress_percent: number;
   speed_bytes_per_sec: number | null;
@@ -90,6 +91,7 @@ export interface CreateJobInput {
   audio_quality?: string;
   video_quality?: string;
   gallery_mode?: GalleryMode;
+  selected_gallery_indices?: number[];
   output_directory: string;
   playlist_scope?: "single_item" | "entire_playlist";
 }

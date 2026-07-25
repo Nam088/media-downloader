@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useTheme } from "next-themes";
-import { Download, Sparkles, Home as HomeIcon, History as HistoryIcon, Settings as SettingsIcon } from "lucide-react";
+import { Download, Sparkles, Home as HomeIcon, History as HistoryIcon, Settings as SettingsIcon, ScrollText } from "lucide-react";
 import { ThemeProvider } from "@/components/theme-provider";
 import { ComplianceDisclaimer } from "@/components/ComplianceDisclaimer";
 import { ThemeToggle } from "@/components/ThemeToggle";
@@ -11,8 +11,9 @@ import { useAppSettings } from "@/hooks/use-app-settings";
 import { Home } from "@/pages/Home";
 import { History } from "@/pages/History";
 import { Settings } from "@/pages/Settings";
+import { Logs } from "@/pages/Logs";
 
-type Route = "home" | "history" | "settings";
+type Route = "home" | "history" | "logs" | "settings";
 
 function useSyncBackendSettings() {
   const { settings } = useAppSettings();
@@ -29,11 +30,24 @@ function useSyncBackendSettings() {
 function AppShell() {
   const { t } = useTranslation();
   const [route, setRoute] = useState<Route>("home");
+  const { settings } = useAppSettings();
   useSyncBackendSettings();
 
+  // Derived at render time rather than corrected via a setState-in-effect
+  // redirect: if the Logs tab gets hidden (Settings toggle) while it's the
+  // active route, this just falls back to "home" for that render — no
+  // effect, no extra render pass.
+  const effectiveRoute: Route = route === "logs" && settings && !settings.show_logs_tab ? "home" : route;
+
+  // Hidden by default (models::AppSettings.show_logs_tab) — the Logs page is
+  // a debugging aid (job failures/retries/fallback decisions), not something
+  // most users need in the main nav; toggled on from Settings.
   const navItems: { id: Route; label: string; icon: typeof HomeIcon }[] = [
     { id: "home", label: t("nav.home", "Home"), icon: HomeIcon },
     { id: "history", label: t("nav.history", "History"), icon: HistoryIcon },
+    ...(settings?.show_logs_tab
+      ? [{ id: "logs" as const, label: t("nav.logs", "Logs"), icon: ScrollText }]
+      : []),
     { id: "settings", label: t("nav.settings", "Settings"), icon: SettingsIcon },
   ];
 
@@ -64,7 +78,7 @@ function AppShell() {
           {/* Flat Navbar Link Navigation */}
           <nav className="flex items-center gap-8">
             {navItems.map((item) => {
-              const isActive = route === item.id;
+              const isActive = effectiveRoute === item.id;
               const Icon = item.icon;
               return (
                 <button
@@ -96,13 +110,16 @@ function AppShell() {
 
       {/* Main Content with Smooth Spring-like CSS Animation */}
       <main className="flex-1 py-4">
-        <div className={route === "home" ? "block animate-in fade-in-50 slide-in-from-bottom-2 zoom-in-98 duration-300 ease-out" : "hidden"}>
+        <div className={effectiveRoute === "home" ? "block animate-in fade-in-50 slide-in-from-bottom-2 zoom-in-98 duration-300 ease-out" : "hidden"}>
           <Home />
         </div>
-        <div className={route === "history" ? "block animate-in fade-in-50 slide-in-from-bottom-2 zoom-in-98 duration-300 ease-out" : "hidden"}>
+        <div className={effectiveRoute === "history" ? "block animate-in fade-in-50 slide-in-from-bottom-2 zoom-in-98 duration-300 ease-out" : "hidden"}>
           <History />
         </div>
-        <div className={route === "settings" ? "block animate-in fade-in-50 slide-in-from-bottom-2 zoom-in-98 duration-300 ease-out" : "hidden"}>
+        <div className={effectiveRoute === "logs" ? "block animate-in fade-in-50 slide-in-from-bottom-2 zoom-in-98 duration-300 ease-out" : "hidden"}>
+          <Logs />
+        </div>
+        <div className={effectiveRoute === "settings" ? "block animate-in fade-in-50 slide-in-from-bottom-2 zoom-in-98 duration-300 ease-out" : "hidden"}>
           <Settings />
         </div>
       </main>

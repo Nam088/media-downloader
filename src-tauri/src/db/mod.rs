@@ -13,6 +13,9 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/0001_init.sql")),
         M::up(include_str!("migrations/0002_gallery_support.sql")),
         M::up(include_str!("migrations/0003_gallery_images_only_mode.sql")),
+        M::up(include_str!("migrations/0004_settings_key_value.sql")),
+        M::up(include_str!("migrations/0005_fix_stale_app_settings_schema.sql")),
+        M::up(include_str!("migrations/0006_gallery_selected_urls.sql")),
     ])
 }
 
@@ -53,13 +56,21 @@ impl Db {
 
     pub fn insert_job(&self, job: &DownloadJob) -> Result<(), AppError> {
         let conn = self.conn();
+        // Column is still named `selected_gallery_urls` (from when this held
+        // URL strings) but now holds a JSON array of indices — renaming the
+        // column isn't worth another migration for a dev-only field.
+        let selected_gallery_indices_json = job
+            .selected_gallery_indices
+            .as_ref()
+            .map(|indices| serde_json::to_string(indices).expect("Vec<u32> always serializes"));
         conn.execute(
             "INSERT INTO download_jobs (
                 id, source_url, platform, media_type, audio_quality, video_quality,
-                gallery_mode, status, progress_percent, speed_bytes_per_sec, eta_seconds,
-                error_message, output_directory, output_file_path, is_playlist_item,
-                parent_playlist_id, retried_from_job_id, created_at, updated_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                gallery_mode, selected_gallery_urls, status, progress_percent,
+                speed_bytes_per_sec, eta_seconds, error_message, output_directory,
+                output_file_path, is_playlist_item, parent_playlist_id,
+                retried_from_job_id, created_at, updated_at
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 job.id,
                 job.source_url,
@@ -68,6 +79,7 @@ impl Db {
                 job.audio_quality,
                 job.video_quality,
                 job.gallery_mode.as_ref().map(gallery_mode_str),
+                selected_gallery_indices_json,
                 job.status.as_str(),
                 job.progress_percent,
                 job.speed_bytes_per_sec,
@@ -201,30 +213,46 @@ impl Db {
         .map_err(AppError::from)
     }
 
-    // ---- app_settings ---------------------------------------------------
+    // ---- app_settings (generic key-value — new settings need no migration) --
+
+    /// Reads `key`, lazily creating it with `default` if it's never been set
+    /// (a fresh install, or a setting introduced after the user's db was
+    /// created) — self-healing instead of requiring every setting to have
+    /// been seeded by a migration up front.
+    fn get_setting_or_default(conn: &Connection, key: &str, default: &str) -> Result<String, AppError> {
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
+            params![key, default],
+        )?;
+        conn.query_row("SELECT value FROM app_settings WHERE key = ?1", params![key], |row| row.get(0))
+            .map_err(AppError::from)
+    }
+
+    fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), AppError> {
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
 
     pub fn get_settings(&self) -> Result<AppSettings, AppError> {
         let conn = self.conn();
-        conn.query_row(
-            "SELECT theme, language, default_output_directory FROM app_settings WHERE id = 1",
-            [],
-            |row| {
-                Ok(AppSettings {
-                    theme: row.get(0)?,
-                    language: row.get(1)?,
-                    default_output_directory: row.get(2)?,
-                })
-            },
-        )
-        .map_err(AppError::from)
+        Ok(AppSettings {
+            theme: Self::get_setting_or_default(&conn, "theme", "system")?,
+            language: Self::get_setting_or_default(&conn, "language", "system")?,
+            default_output_directory: Self::get_setting_or_default(&conn, "default_output_directory", "")?,
+            show_logs_tab: Self::get_setting_or_default(&conn, "show_logs_tab", "0")? != "0",
+        })
     }
 
     pub fn update_settings(&self, settings: &AppSettings) -> Result<(), AppError> {
         let conn = self.conn();
-        conn.execute(
-            "UPDATE app_settings SET theme = ?1, language = ?2, default_output_directory = ?3 WHERE id = 1",
-            params![settings.theme, settings.language, settings.default_output_directory],
-        )?;
+        Self::set_setting(&conn, "theme", &settings.theme)?;
+        Self::set_setting(&conn, "language", &settings.language)?;
+        Self::set_setting(&conn, "default_output_directory", &settings.default_output_directory)?;
+        Self::set_setting(&conn, "show_logs_tab", if settings.show_logs_tab { "1" } else { "0" })?;
         Ok(())
     }
 }
@@ -249,6 +277,7 @@ fn gallery_mode_str(gallery_mode: &GalleryMode) -> &'static str {
 fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<DownloadJob> {
     let media_type_raw: String = row.get("media_type")?;
     let gallery_mode_raw: Option<String> = row.get("gallery_mode")?;
+    let selected_gallery_indices_raw: Option<String> = row.get("selected_gallery_urls")?;
     let status_raw: String = row.get("status")?;
     Ok(DownloadJob {
         id: row.get("id")?,
@@ -268,6 +297,8 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<DownloadJob> {
             "slideshow" => Some(GalleryMode::Slideshow),
             _ => None,
         }),
+        selected_gallery_indices: selected_gallery_indices_raw
+            .and_then(|raw| serde_json::from_str::<Vec<u32>>(&raw).ok()),
         status: JobStatus::from_str(&status_raw).unwrap_or(JobStatus::Failed),
         progress_percent: row.get("progress_percent")?,
         speed_bytes_per_sec: row.get("speed_bytes_per_sec")?,

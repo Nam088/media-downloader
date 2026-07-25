@@ -83,6 +83,23 @@ pub struct DownloadJob {
     pub audio_quality: Option<String>,
     pub video_quality: Option<String>,
     pub gallery_mode: Option<GalleryMode>,
+    /// A user-picked subset of `MediaSource.gallery_items` to actually
+    /// download (checkbox grid in the gallery preview), as 0-based indices
+    /// into that same `gallery_items` array — `None` means no selection was
+    /// made, i.e. everything. Never restricts the audio track, only which
+    /// images: audio inclusion is entirely governed by `gallery_mode`
+    /// (`AudioOnly`/`Slideshow` need it, `Files`/`ImagesOnly` keep or drop it
+    /// regardless of this field).
+    ///
+    /// Indices, not URLs: `downloader::queue::run_gallery_job` re-dumps the
+    /// post right before the real download and applies these same ordinal
+    /// positions to *that* fresh dump (via gallery-dl's own `--range`) —
+    /// matching by position rather than by URL value, since a site's own
+    /// item order for a given, unchanged post is stable across separate
+    /// crawls even when its per-item URLs aren't (confirmed on TikTok: fresh,
+    /// short-lived, signed CDN URLs every single crawl, but the same 2
+    /// images + 1 audio track in the same order every time).
+    pub selected_gallery_indices: Option<Vec<u32>>,
     pub status: JobStatus,
     pub progress_percent: f64,
     pub speed_bytes_per_sec: Option<i64>,
@@ -154,6 +171,26 @@ pub struct MediaSource {
     /// always empty.
     pub is_gallery: bool,
     pub gallery_items: Vec<GalleryItemPreview>,
+    /// One entry per item in a flat-playlist preview (empty when
+    /// `!is_playlist`) — lets the frontend list every video in a playlist
+    /// individually (title/duration/thumbnail) instead of only offering an
+    /// all-or-nothing "entire playlist" fetch, and pick a different
+    /// media type/quality per item (`commands::download::PlaylistItemJobInput`).
+    pub playlist_entries: Vec<PlaylistEntryPreview>,
+}
+
+/// One video in a flat-playlist preview. `title`/`duration_seconds`/
+/// `thumbnail_url` come straight from yt-dlp's own `--flat-playlist` entry
+/// metadata (no per-video format fetch — same reasoning as
+/// `available_video_qualities`'s doc comment: fetching real formats for
+/// every single playlist item up front doesn't scale, so quality choice for
+/// playlist items stays a generic, unvalidated label).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistEntryPreview {
+    pub url: String,
+    pub title: String,
+    pub duration_seconds: Option<i64>,
+    pub thumbnail_url: Option<String>,
 }
 
 /// Mirrors `data-model.md` §3 (DownloadedFile).
@@ -173,4 +210,8 @@ pub struct AppSettings {
     pub theme: String,
     pub language: String,
     pub default_output_directory: String,
+    /// Hidden by default — the Logs nav tab (job failures/retries/fallback
+    /// decisions) is a debugging aid, not something most users need to see
+    /// day to day.
+    pub show_logs_tab: bool,
 }

@@ -16,6 +16,7 @@ pub struct UpdateSettingsInput {
     pub theme: Option<String>,
     pub language: Option<String>,
     pub default_output_directory: Option<String>,
+    pub show_logs_tab: Option<bool>,
 }
 
 #[tauri::command]
@@ -32,6 +33,9 @@ pub fn update_settings(
     }
     if let Some(dir) = patch.default_output_directory {
         current.default_output_directory = dir;
+    }
+    if let Some(show_logs_tab) = patch.show_logs_tab {
+        current.show_logs_tab = show_logs_tab;
     }
     db.update_settings(&current)?;
     Ok(current)

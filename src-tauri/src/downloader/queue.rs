@@ -7,6 +7,7 @@ use tokio::sync::{watch, Mutex as AsyncMutex, Semaphore};
 
 use crate::db::Db;
 use crate::error::AppError;
+use crate::logging::log_event;
 use crate::models::{DownloadJob, GalleryMode, JobStatus, MediaType};
 
 use super::gallery_dl;
@@ -96,6 +97,14 @@ impl DownloadQueue {
             let _permit = semaphore.acquire().await;
             let result = run_job(&app, &db, &job, cancel_rx).await;
             if let Err(err) = result {
+                log_event(
+                    &app,
+                    "ERROR",
+                    format!(
+                        "Job {} failed ({} — {}): {}",
+                        job.id, job.platform, job.source_url, err.message
+                    ),
+                );
                 let _ = db.update_job_status(&job.id, JobStatus::Failed, Some(&err.message));
                 emit_status_changed(&app, &job.id, JobStatus::Failed, Some(err.message), None);
             }
@@ -159,6 +168,7 @@ impl DownloadQueue {
             audio_quality: original.audio_quality,
             video_quality: original.video_quality,
             gallery_mode: original.gallery_mode,
+            selected_gallery_indices: original.selected_gallery_indices,
             status: JobStatus::Queued,
             progress_percent: 0.0,
             speed_bytes_per_sec: None,
@@ -234,6 +244,14 @@ async fn run_job(
             Ok(path) => path,
             Err(err) => {
                 if attempt < MAX_DOWNLOAD_ATTEMPTS {
+                    log_event(
+                        app,
+                        "WARN",
+                        format!(
+                            "Job {} attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS} failed, retrying: {}",
+                            job.id, err.message
+                        ),
+                    );
                     continue;
                 }
                 return Err(err);
@@ -246,6 +264,11 @@ async fn run_job(
         // retries.
         if job.media_type == MediaType::Video && !ytdlp::output_has_audio_stream(&path).await {
             if attempt < MAX_DOWNLOAD_ATTEMPTS {
+                log_event(
+                    app,
+                    "WARN",
+                    format!("Job {} attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS}: downloaded video had no audio track, retrying", job.id),
+                );
                 let _ = tokio::fs::remove_file(&path).await;
                 continue;
             }
@@ -350,9 +373,29 @@ async fn run_gallery_job(
                 break;
             }
             Ok(d) if attempt == MAX_DOWNLOAD_ATTEMPTS => dump = Some(d),
-            Ok(_) => continue,
+            Ok(_) => {
+                log_event(
+                    app,
+                    "WARN",
+                    format!(
+                        "Gallery job {} dump attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS} found nothing, retrying",
+                        job.id
+                    ),
+                );
+                continue;
+            }
             Err(err) if attempt == MAX_DOWNLOAD_ATTEMPTS => last_dump_err = Some(err),
-            Err(_) => continue,
+            Err(err) => {
+                log_event(
+                    app,
+                    "WARN",
+                    format!(
+                        "Gallery job {} dump attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS} errored, retrying: {}",
+                        job.id, err.message
+                    ),
+                );
+                continue;
+            }
         }
     }
     let dump = dump.ok_or_else(|| {
@@ -363,7 +406,42 @@ async fn run_gallery_job(
             )
         })
     })?;
-    let total_files = dump.entries.len().max(1) as u32;
+    // Narrow to the user's selection (checkbox grid in the gallery preview),
+    // if one was made, via gallery-dl's own `--range` (item numbers in its
+    // own 1-based crawl order). Matched by *ordinal position*, not URL — see
+    // `models::DownloadJob.selected_gallery_indices`'s doc comment for why:
+    // a site's own item order for a given, unchanged post is stable across
+    // separate crawls even when its per-item URLs aren't (TikTok serves
+    // fresh, short-lived, signed CDN URLs every crawl, but the same items in
+    // the same order). The audio track's own index is always included
+    // regardless of what was selected — this only ever restricts which
+    // *images* get fetched; whether audio ends up kept is entirely
+    // `gallery_mode`'s call (`AudioOnly`/`Slideshow` need it,
+    // `Files`/`ImagesOnly` keep or drop it after the fact).
+    let resolved_indices: Option<Vec<usize>> = job.selected_gallery_indices.as_ref().map(|selected| {
+        dump.entries
+            .iter()
+            .enumerate()
+            .filter(|(i, entry)| {
+                let is_audio = entry.extension.as_deref().map(gallery_dl::is_audio_extension).unwrap_or(false);
+                is_audio || selected.contains(&(*i as u32))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    });
+    // Nothing usable to narrow to (an empty selection would otherwise
+    // silently download zero images), or the selection already covers
+    // everything — either way, no `--range` restriction at all.
+    let resolved_indices =
+        resolved_indices.filter(|indices| !indices.is_empty() && indices.len() < dump.entries.len());
+    let range: Option<String> = resolved_indices.as_ref().map(|indices| {
+        indices
+            .iter()
+            .map(|i| (i + 1).to_string()) // gallery-dl's --range is 1-based
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+    let total_files = resolved_indices.map(|indices| indices.len()).unwrap_or(dump.entries.len()).max(1) as u32;
 
     let folder_label = dump
         .title
@@ -386,6 +464,7 @@ async fn run_gallery_job(
         let download_fut = gallery_dl::run_gallery_download(
             app,
             &job.source_url,
+            range.as_deref(),
             &job_dir,
             total_files,
             move |update| {
@@ -415,6 +494,14 @@ async fn run_gallery_job(
             }
             Err(err) => {
                 if attempt < MAX_DOWNLOAD_ATTEMPTS {
+                    log_event(
+                        app,
+                        "WARN",
+                        format!(
+                            "Gallery job {} attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS} failed, retrying: {}",
+                            job.id, err.message
+                        ),
+                    );
                     continue;
                 }
                 return Err(err);
@@ -964,6 +1051,7 @@ mod tests {
             audio_quality: audio_quality.map(String::from),
             video_quality: video_quality.map(String::from),
             gallery_mode: None,
+            selected_gallery_indices: None,
             status: JobStatus::Queued,
             progress_percent: 0.0,
             speed_bytes_per_sec: None,

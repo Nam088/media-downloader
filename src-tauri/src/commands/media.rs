@@ -8,6 +8,7 @@ use crate::downloader::gallery_dl::GalleryDump;
 use crate::downloader::ytdlp;
 use crate::downloader::ytdlp::YtDlpChild;
 use crate::error::AppError;
+use crate::logging::log_event;
 use crate::models::{AudioFormatOption, GalleryItemPreview, MediaSource, VideoQualityOption};
 use crate::platform::detect_platform;
 
@@ -135,7 +136,18 @@ pub async fn preview_media(
             // gallery-dl — a tool actually built for image/gallery posts —
             // has a richer view of the same URL before settling for the
             // audio-only result.
-            if yt_dlp_source.available_video_qualities.is_empty() && !yt_dlp_source.is_playlist {
+            //
+            // A yt-dlp "playlist" result is normally excluded from this check
+            // (a real, populated playlist has nothing gallery-dl would do
+            // better), but a playlist with *zero* entries is exactly as
+            // empty-handed as a non-playlist result with no video — confirmed
+            // on Imgur's "gallery" URL form, which yt-dlp's own imgur
+            // extractor recognizes but resolves to `"entries": [],
+            // "playlist_count": 0"`, even though the link genuinely has
+            // images gallery-dl can see just fine.
+            let looks_empty_handed = yt_dlp_source.available_video_qualities.is_empty()
+                && (!yt_dlp_source.is_playlist || yt_dlp_source.playlist_item_count.unwrap_or(0) == 0);
+            if looks_empty_handed {
                 match try_gallery_dl_preview(&app, &previews, &source_url, &platform).await {
                     Some(gallery_source) => (gallery_source, Vec::new()),
                     None => {
@@ -168,7 +180,14 @@ pub async fn preview_media(
                 .unwrap_or_else(|| "unknown".to_string());
             match try_gallery_dl_preview(&app, &previews, &source_url, &platform).await {
                 Some(gallery_source) => (gallery_source, Vec::new()),
-                None => return Err(err),
+                None => {
+                    log_event(
+                        &app,
+                        "INFO",
+                        format!("preview_media: neither yt-dlp nor gallery-dl support {source_url}"),
+                    );
+                    return Err(err);
+                }
             }
         }
         Err(err) => return Err(err),
@@ -190,9 +209,8 @@ async fn try_gallery_dl_preview(
     source_url: &str,
     platform: &str,
 ) -> Option<MediaSource> {
-    let url_for_registry = source_url.to_string();
     let result = gallery_dl::dump_gallery_json(app, source_url, |child| {
-        previews.insert(url_for_registry, child);
+        previews.insert(source_url.to_string(), child);
     })
     .await;
     previews.remove(source_url);
@@ -204,9 +222,14 @@ async fn try_gallery_dl_preview(
             // or error to fall back to), but silently discarding this made a
             // genuine gallery-dl invocation failure (missing/uncached
             // resource, launch failure, etc.) indistinguishable from "this
-            // URL just isn't a gallery" — log it so that distinction is at
-            // least visible in the terminal running `tauri dev`.
-            eprintln!("[preview_media] gallery-dl fallback failed for {source_url}: {err}");
+            // URL just isn't a gallery" — log it (visible in the app's own
+            // Logs page, not just a dev-only terminal) so that distinction
+            // is diagnosable.
+            log_event(
+                app,
+                "WARN",
+                format!("preview_media: gallery-dl fallback failed for {source_url}: {err}"),
+            );
             return None;
         }
     };

@@ -90,6 +90,30 @@ function splitUrls(raw: string): string[] {
   return extractUrlsFromText(raw);
 }
 
+/** Flat-playlist previews carry no per-entry format list at all (see
+ * `commands::media::build_media_source`'s own comment on the backend) — so
+ * there's nothing real to render per FR-004/FR-019's "never invent options"
+ * rule. But that shouldn't mean playlist downloads can never pick a
+ * resolution/bitrate at all: this is a fixed, generic set of common labels
+ * (not validated against any specific link) that the backend passes through
+ * as-is to yt-dlp's own graceful per-video format selector for each fanned-out
+ * entry (`queue::video_format_selector` already tolerates a quality that
+ * doesn't exist for a given video by falling back to the nearest one). */
+const GENERIC_PLAYLIST_VIDEO_QUALITIES: VideoQualityOption[] = [
+  { label: "2160p", filesize_bytes: null },
+  { label: "1440p", filesize_bytes: null },
+  { label: "1080p", filesize_bytes: null },
+  { label: "720p", filesize_bytes: null },
+  { label: "480p", filesize_bytes: null },
+  { label: "360p", filesize_bytes: null },
+];
+const GENERIC_PLAYLIST_AUDIO_QUALITIES: AudioFormatOption[] = [
+  { bitrate_kbps: 320, codec: "mp3", filesize_bytes: null },
+  { bitrate_kbps: 256, codec: "mp3", filesize_bytes: null },
+  { bitrate_kbps: 192, codec: "mp3", filesize_bytes: null },
+  { bitrate_kbps: 128, codec: "mp3", filesize_bytes: null },
+];
+
 /** One row in the quality picker — mirrors the reference layout: radio +
  * bold quality label + codec detail + right-aligned estimated size. Options
  * are rendered exactly as the backend returned them (FR-004/FR-019); this
@@ -232,6 +256,11 @@ export function DownloadForm() {
   const [audioQuality, setAudioQuality] = useState<string | undefined>(undefined);
   const [videoQuality, setVideoQuality] = useState<string | undefined>(undefined);
   const [galleryMode, setGalleryMode] = useState<GalleryMode>("files");
+  // Indices into `preview.gallery_items` (not URLs — TikTok's per-item CDN
+  // URLs are short-lived and signed per-request, so the backend correlates
+  // a selection against a fresh re-crawl by ordinal position instead; see
+  // `models::DownloadJob.selected_gallery_indices`'s doc comment).
+  const [selectedGalleryIndices, setSelectedGalleryIndices] = useState<Set<number>>(new Set());
   const [outputDirectory, setOutputDirectory] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<AppError | null>(null);
@@ -264,6 +293,16 @@ export function DownloadForm() {
       if (result.is_gallery) {
         setMediaType("gallery");
         setGalleryMode("files");
+        // Default to everything selected — most people want all the images;
+        // deselecting specific ones is the exception, not the starting point.
+        setSelectedGalleryIndices(
+          new Set(
+            result.gallery_items.reduce<number[]>((indices, item, index) => {
+              if (!item.is_audio) indices.push(index);
+              return indices;
+            }, []),
+          ),
+        );
       } else {
         // Leftover "gallery" selection from a previous preview on this same
         // form wouldn't make sense against a regular video/audio result.
@@ -328,6 +367,14 @@ export function DownloadForm() {
               source_url: preview.source_url,
               media_type: "gallery",
               gallery_mode: galleryMode,
+              // Omit entirely (rather than an empty array) when every image
+              // is selected — semantically "everything", and keeps a
+              // wholesale "select all" job identical to how it behaved
+              // before per-image selection existed.
+              selected_gallery_indices:
+                selectedGalleryIndices.size === preview.gallery_items.filter((item) => !item.is_audio).length
+                  ? undefined
+                  : Array.from(selectedGalleryIndices),
               output_directory: effectiveOutputDirectory,
             }
           : {
@@ -418,10 +465,15 @@ export function DownloadForm() {
       ? (preview?.available_audio_formats.length ?? 0) > 0
       : (preview?.available_video_qualities.length ?? 0) > 0;
   const selectedQuality = mediaType === "audio" ? audioQuality : videoQuality;
+  // Files/ImagesOnly/Slideshow all need at least one selected image;
+  // AudioOnly ignores the image selection entirely (it discards images
+  // regardless), so it's the one gallery mode that's fine with zero picked.
+  const galleryHasValidSelection = mediaType !== "gallery" || galleryMode === "audio_only" || selectedGalleryIndices.size > 0;
   const canDownloadSingle = Boolean(
     preview &&
       effectiveOutputDirectory &&
       !submitting &&
+      galleryHasValidSelection &&
       (mediaType === "gallery" || preview.is_playlist || selectedQuality),
   );
   const canDownloadBatch = Boolean(effectiveOutputDirectory && !submitting && urls.length > 0);
@@ -561,21 +613,76 @@ export function DownloadForm() {
 
             {preview.is_gallery ? (
               <div className="flex flex-col gap-6 px-6 pt-2 pb-2">
-                {preview.gallery_items.some((item) => !item.is_audio) && (
-                  <div className="grid grid-cols-4 gap-2 sm:grid-cols-6">
-                    {preview.gallery_items
-                      .filter((item) => !item.is_audio)
-                      .slice(0, 12)
-                      .map((item) => (
-                        <img
-                          key={item.url}
-                          src={item.url}
-                          alt=""
-                          className="aspect-square w-full rounded-md border border-border/50 object-cover shadow-2xs"
-                        />
-                      ))}
-                  </div>
-                )}
+                {(() => {
+                  const imageItems = preview.gallery_items
+                    .map((item, index) => ({ item, index }))
+                    .filter(({ item }) => !item.is_audio);
+                  if (imageItems.length === 0) return null;
+                  const selectedCount = imageItems.filter(({ index }) => selectedGalleryIndices.has(index)).length;
+                  return (
+                    <div className="flex flex-col gap-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-medium text-muted-foreground">
+                          {t("downloadForm.gallery_selected_count", { selected: selectedCount, total: imageItems.length })}
+                        </span>
+                        <div className="flex items-center gap-3">
+                          <button
+                            type="button"
+                            onClick={() => setSelectedGalleryIndices(new Set(imageItems.map(({ index }) => index)))}
+                            className="text-xs font-semibold text-primary hover:underline"
+                          >
+                            {t("downloadForm.gallery_select_all")}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setSelectedGalleryIndices(new Set())}
+                            className="text-xs font-semibold text-muted-foreground hover:underline"
+                          >
+                            {t("downloadForm.gallery_select_none")}
+                          </button>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-4 gap-2 sm:grid-cols-6">
+                        {imageItems.slice(0, 24).map(({ item, index }) => {
+                          const isSelected = selectedGalleryIndices.has(index);
+                          return (
+                            <button
+                              type="button"
+                              key={index}
+                              onClick={() =>
+                                setSelectedGalleryIndices((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(index)) {
+                                    next.delete(index);
+                                  } else {
+                                    next.add(index);
+                                  }
+                                  return next;
+                                })
+                              }
+                              className="group relative aspect-square overflow-hidden rounded-md border border-border/50 shadow-2xs"
+                            >
+                              <img
+                                src={item.url}
+                                alt=""
+                                className={`h-full w-full object-cover transition-opacity ${isSelected ? "" : "opacity-35"}`}
+                              />
+                              <span
+                                className={`absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full border text-[10px] font-bold transition-colors ${
+                                  isSelected
+                                    ? "border-primary bg-primary text-primary-foreground"
+                                    : "border-white/80 bg-black/30 text-transparent"
+                                }`}
+                              >
+                                ✓
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })()}
                 <p className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
                   <Images className="h-4 w-4" />
                   {t("downloadForm.gallery_item_count", { count: preview.gallery_items.length })}
@@ -619,7 +726,7 @@ export function DownloadForm() {
                   <div className="mt-1 animate-in fade-in-50 slide-in-from-top-1 duration-200 ease-out">
                     <QualityOptionsList
                       qualityLabel={t("downloadForm.audio_quality_label")}
-                      audioOptions={preview.available_audio_formats}
+                      audioOptions={preview.is_playlist ? GENERIC_PLAYLIST_AUDIO_QUALITIES : preview.available_audio_formats}
                       value={audioQuality}
                       onChange={setAudioQuality}
                     />
@@ -629,7 +736,7 @@ export function DownloadForm() {
                   <div className="mt-1 animate-in fade-in-50 slide-in-from-top-1 duration-200 ease-out">
                     <QualityOptionsList
                       qualityLabel={t("downloadForm.video_quality_label")}
-                      videoOptions={preview.available_video_qualities}
+                      videoOptions={preview.is_playlist ? GENERIC_PLAYLIST_VIDEO_QUALITIES : preview.available_video_qualities}
                       value={videoQuality}
                       onChange={setVideoQuality}
                     />

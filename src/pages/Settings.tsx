@@ -1,10 +1,13 @@
 import { useTranslation } from "react-i18next";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { useAppSettings } from "@/hooks/use-app-settings";
+import type { AppError } from "@/types/download";
 
 export function Settings() {
   const { t } = useTranslation();
@@ -13,7 +16,21 @@ export function Settings() {
   async function handleChooseDefaultDirectory() {
     const selected = await openDialog({ directory: true, multiple: false });
     if (typeof selected === "string") {
-      await updateSettings({ default_output_directory: selected });
+      try {
+        await updateSettings({ default_output_directory: selected });
+      } catch (err) {
+        const appError = err as AppError;
+        toast.error(appError.message ?? t("errors.INTERNAL"));
+      }
+    }
+  }
+
+  async function handleToggleShowLogsTab(checked: boolean) {
+    try {
+      await updateSettings({ show_logs_tab: checked });
+    } catch (err) {
+      const appError = err as AppError;
+      toast.error(appError.message ?? t("errors.INTERNAL"));
     }
   }
 
@@ -50,6 +67,16 @@ export function Settings() {
               {t("downloadForm.choose_directory_button")}
             </Button>
           </div>
+        </div>
+
+        <div className="h-px bg-border/60" />
+
+        <div className="flex items-center justify-between py-1">
+          <div className="flex flex-col gap-0.5">
+            <Label className="text-sm font-medium">{t("settings.show_logs_tab_label")}</Label>
+            <span className="text-xs text-muted-foreground">{t("settings.show_logs_tab_hint")}</span>
+          </div>
+          <Switch checked={settings?.show_logs_tab ?? false} onCheckedChange={handleToggleShowLogsTab} />
         </div>
       </div>
     </div>
