@@ -1,0 +1,114 @@
+{
+  "app": {
+    "title": "Trình Tải Media"
+  },
+  "nav": {
+    "home": "Trang chủ",
+    "history": "Lịch sử",
+    "settings": "Cài đặt"
+  },
+  "common": {
+    "loading": "Đang tải…",
+    "cancel": "Huỷ",
+    "retry": "Thử lại",
+    "close": "Đóng"
+  },
+  "settings": {
+    "theme_label": "Giao diện",
+    "language_label": "Ngôn ngữ",
+    "default_output_directory_label": "Thư mục lưu mặc định"
+  },
+  "theme": {
+    "toggle_label": "Đổi giao diện",
+    "light": "Sáng",
+    "dark": "Tối",
+    "system": "Theo hệ thống"
+  },
+  "language": {
+    "toggle_label": "Đổi ngôn ngữ",
+    "en": "English",
+    "vi": "Tiếng Việt",
+    "system": "Theo hệ thống"
+  },
+  "history": {
+    "empty": "Chưa có lịch sử tải nào.",
+    "open_folder": "Mở thư mục chứa tệp"
+  },
+  "playlistScope": {
+    "title": "Liên kết này là một playlist",
+    "description_with_count": "Danh sách này có {{count}} mục. Bạn muốn chỉ tải mục này, hay thêm cả danh sách vào hàng đợi?",
+    "description_unknown_count": "Bạn muốn chỉ tải mục này, hay thêm cả danh sách vào hàng đợi?",
+    "single_item_button": "Chỉ mục này",
+    "entire_playlist_button": "Cả danh sách"
+  },
+  "home": {
+    "queue_heading": "Đang tải",
+    "completed_heading": "Đã hoàn tất"
+  },
+  "queue": {
+    "empty": "Không có tác vụ nào đang tải.",
+    "download_completed": "Đã tải xong",
+    "status": {
+      "queued": "Đang chờ",
+      "fetching_metadata": "Đang lấy thông tin…",
+      "downloading": "Đang tải",
+      "paused": "Tạm dừng",
+      "completed": "Hoàn tất",
+      "failed": "Lỗi",
+      "canceled": "Đã huỷ"
+    }
+  },
+  "downloadForm": {
+    "url_label": "Liên kết video hoặc âm thanh",
+    "url_placeholder": "Dán liên kết YouTube, TikTok, Facebook, Instagram, X, hoặc SoundCloud",
+    "url_placeholder_multi": "Dán một hoặc nhiều liên kết (mỗi dòng một liên kết) — YouTube, TikTok, Facebook, Instagram, X, SoundCloud",
+    "supported_sites_hint": "Hỗ trợ YouTube, TikTok, Facebook, Instagram, X, SoundCloud, và hàng nghìn trang khác mà yt-dlp hỗ trợ.",
+    "batch_mode_hint": "Đã phát hiện {{count}} liên kết — mỗi liên kết sẽ được thêm vào hàng đợi với chất lượng âm thanh mặc định.",
+    "batch_partial_failure": "{{count}} liên kết không thêm được — xem chi tiết bên dưới.",
+    "download_all_button": "Tải tất cả ({{count}})",
+    "preview_button": "Xem trước",
+    "stop_preview_button": "Dừng",
+    "media_type_audio": "Chỉ âm thanh",
+    "media_type_video": "Video đầy đủ",
+    "audio_quality_label": "Chất lượng âm thanh",
+    "video_quality_label": "Chất lượng video",
+    "no_audio_formats": "Không có tuỳ chọn chất lượng âm thanh nào cho liên kết này.",
+    "no_video_qualities": "Không có tuỳ chọn chất lượng video nào cho liên kết này.",
+    "best_available": "Chất lượng tốt nhất",
+    "size_unknown": "chưa rõ dung lượng",
+    "output_directory_label": "Lưu vào",
+    "choose_directory_button": "Chọn thư mục",
+    "no_directory_chosen": "Chưa chọn thư mục",
+    "download_audio_button": "Tải âm thanh",
+    "download_video_button": "Tải video",
+    "download_gallery_button": "Tải xuống",
+    "added_to_queue": "Đã thêm vào hàng đợi tải",
+    "gallery_item_count": "Tìm thấy {{count}} tệp",
+    "gallery_mode_label": "Muốn tải gì",
+    "gallery_mode_files": "Tất cả tệp",
+    "gallery_mode_files_hint": "Mọi ảnh và âm thanh, giữ nguyên gốc",
+    "gallery_mode_audio_only": "Chỉ âm thanh",
+    "gallery_mode_audio_only_hint": "Chỉ giữ nhạc nền, bỏ ảnh",
+    "gallery_mode_images_only": "Chỉ ảnh",
+    "gallery_mode_images_only_hint": "Chỉ giữ ảnh, bỏ âm thanh",
+    "gallery_mode_slideshow": "Ghép thành video",
+    "gallery_mode_slideshow_hint": "Ghép ảnh và âm thanh thành 1 video slideshow",
+    "gallery_mode_slideshow_unavailable": "Không tìm thấy âm thanh — không thể ghép video cho liên kết này"
+  },
+  "errors": {
+    "UNSUPPORTED_PLATFORM": "Liên kết này không thuộc nền tảng được hỗ trợ.",
+    "ACCESS_DENIED": "Nội dung này riêng tư, yêu cầu đăng nhập, hoặc có bảo vệ DRM nên không thể tải.",
+    "INVALID_QUALITY_OPTION": "Mức chất lượng đã chọn không còn khả dụng cho liên kết này. Vui lòng xem trước lại.",
+    "PREVIEW_REQUIRED": "Vui lòng xem trước liên kết trước khi tải.",
+    "DOWNLOAD_FAILED": "Tải thất bại. Vui lòng thử lại hoặc dùng liên kết khác.",
+    "NOT_FOUND": "Không tìm thấy mục này.",
+    "INVALID_JOB_STATE": "Thao tác này không khả dụng với trạng thái tải hiện tại.",
+    "MISSING_QUALITY": "Vui lòng chọn mức chất lượng trước khi tải.",
+    "INTERNAL": "Đã có lỗi xảy ra. Vui lòng thử lại."
+  },
+  "compliance": {
+    "title": "Trước khi bắt đầu tải",
+    "body": "Chỉ tải nội dung bạn sở hữu hoặc được phép sử dụng. Bạn tự chịu trách nhiệm tuân thủ luật bản quyền và Điều khoản Dịch vụ của từng nền tảng. Ứng dụng này không hỗ trợ phá khoá DRM hay truy cập nội dung riêng tư/trả phí.",
+    "acknowledge": "Tôi đã hiểu"
+  }
+}

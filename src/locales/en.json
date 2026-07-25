@@ -1,0 +1,115 @@
+{
+  "app": {
+    "title": "Media Downloader"
+  },
+  "nav": {
+    "home": "Home",
+    "history": "History",
+    "settings": "Settings"
+  },
+  "common": {
+    "loading": "Loading…",
+    "cancel": "Cancel",
+    "retry": "Retry",
+    "close": "Close"
+  },
+  "settings": {
+    "theme_label": "Theme",
+    "language_label": "Language",
+    "default_output_directory_label": "Default save folder"
+  },
+  "theme": {
+    "toggle_label": "Change theme",
+    "light": "Light",
+    "dark": "Dark",
+    "system": "System"
+  },
+  "language": {
+    "toggle_label": "Change language",
+    "en": "English",
+    "vi": "Tiếng Việt",
+    "system": "System"
+  },
+  "history": {
+    "empty": "No download history yet.",
+    "open_folder": "Open containing folder"
+  },
+  "playlistScope": {
+    "title": "This link is a playlist",
+    "description_with_count": "It contains {{count}} items. Download just this one, or add the whole playlist to the queue?",
+    "description_unknown_count": "Download just this one, or add the whole playlist to the queue?",
+    "single_item_button": "Just this item",
+    "entire_playlist_button": "Entire playlist"
+  },
+  "home": {
+    "queue_heading": "Active downloads",
+    "completed_heading": "Completed"
+  },
+  "queue": {
+    "empty": "No downloads in progress.",
+    "download_completed": "Download complete",
+    "status": {
+      "queued": "Queued",
+      "fetching_metadata": "Fetching info…",
+      "downloading": "Downloading",
+      "paused": "Paused",
+      "completed": "Completed",
+      "failed": "Failed",
+      "canceled": "Canceled"
+    }
+  },
+  "downloadForm": {
+    "url_label": "Video or audio link(s)",
+    "url_placeholder": "Paste a YouTube, TikTok, Facebook, Instagram, X, or SoundCloud link",
+    "url_placeholder_multi": "Paste one or more links (one per line) — YouTube, TikTok, Facebook, Instagram, X, SoundCloud",
+    "supported_sites_hint": "Works with YouTube, TikTok, Facebook, Instagram, X, SoundCloud, and thousands of other sites yt-dlp supports.",
+    "batch_mode_hint": "{{count}} links detected — each will be added to the queue with default audio quality.",
+    "batch_partial_failure": "{{count}} link(s) could not be added — see details below.",
+    "download_all_button": "Download all ({{count}})",
+    "preview_button": "Preview",
+    "stop_preview_button": "Stop",
+    "media_type_audio": "Audio only",
+    "media_type_video": "Full video",
+    "audio_quality_label": "Audio quality",
+    "video_quality_label": "Video quality",
+    "no_audio_formats": "No audio quality options are available for this link.",
+    "no_video_qualities": "No video quality options are available for this link.",
+    "best_available": "Best available",
+    "size_unknown": "size unknown",
+    "output_directory_label": "Save to",
+    "choose_directory_button": "Choose folder",
+    "no_directory_chosen": "No folder chosen yet",
+    "download_audio_button": "Download audio",
+    "download_video_button": "Download video",
+    "download_gallery_button": "Download",
+    "added_to_queue": "Added to the download queue",
+    "gallery_item_count": "{{count}} file found",
+    "gallery_item_count_other": "{{count}} files found",
+    "gallery_mode_label": "What to download",
+    "gallery_mode_files": "All files",
+    "gallery_mode_files_hint": "Every image and audio track, as-is",
+    "gallery_mode_audio_only": "Audio only",
+    "gallery_mode_audio_only_hint": "Keep just the background audio, discard images",
+    "gallery_mode_images_only": "Images only",
+    "gallery_mode_images_only_hint": "Keep just the images, discard the audio track",
+    "gallery_mode_slideshow": "Merged video",
+    "gallery_mode_slideshow_hint": "Combine the images and audio into one slideshow video",
+    "gallery_mode_slideshow_unavailable": "No audio track found — merged video isn't available for this link"
+  },
+  "errors": {
+    "UNSUPPORTED_PLATFORM": "This link is not from a supported platform.",
+    "ACCESS_DENIED": "This content is private, requires login, or is DRM-protected, so it can't be downloaded.",
+    "INVALID_QUALITY_OPTION": "The selected quality is no longer available for this link. Please preview it again.",
+    "PREVIEW_REQUIRED": "Please preview the link before downloading.",
+    "DOWNLOAD_FAILED": "The download failed. Please try again or use a different link.",
+    "NOT_FOUND": "This item could not be found.",
+    "INVALID_JOB_STATE": "This action isn't available for the current download state.",
+    "MISSING_QUALITY": "Please choose a quality before downloading.",
+    "INTERNAL": "Something went wrong. Please try again."
+  },
+  "compliance": {
+    "title": "Before you start downloading",
+    "body": "Only download content you own or have permission to use. You are responsible for complying with copyright law and each platform's Terms of Service. This app does not support bypassing DRM or accessing private/paid content.",
+    "acknowledge": "I understand"
+  }
+}

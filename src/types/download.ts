@@ -1,0 +1,109 @@
+export type MediaType = "audio" | "video" | "gallery";
+
+/** Only meaningful when `media_type === "gallery"`. Mirrors the three modes
+ * the reference implementation offered for a TikTok slideshow post. */
+export type GalleryMode = "files" | "audio_only" | "images_only" | "slideshow";
+
+export type JobStatus =
+  | "queued"
+  | "fetching_metadata"
+  | "downloading"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "canceled";
+
+/** `bitrate_kbps` is `null` when the source never exposed a bitrate at all
+ * (e.g. TikTok's pre-muxed video+audio formats) — audio is still real and
+ * extractable, there's just nothing to label a specific number with. */
+export interface AudioFormatOption {
+  bitrate_kbps: number | null;
+  codec: string;
+  filesize_bytes: number | null;
+}
+
+export interface VideoQualityOption {
+  label: string;
+  filesize_bytes: number | null;
+}
+
+/** One file gallery-dl found for a gallery-backed `MediaSource`. `is_audio`
+ * is decided server-side from the file extension (mirrors the reference
+ * implementation's own image/audio classification for a slideshow post). */
+export interface GalleryItemPreview {
+  url: string;
+  extension: string | null;
+  is_audio: boolean;
+}
+
+/** Options are always populated from the real formats yt-dlp returned for
+ * this specific link (FR-004, FR-019) — never a fixed list in this file.
+ *
+ * `is_gallery`/`gallery_items` are populated instead when the link was
+ * resolved by gallery-dl rather than yt-dlp (yt-dlp had no extractor, or the
+ * link is an image/gallery post yt-dlp can't represent — e.g. a TikTok
+ * slideshow). `available_*` are always empty in that case. */
+export interface MediaSource {
+  source_url: string;
+  title: string;
+  thumbnail_url: string | null;
+  duration_seconds: number | null;
+  platform: string;
+  is_playlist: boolean;
+  playlist_item_count: number | null;
+  available_video_qualities: VideoQualityOption[];
+  available_audio_formats: AudioFormatOption[];
+  is_gallery: boolean;
+  gallery_items: GalleryItemPreview[];
+}
+
+export interface DownloadJob {
+  id: string;
+  source_url: string;
+  platform: string;
+  media_type: MediaType;
+  audio_quality: string | null;
+  video_quality: string | null;
+  gallery_mode: GalleryMode | null;
+  status: JobStatus;
+  progress_percent: number;
+  speed_bytes_per_sec: number | null;
+  eta_seconds: number | null;
+  error_message: string | null;
+  output_directory: string;
+  output_file_path: string | null;
+  is_playlist_item: boolean;
+  parent_playlist_id: string | null;
+  retried_from_job_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AppError {
+  code: string;
+  message: string;
+}
+
+export interface CreateJobInput {
+  source_url: string;
+  media_type: MediaType;
+  audio_quality?: string;
+  video_quality?: string;
+  gallery_mode?: GalleryMode;
+  output_directory: string;
+  playlist_scope?: "single_item" | "entire_playlist";
+}
+
+export interface JobProgressEvent {
+  job_id: string;
+  progress_percent: number;
+  speed_bytes_per_sec: number | null;
+  eta_seconds: number | null;
+}
+
+export interface JobStatusChangedEvent {
+  job_id: string;
+  status: JobStatus;
+  error_message: string | null;
+  output_file_path: string | null;
+}
