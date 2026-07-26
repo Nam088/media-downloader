@@ -83,6 +83,27 @@ else
   echo "spotiflac-worker onedir build already present at $SPOTIFLAC_ONEDIR_DEST"
 fi
 
+# macOS gets the same static arm64 build the release pipeline uses, rather
+# than a copy of the system one. Two reasons, both learned the hard way: a
+# Homebrew ffmpeg is dynamically linked, so it runs here and nowhere else —
+# exactly the failure the bundle exists to prevent, and the release workflow
+# now fails the build over it. And since the sidecar is gitignored, this
+# script is the ONLY way back after the file is lost; recovering it as a
+# *worse* binary than the one that went missing is a trap.
+if [[ ! -x "$FFMPEG_DEST" && "$(uname -s)" == "Darwin" && "$TARGET_TRIPLE" == aarch64-* ]]; then
+  echo "Downloading the static arm64 ffmpeg build (same source as the release pipeline)..."
+  TMP_FFMPEG_ZIP="$(mktemp -t ffmpeg-static.XXXXXX.zip)"
+  TMP_FFMPEG_DIR="$(mktemp -d -t ffmpeg-static.XXXXXX)"
+  if curl -fL "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip" -o "$TMP_FFMPEG_ZIP" \
+     && unzip -oq "$TMP_FFMPEG_ZIP" -d "$TMP_FFMPEG_DIR"; then
+    cp "$TMP_FFMPEG_DIR/ffmpeg" "$FFMPEG_DEST"
+    chmod +x "$FFMPEG_DEST"
+  else
+    echo "Static ffmpeg download failed; falling back to the system one below." >&2
+  fi
+  rm -rf "$TMP_FFMPEG_ZIP" "$TMP_FFMPEG_DIR"
+fi
+
 if [[ ! -x "$FFMPEG_DEST" ]]; then
   if command -v ffmpeg >/dev/null 2>&1; then
     echo "Using system ffmpeg found at $(command -v ffmpeg) for local dev (release builds bundle a proper static build instead)"
