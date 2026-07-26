@@ -232,6 +232,12 @@ impl Db {
     ///
     /// Giao diện gửi id của hai hàng xóm chứ không gửi số: giao diện không nên
     /// phải biết gì về cách đánh số nội bộ.
+    ///
+    /// Toàn bộ thao tác nằm trong đúng một transaction, giữ đúng một lần khoá
+    /// mutex: đọc hai hàng xóm, chuẩn hoá nếu cần, đọc lại, rồi ghi. Nếu đọc và
+    /// ghi tách rời nhau thì một lần enqueue hay một lần kéo khác chen vào giữa
+    /// sẽ khiến điểm giữa vừa tính trở thành số cũ — đúng loại tranh chấp mà
+    /// hàm này tự nhận là tránh được.
     #[allow(dead_code)]
     pub fn move_job_between(
         &self,
@@ -239,19 +245,32 @@ impl Db {
         before_job_id: Option<&str>,
         after_job_id: Option<&str>,
     ) -> Result<(), AppError> {
-        let mut before = self.position_of(before_job_id)?;
-        let mut after = self.position_of(after_job_id)?;
-
-        // Chèn liên tiếp vào cùng một chỗ chia đôi khe hở mỗi lần. Khi nó hẹp
-        // tới mức f64 sắp hết chỗ, đánh số lại rồi đọc lại hàng xóm.
-        if needs_renormalize(before, after) {
-            self.renormalize_queue_positions()?;
-            before = self.position_of(before_job_id)?;
-            after = self.position_of(after_job_id)?;
+        // Một job không thể là hàng xóm của chính nó: điểm giữa sẽ tính từ
+        // chính vị trí sắp bị ghi đè, cho ra kết quả vô nghĩa. Đây là lỗi của
+        // phía gọi, nên báo lỗi thay vì đoán ý.
+        if Some(job_id) == before_job_id || Some(job_id) == after_job_id {
+            return Err(AppError::new(
+                "INVALID_ARGUMENT",
+                "A job cannot be moved relative to itself",
+            ));
         }
 
-        let conn = self.conn();
-        conn.execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+
+        let mut before = position_of(&tx, before_job_id)?;
+        let mut after = position_of(&tx, after_job_id)?;
+
+        // Chèn liên tiếp vào cùng một chỗ chia đôi khe hở mỗi lần. Khi nó hẹp
+        // tới mức f64 sắp hết chỗ, đánh số lại rồi đọc lại hàng xóm — giá trị
+        // đọc trước khi chuẩn hoá đã không còn đúng nữa.
+        if needs_renormalize(before, after) {
+            renormalize_positions_within(&tx)?;
+            before = position_of(&tx, before_job_id)?;
+            after = position_of(&tx, after_job_id)?;
+        }
+
+        let changed = tx.execute(
             "UPDATE download_jobs SET queue_position = ?1, updated_at = ?2 WHERE id = ?3",
             params![
                 position_between(before, after),
@@ -259,22 +278,14 @@ impl Db {
                 job_id
             ],
         )?;
+        // Không có dòng nào khớp nghĩa là job đã bị xoá: trả lỗi thay vì `Ok`
+        // im lặng, và bỏ luôn transaction để lần chuẩn hoá ở trên (nếu có)
+        // không bị commit cho một thao tác rốt cuộc không xảy ra.
+        if changed == 0 {
+            return Err(AppError::not_found("Job"));
+        }
+        tx.commit()?;
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn position_of(&self, job_id: Option<&str>) -> Result<Option<f64>, AppError> {
-        let Some(job_id) = job_id else {
-            return Ok(None);
-        };
-        let conn = self.conn();
-        conn.query_row(
-            "SELECT queue_position FROM download_jobs WHERE id = ?1",
-            params![job_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(AppError::from)
     }
 
     /// Đánh số lại các job chưa kết thúc thành 1.0, 2.0, 3.0… giữ nguyên thứ tự
@@ -284,23 +295,7 @@ impl Db {
     pub fn renormalize_queue_positions(&self) -> Result<(), AppError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-
-        let ids: Vec<String> = {
-            let mut stmt = tx.prepare(
-                "SELECT id FROM download_jobs
-                 WHERE status IN ('queued','paused','downloading','fetching_metadata')
-                 ORDER BY queue_position ASC, created_at ASC",
-            )?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            rows.collect::<rusqlite::Result<Vec<String>>>()?
-        };
-
-        for (index, id) in ids.iter().enumerate() {
-            tx.execute(
-                "UPDATE download_jobs SET queue_position = ?1 WHERE id = ?2",
-                params![(index + 1) as f64, id],
-            )?;
-        }
+        renormalize_positions_within(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -318,56 +313,6 @@ impl Db {
             params![Utc::now().to_rfc3339()],
         )?;
         Ok(changed)
-    }
-
-    /// Cấp vị trí cho các job chưa từng có vị trí thật.
-    ///
-    /// Migration 0008 chỉ đánh số một lần cho các dòng có sẵn tại thời điểm nó
-    /// chạy. Một job được chèn bởi đường nào đó không đi qua `enqueue` sẽ mang
-    /// `queue_position = 0.0` và vì thế sắp trước *mọi* job đã được đánh số —
-    /// một lỗi thứ tự âm thầm, không bao giờ tự khỏi vì backfill không quay
-    /// lại lần hai.
-    ///
-    /// Gọi một lần lúc khởi động, cạnh `reset_interrupted_jobs`. Trong vận
-    /// hành bình thường nó không đổi dòng nào; nó tồn tại để bất biến "mọi job
-    /// đều có vị trí phân biệt" không phụ thuộc vào việc mọi đường tạo job đều
-    /// nhớ gọi đúng hàm.
-    #[allow(dead_code)]
-    pub fn repair_unpositioned_jobs(&self) -> Result<usize, AppError> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-
-        let ids: Vec<String> = {
-            let mut stmt = tx.prepare(
-                "SELECT id FROM download_jobs
-                 WHERE queue_position = 0
-                   AND status IN ('queued','paused','downloading','fetching_metadata')
-                 ORDER BY created_at ASC",
-            )?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            rows.collect::<rusqlite::Result<Vec<String>>>()?
-        };
-        if ids.is_empty() {
-            return Ok(0);
-        }
-
-        let max: Option<f64> =
-            tx.query_row("SELECT MAX(queue_position) FROM download_jobs", [], |row| {
-                row.get(0)
-            })?;
-        let mut next = max.unwrap_or(0.0);
-
-        // Xếp vào cuối theo thứ tự tạo: chúng chưa từng được người dùng sắp
-        // xếp, nên không có ý định nào để bảo toàn.
-        for id in &ids {
-            next += 1.0;
-            tx.execute(
-                "UPDATE download_jobs SET queue_position = ?1 WHERE id = ?2",
-                params![next, id],
-            )?;
-        }
-        tx.commit()?;
-        Ok(ids.len())
     }
 
     /// Đưa job về hàng chờ kèm mốc thời gian được phép thử lại (FR-121).
@@ -398,8 +343,14 @@ impl Db {
         Ok(())
     }
 
-    /// Đổi trạng thái hàng loạt, trả về id các job thực sự bị đổi để tầng gọi
-    /// biết cần phát sự kiện cho những job nào (FR-118).
+    /// Đổi trạng thái hàng loạt, trả về id của những job **khớp**
+    /// `from_statuses` để tầng gọi biết cần phát sự kiện cho những job nào
+    /// (FR-118).
+    ///
+    /// "Khớp" chứ không phải "đã đổi": nếu `to_status` cũng nằm trong
+    /// `from_statuses` thì các dòng vốn đã ở trạng thái đích vẫn được liệt kê,
+    /// và phía gọi sẽ phát sự kiện thừa cho chúng. Phía gọi chịu trách nhiệm
+    /// không truyền vào tổ hợp đó.
     #[allow(dead_code)]
     pub fn bulk_update_status(
         &self,
@@ -556,6 +507,57 @@ pub fn needs_renormalize(before: Option<f64>, after: Option<f64>) -> bool {
         (Some(before), Some(after)) => (after - before).abs() < MIN_POSITION_GAP,
         _ => false,
     }
+}
+
+/// Vị trí hiện tại của một hàng xóm, đọc trong transaction đang mở.
+///
+/// `Ok(None)` chỉ có đúng một nghĩa: phía đó không có hàng xóm nào (đang thả
+/// vào đầu hoặc cuối danh sách). Nếu phía gọi *có* đưa id mà không tìm thấy
+/// dòng nào thì đó là lỗi, không phải "đầu danh sách" — hàng xóm có thể vừa
+/// hoàn tất và biến khỏi danh sách trong lúc người dùng đang kéo, và đặt nhầm
+/// job vào một chỗ tuỳ tiện tệ hơn nhiều so với báo lỗi.
+#[allow(dead_code)]
+fn position_of(conn: &Connection, job_id: Option<&str>) -> Result<Option<f64>, AppError> {
+    let Some(job_id) = job_id else {
+        return Ok(None);
+    };
+    let found: Option<f64> = conn
+        .query_row(
+            "SELECT queue_position FROM download_jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match found {
+        Some(position) => Ok(Some(position)),
+        None => Err(AppError::not_found("Job")),
+    }
+}
+
+/// Phần ruột của việc đánh số lại, chạy trên transaction do phía gọi mở.
+///
+/// Tách ra để `move_job_between` chuẩn hoá được *bên trong* transaction của
+/// chính nó thay vì mở một transaction thứ hai — nếu không, khoảng giữa hai
+/// transaction là chỗ một thao tác khác chen vào và làm hỏng giá trị vừa đọc.
+#[allow(dead_code)]
+fn renormalize_positions_within(conn: &Connection) -> Result<(), AppError> {
+    let ids: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM download_jobs
+             WHERE status IN ('queued','paused','downloading','fetching_metadata')
+             ORDER BY queue_position ASC, created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<String>>>()?
+    };
+
+    for (index, id) in ids.iter().enumerate() {
+        conn.execute(
+            "UPDATE download_jobs SET queue_position = ?1 WHERE id = ?2",
+            params![(index + 1) as f64, id],
+        )?;
+    }
+    Ok(())
 }
 
 fn media_type_str(media_type: &MediaType) -> &'static str {
@@ -854,6 +856,19 @@ mod tests {
         job.queue_position = 4.0;
         db.insert_job(&job).unwrap();
         assert_eq!(db.next_queue_position().unwrap(), 5.0);
+
+        // Job đã kết thúc không còn nằm trong hàng đợi, nên vị trí của nó
+        // không được kéo theo vị trí cấp cho job mới — nếu không, mỗi lần tải
+        // xong lại đẩy số thứ tự phình lên vô hạn.
+        let mut finished = sample_job("finished");
+        finished.status = JobStatus::Completed;
+        finished.queue_position = 900.0;
+        db.insert_job(&finished).unwrap();
+        assert_eq!(
+            db.next_queue_position().unwrap(),
+            5.0,
+            "job đã hoàn tất không được tính vào cuối hàng đợi"
+        );
     }
 
     #[test]
@@ -882,7 +897,11 @@ mod tests {
     #[test]
     fn move_job_between_only_rewrites_the_moved_row() {
         let db = temp_db();
-        for (id, position) in [("a", 1.0), ("b", 2.0), ("c", 3.0)] {
+        // Cố ý KHÔNG dùng 1.0/2.0/3.0: đó đúng là kết quả của một lần chuẩn
+        // hoá, nên với bộ số ấy "chỉ ghi một dòng" và "ghi lại cả danh sách"
+        // cho ra y hệt nhau và test không phân biệt được. 10/20/30 thì một lần
+        // chuẩn hoá thừa sẽ lộ ra ngay ở vị trí của "a" và "b".
+        for (id, position) in [("a", 10.0), ("b", 20.0), ("c", 30.0)] {
             let mut job = sample_job(id);
             job.queue_position = position;
             db.insert_job(&job).unwrap();
@@ -891,13 +910,17 @@ mod tests {
         // Kéo "c" vào giữa "a" và "b".
         db.move_job_between("c", Some("a"), Some("b")).unwrap();
 
-        assert_eq!(db.get_job("c").unwrap().unwrap().queue_position, 1.5);
+        assert_eq!(db.get_job("c").unwrap().unwrap().queue_position, 15.0);
         assert_eq!(
             db.get_job("a").unwrap().unwrap().queue_position,
-            1.0,
+            10.0,
             "hàng xóm không được đụng tới"
         );
-        assert_eq!(db.get_job("b").unwrap().unwrap().queue_position, 2.0);
+        assert_eq!(
+            db.get_job("b").unwrap().unwrap().queue_position,
+            20.0,
+            "hàng xóm không được đụng tới"
+        );
     }
 
     #[test]
@@ -915,8 +938,69 @@ mod tests {
         let a = db.get_job("a").unwrap().unwrap().queue_position;
         let b = db.get_job("b").unwrap().unwrap().queue_position;
         let c = db.get_job("c").unwrap().unwrap().queue_position;
+        // Hai khẳng định dưới bắt hai lỗi khác nhau và cần giữ cả hai: bỏ hẳn
+        // nhánh chuẩn hoá thì khe hở vẫn hẹp (assert thứ hai bắt), còn đảo
+        // `ORDER BY` của lần chuẩn hoá thành DESC thì khe hở rộng nhưng thứ tự
+        // sai (assert thứ nhất bắt).
         assert!(a < c && c < b, "thứ tự a < c < b phải đúng sau khi chuẩn hoá");
         assert!(b - a > 0.1, "sau chuẩn hoá khe hở phải rộng trở lại");
+        // Giá trị cụ thể: chuẩn hoá đưa a,b,c về 1.0/2.0/3.0 rồi "c" nhận điểm
+        // giữa của a và b. Kiểm tra thẳng con số để một lần chuẩn hoá giữ đúng
+        // thứ tự nhưng để lại khe hở nham nhở không lọt qua được.
+        assert_eq!((a, b, c), (1.0, 2.0, 1.5));
+    }
+
+    #[test]
+    fn move_job_between_rejects_a_neighbour_that_no_longer_exists() {
+        // Hàng xóm có thể vừa tải xong và rơi khỏi danh sách trong lúc người
+        // dùng đang kéo. Coi id không tìm thấy là "đầu danh sách" sẽ đặt job
+        // vào một chỗ hoàn toàn khác chỗ người dùng thả — im lặng và sai.
+        let db = temp_db();
+        for (id, position) in [("a", 10.0), ("b", 20.0), ("c", 30.0)] {
+            let mut job = sample_job(id);
+            job.queue_position = position;
+            db.insert_job(&job).unwrap();
+        }
+
+        let result = db.move_job_between("c", Some("ghost"), Some("b"));
+
+        assert!(result.is_err(), "hàng xóm không tồn tại phải là lỗi");
+        assert_eq!(
+            db.get_job("c").unwrap().unwrap().queue_position,
+            30.0,
+            "thất bại thì không được đổi vị trí của job"
+        );
+    }
+
+    #[test]
+    fn move_job_between_rejects_a_job_that_no_longer_exists() {
+        let db = temp_db();
+        let mut anchor = sample_job("a");
+        anchor.queue_position = 10.0;
+        db.insert_job(&anchor).unwrap();
+
+        let result = db.move_job_between("ghost", Some("a"), None);
+
+        assert!(result.is_err(), "job không tồn tại phải là lỗi, không phải Ok");
+        assert_eq!(db.get_job("a").unwrap().unwrap().queue_position, 10.0);
+    }
+
+    #[test]
+    fn move_job_between_rejects_using_the_moved_job_as_its_own_neighbour() {
+        let db = temp_db();
+        for (id, position) in [("a", 10.0), ("b", 20.0)] {
+            let mut job = sample_job(id);
+            job.queue_position = position;
+            db.insert_job(&job).unwrap();
+        }
+
+        assert!(db.move_job_between("a", Some("a"), Some("b")).is_err());
+        assert!(db.move_job_between("a", Some("b"), Some("a")).is_err());
+        assert_eq!(
+            db.get_job("a").unwrap().unwrap().queue_position,
+            10.0,
+            "thất bại thì không được đổi vị trí của job"
+        );
     }
 
     #[test]
@@ -948,42 +1032,6 @@ mod tests {
             JobStatus::Completed,
             "job đã xong không được đụng tới"
         );
-    }
-
-    #[test]
-    fn repair_unpositioned_jobs_appends_them_after_positioned_ones() {
-        let db = temp_db();
-        let mut positioned = sample_job("positioned");
-        positioned.queue_position = 4.0;
-        let mut orphan = sample_job("orphan");
-        orphan.queue_position = 0.0;
-        orphan.created_at = "2026-07-26T01:00:00Z".to_string();
-        db.insert_job(&positioned).unwrap();
-        db.insert_job(&orphan).unwrap();
-
-        let repaired = db.repair_unpositioned_jobs().unwrap();
-
-        assert_eq!(repaired, 1);
-        assert_eq!(
-            db.get_job("positioned").unwrap().unwrap().queue_position,
-            4.0
-        );
-        assert_eq!(
-            db.get_job("orphan").unwrap().unwrap().queue_position,
-            5.0,
-            "job chưa có vị trí phải xếp vào cuối, không phải đầu"
-        );
-    }
-
-    #[test]
-    fn repair_unpositioned_jobs_is_a_no_op_when_everything_has_a_position() {
-        let db = temp_db();
-        let mut job = sample_job("job-1");
-        job.queue_position = 2.0;
-        db.insert_job(&job).unwrap();
-
-        assert_eq!(db.repair_unpositioned_jobs().unwrap(), 0);
-        assert_eq!(db.get_job("job-1").unwrap().unwrap().queue_position, 2.0);
     }
 
     #[test]
