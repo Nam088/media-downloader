@@ -13,6 +13,13 @@ pub struct AppError {
     pub message: String,
 }
 
+/// Mã lỗi cho sự cố đường truyền. Khai báo một lần ở đây vì nó đi qua ba
+/// module: hai bộ phân loại (`ytdlp`, `gallery_dl`) sinh ra nó, còn
+/// `retry::is_transient` đọc nó để quyết định có thử lại hay không. Gõ sai ở
+/// bất kỳ đầu nào cũng sẽ âm thầm biến lỗi mạng thành lỗi vĩnh viễn mà không
+/// test nào bắt được.
+pub const NETWORK_ERROR_CODE: &str = "NETWORK_ERROR";
+
 impl AppError {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
@@ -30,6 +37,11 @@ impl AppError {
 
     pub fn access_denied(reason: impl Into<String>) -> Self {
         Self::new("ACCESS_DENIED", reason.into())
+    }
+
+    /// Lỗi đường truyền — nhóm duy nhất đáng thử lại (xem `downloader::retry`).
+    pub fn network_error(reason: impl Into<String>) -> Self {
+        Self::new(NETWORK_ERROR_CODE, reason.into())
     }
 
     pub fn invalid_quality_option() -> Self {

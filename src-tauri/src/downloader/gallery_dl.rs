@@ -341,12 +341,9 @@ fn classify_gallery_dl_error(stderr: &str) -> AppError {
         AppError::unsupported_platform(stderr.lines().last().unwrap_or(stderr))
     } else if lower.contains("401") || lower.contains("403") || lower.contains("private") || lower.contains("login") {
         AppError::access_denied(stderr.lines().last().unwrap_or(stderr).to_string())
-    } else if crate::downloader::retry::has_network_marker(&lower) {
+    } else if crate::downloader::retry::has_network_marker(stderr) {
         // Kiểm tra lỗi mạng SAU các lỗi nội dung, cùng lý do như trong `ytdlp`.
-        AppError::new(
-            "NETWORK_ERROR",
-            stderr.lines().last().unwrap_or(stderr).to_string(),
-        )
+        AppError::network_error(stderr.lines().last().unwrap_or(stderr).to_string())
     } else {
         AppError::new(
             "DOWNLOAD_FAILED",
@@ -445,6 +442,32 @@ mod tests {
         assert_eq!(
             classify_gallery_dl_error("HttpError: 403 Forbidden").code,
             "ACCESS_DENIED"
+        );
+    }
+
+    #[test]
+    fn content_failures_win_over_network_markers_in_the_same_message() {
+        // Ghim thứ tự nhánh, y như bên `ytdlp`: chuỗi mang cả hai loại dấu hiệu
+        // phải ra lỗi nội dung, nếu không một tài khoản bị chặn vĩnh viễn sẽ bị
+        // thử lại mãi.
+        assert_eq!(
+            classify_gallery_dl_error("HttpError: 403 Forbidden (connection timed out)").code,
+            "ACCESS_DENIED",
+            "content failure must win over a network marker in the same message"
+        );
+        assert_eq!(
+            classify_gallery_dl_error("Unsupported URL 'https://example.com' (connection reset)").code,
+            "UNSUPPORTED_PLATFORM",
+            "content failure must win over a network marker in the same message"
+        );
+    }
+
+    #[test]
+    fn only_the_last_stderr_line_reaches_the_message() {
+        let err = classify_gallery_dl_error("[gallery-dl][warning] noise\nConnectionError: Connection reset by peer");
+        assert_eq!(
+            err.message, "ConnectionError: Connection reset by peer",
+            "only the last line reaches the UI"
         );
     }
 }
