@@ -481,6 +481,39 @@ Thêm vào `mod tests` trong `src-tauri/src/db/mod.rs`:
     }
 
     #[test]
+    fn repair_unpositioned_jobs_appends_them_after_positioned_ones() {
+        let db = temp_db();
+        let mut positioned = sample_job("positioned");
+        positioned.queue_position = 4.0;
+        let mut orphan = sample_job("orphan");
+        orphan.queue_position = 0.0;
+        orphan.created_at = "2026-07-26T01:00:00Z".to_string();
+        db.insert_job(&positioned).unwrap();
+        db.insert_job(&orphan).unwrap();
+
+        let repaired = db.repair_unpositioned_jobs().unwrap();
+
+        assert_eq!(repaired, 1);
+        assert_eq!(db.get_job("positioned").unwrap().unwrap().queue_position, 4.0);
+        assert_eq!(
+            db.get_job("orphan").unwrap().unwrap().queue_position,
+            5.0,
+            "job chưa có vị trí phải xếp vào cuối, không phải đầu"
+        );
+    }
+
+    #[test]
+    fn repair_unpositioned_jobs_is_a_no_op_when_everything_has_a_position() {
+        let db = temp_db();
+        let mut job = sample_job("job-1");
+        job.queue_position = 2.0;
+        db.insert_job(&job).unwrap();
+
+        assert_eq!(db.repair_unpositioned_jobs().unwrap(), 0);
+        assert_eq!(db.get_job("job-1").unwrap().unwrap().queue_position, 2.0);
+    }
+
+    #[test]
     fn mark_job_for_retry_requeues_with_a_future_deadline() {
         let db = temp_db();
         let mut running = sample_job("job-1");
@@ -650,6 +683,56 @@ Trong `src-tauri/src/db/mod.rs`, thêm ngay sau `list_jobs_by_statuses` (`:173`)
             params![Utc::now().to_rfc3339()],
         )?;
         Ok(changed)
+    }
+
+    /// Cấp vị trí cho các job chưa từng có vị trí thật.
+    ///
+    /// Migration 0008 chỉ đánh số một lần cho các dòng có sẵn tại thời điểm nó
+    /// chạy. Một job được chèn bởi đường nào đó không đi qua `enqueue` sẽ mang
+    /// `queue_position = 0.0` và vì thế sắp trước *mọi* job đã được đánh số —
+    /// một lỗi thứ tự âm thầm, không bao giờ tự khỏi vì backfill không quay
+    /// lại lần hai.
+    ///
+    /// Gọi một lần lúc khởi động, cạnh `reset_interrupted_jobs`. Trong vận
+    /// hành bình thường nó không đổi dòng nào; nó tồn tại để bất biến "mọi job
+    /// đều có vị trí phân biệt" không phụ thuộc vào việc mọi đường tạo job đều
+    /// nhớ gọi đúng hàm.
+    pub fn repair_unpositioned_jobs(&self) -> Result<usize, AppError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+
+        let ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM download_jobs
+                 WHERE queue_position = 0
+                   AND status IN ('queued','paused','downloading','fetching_metadata')
+                 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<String>>>()?
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let max: Option<f64> = tx.query_row(
+            "SELECT MAX(queue_position) FROM download_jobs",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut next = max.unwrap_or(0.0);
+
+        // Xếp vào cuối theo thứ tự tạo: chúng chưa từng được người dùng sắp
+        // xếp, nên không có ý định nào để bảo toàn.
+        for id in &ids {
+            next += 1.0;
+            tx.execute(
+                "UPDATE download_jobs SET queue_position = ?1 WHERE id = ?2",
+                params![next, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ids.len())
     }
 
     /// Đưa job về hàng chờ kèm mốc thời gian được phép thử lại (FR-121).
@@ -1673,6 +1756,7 @@ Trong `src-tauri/src/lib.rs`, `DownloadQueue::new` giờ nhận thêm tham số:
 ```rust
             let db = Arc::new(Db::open(&app_data_dir.join("media-downloader.db"))?);
             let interrupted = db.reset_interrupted_jobs()?;
+            db.repair_unpositioned_jobs()?;
             let settings = db.get_settings()?;
             let queue = DownloadQueue::new(
                 Arc::clone(&db),
