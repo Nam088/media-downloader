@@ -6,7 +6,11 @@ node_modules
 dist
 dist-ssr
 /src-tauri/target
-/src-tauri/binaries/ffmpeg
+# The `*` matters: without it this matched only a file literally named
+# `ffmpeg`, so the target-triple-suffixed `ffmpeg-aarch64-apple-darwin` slipped
+# through and got committed — a 416K dynamically-linked Homebrew copy that only
+# runs on a machine with that exact Homebrew ffmpeg installed.
+/src-tauri/binaries/ffmpeg*
 /src-tauri/binaries/yt-dlp*
 /src-tauri/binaries/gallery-dl*
 /src-tauri/binaries/spotiflac*

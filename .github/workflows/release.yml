@@ -122,20 +122,46 @@ jobs:
           unzip -q ffmpeg.zip
           cp ffmpeg-*-win64-gpl/bin/ffmpeg.exe "src-tauri/binaries/${{ matrix.ffmpeg_dest_name }}"
 
-      # macOS: evermeet.cx only publishes x86_64 static builds today.
-      # TODO before shipping to Apple Silicon users: verify Rosetta 2 is an
-      # acceptable dependency, or replace this step with a verified
-      # universal/arm64 static ffmpeg source — do not ship silently assuming
-      # Rosetta is present, since that would quietly break FR-018 for some
-      # users on Apple Silicon.
+      # This step used to pull from evermeet.cx, which publishes x86_64 only —
+      # verified, not assumed: its release zip is `Mach-O 64-bit executable
+      # x86_64`. The macOS target here is `aarch64-apple-darwin`, so that build
+      # would have run through Rosetta 2, which is NOT installed by default on
+      # Apple Silicon. A sidecar spawned by the app cannot usefully prompt for
+      # it, so every download needing post-processing would have failed on a
+      # clean Mac — silently breaking the FR-018/SC-008 promise for exactly the
+      # users least able to diagnose it.
+      #
+      # martin-riedl.de publishes a genuine arm64 build. Checked before
+      # adopting: `lipo -archs` reports arm64, and `otool -L` lists nothing
+      # outside /System and /usr/lib, so it carries no dependency the target
+      # machine has to already have.
       - name: Fetch ffmpeg sidecar (macOS)
         if: matrix.platform == 'macos-latest'
         run: |
-          FFMPEG_URL=$(curl -fsSL "https://evermeet.cx/ffmpeg/info/ffmpeg/release" | python3 -c "import sys,json; print(json.load(sys.stdin)['download']['zip']['url'])")
-          curl -fL "$FFMPEG_URL" -o ffmpeg.zip
+          curl -fL "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip" -o ffmpeg.zip
           unzip -q ffmpeg.zip
           cp ffmpeg "src-tauri/binaries/${{ matrix.ffmpeg_dest_name }}"
           chmod +x "src-tauri/binaries/${{ matrix.ffmpeg_dest_name }}"
+
+      # A dynamically-linked ffmpeg runs fine on the machine that built it and
+      # fails on every other one, which is the failure mode this whole bundle
+      # exists to prevent — and it is invisible until a user reports it. The
+      # local dev script copies the system ffmpeg by design, so this guard is
+      # what keeps that convenience from ever reaching a release.
+      - name: Verify the ffmpeg sidecar is self-contained
+        if: matrix.platform == 'macos-latest'
+        run: |
+          LEAKED=$(otool -L "src-tauri/binaries/${{ matrix.ffmpeg_dest_name }}" | tail -n +2 | grep -vE '/System/|/usr/lib/' || true)
+          if [ -n "$LEAKED" ]; then
+            echo "::error::ffmpeg sidecar links against libraries outside the OS:"
+            echo "$LEAKED"
+            exit 1
+          fi
+          ARCH=$(lipo -archs "src-tauri/binaries/${{ matrix.ffmpeg_dest_name }}")
+          if [ "$ARCH" != "arm64" ]; then
+            echo "::error::ffmpeg sidecar is $ARCH, but the target is aarch64-apple-darwin"
+            exit 1
+          fi
 
       - name: Build installer
         run: pnpm tauri build --target ${{ matrix.target }}
