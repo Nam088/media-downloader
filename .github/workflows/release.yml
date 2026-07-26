@@ -252,21 +252,22 @@ jobs:
         # failure as a bare `failed to run linuxdeploy` and swallows the tool's
         # own output, which is what made the first two attempts at this guesses
         # rather than fixes.
-        shell: bash
-        run: |
-          # linuxdeploy walks every ELF file in the AppDir and resolves its
-          # shared libraries. That includes the PyInstaller onedir bundles we
-          # ship as resources, whose Python extension modules link against
-          # libraries that live inside their own _internal/ folder and nowhere
-          # on the system — libmpdec.so.4, needed by _decimal, is the one it
-          # died on. The libraries are present, just not anywhere the loader
-          # looks, so pointing LD_LIBRARY_PATH at those folders is enough for
-          # linuxdeploy to find and deploy them.
-          if [ "${{ matrix.platform }}" = "ubuntu-latest" ]; then
-            export LD_LIBRARY_PATH="$(ls -d src-tauri/binaries/*/_internal 2>/dev/null | tr '\n' ':')$LD_LIBRARY_PATH"
-            echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
-          fi
-          pnpm tauri build --verbose --target ${{ matrix.target }}
+        #
+        # DO NOT put the PyInstaller bundles' _internal/ folders on
+        # LD_LIBRARY_PATH to satisfy linuxdeploy. That was tried and it broke
+        # the build earlier and harder than the problem it aimed at: the
+        # variable applies to every process in the tree, so `node` — which
+        # runs vite inside this very command — loaded the ancient
+        # libstdc++.so.6 shipped inside yt-dlp's bundle and died on a missing
+        # GLIBCXX_3.4.21 before Tauri was even reached.
+        #
+        # The open problem is narrower than it looked: linuxdeploy resolves
+        # shared libraries for every ELF in the AppDir, including those Python
+        # bundles, whose extension modules link against libraries that exist
+        # only inside their own _internal/ folder (libmpdec.so.4, needed by
+        # _decimal, is the first one it hits). deb and rpm are unaffected and
+        # build fine; only the AppImage artifact is missing.
+        run: pnpm tauri build --verbose --target ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
         with:
