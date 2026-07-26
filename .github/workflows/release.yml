@@ -248,7 +248,15 @@ jobs:
         # never build an AppImage.
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
-        run: pnpm tauri build --target ${{ matrix.target }}
+        # --verbose is here to end a guessing loop, not as a permanent taste.
+        # Tauri reports an AppImage bundling failure as a bare `failed to run
+        # linuxdeploy` and swallows everything linuxdeploy itself printed, so
+        # two plausible fixes (libfuse2, APPIMAGE_EXTRACT_AND_RUN) were both
+        # applied blind and both left the job failing exactly the same way,
+        # with libfuse2t64 provably installed. Without the tool's own stderr
+        # there is nothing left to reason from. Remove this once the real
+        # cause is known and fixed.
+        run: pnpm tauri build --verbose --target ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
         with:
