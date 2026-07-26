@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { formatDuration, formatEta, formatFileSize, formatSpeed } from "@/lib/format";
+import {
+  formatDuration,
+  formatEta,
+  formatFileSize,
+  formatPlatformLabel,
+  formatSpeed,
+} from "@/lib/format";
 
 describe("formatDuration", () => {
   it("shows minutes and seconds below an hour", () => {
@@ -51,5 +57,33 @@ describe("formatEta", () => {
 
   it("returns a placeholder when unknown", () => {
     expect(formatEta(null)).toBe("--:--");
+  });
+});
+
+// The backend stores `platform` as either the app's own snake_case label for
+// its 6 curated sites, or yt-dlp's raw lowercased `extractor_key` for
+// everything else (`resolve_platform_label` in `commands/media.rs`) — that
+// raw value is what gets stored and queried on, so this only touches display.
+describe("formatPlatformLabel", () => {
+  it("uses the branded display name for the app's curated platforms", () => {
+    expect(formatPlatformLabel("youtube")).toBe("YouTube");
+    expect(formatPlatformLabel("tiktok")).toBe("TikTok");
+    expect(formatPlatformLabel("facebook")).toBe("Facebook");
+    expect(formatPlatformLabel("instagram")).toBe("Instagram");
+    expect(formatPlatformLabel("twitter_x")).toBe("X (Twitter)");
+    expect(formatPlatformLabel("soundcloud")).toBe("SoundCloud");
+  });
+
+  it("cleans up a known-ugly compound extractor key", () => {
+    expect(formatPlatformLabel("imgurgallery")).toBe("Imgur");
+  });
+
+  it("capitalizes the first letter of any other raw extractor key", () => {
+    expect(formatPlatformLabel("bilibili")).toBe("Bilibili");
+    expect(formatPlatformLabel("vimeo")).toBe("Vimeo");
+  });
+
+  it("leaves an empty string unchanged rather than throwing", () => {
+    expect(formatPlatformLabel("")).toBe("");
   });
 });

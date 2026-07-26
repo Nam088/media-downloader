@@ -17,7 +17,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { formatDuration, formatFileSize } from "@/lib/format";
+import { formatDuration, formatFileSize, formatPlatformLabel } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { hasActiveFilters, useLibraryStore } from "@/stores/library-store";
 import type { MediaType } from "@/types/download";
@@ -374,7 +374,7 @@ function SelectBox({
 function ItemMeta({ item }: { item: LibraryItem }) {
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
-      <span>{item.platform}</span>
+      <span>{formatPlatformLabel(item.platform)}</span>
       <span>{item.file_format}</span>
       <span>{formatFileSize(item.file_size_bytes)}</span>
       {item.duration_seconds !== null && (

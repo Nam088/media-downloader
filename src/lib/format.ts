@@ -55,3 +55,39 @@ export function formatSpeed(bytesPerSecond: number | null | undefined): string {
 export function formatEta(seconds: number | null | undefined): string {
   return formatDuration(seconds);
 }
+
+/**
+ * `platform` lưu ở backend là nhãn snake_case riêng của app cho 6 nền tảng
+ * chính (`resolve_platform_label` trong `commands/media.rs`), hoặc
+ * `extractor_key` thô của yt-dlp/gallery-dl đã viết thường cho ~1.600 site
+ * còn lại — nên có những giá trị xấu như `"imgurgallery"`. Hàm này chỉ đổi
+ * cách hiển thị; giá trị dùng để lọc/nhóm trong store vẫn giữ nguyên bản gốc.
+ */
+const PLATFORM_DISPLAY_NAMES: Record<string, string> = {
+  youtube: "YouTube",
+  tiktok: "TikTok",
+  facebook: "Facebook",
+  instagram: "Instagram",
+  twitter_x: "X (Twitter)",
+  soundcloud: "SoundCloud",
+  imgurgallery: "Imgur",
+};
+
+export function formatPlatformLabel(platform: string): string {
+  const known = PLATFORM_DISPLAY_NAMES[platform];
+  if (known) return known;
+  return platform.length > 0 ? platform[0].toUpperCase() + platform.slice(1) : platform;
+}
+
+/** The 6 platforms FR-014 requires (`PLATFORM_HOSTS` in `src-tauri/src/platform.rs`)
+ * — the ones worth advertising as "quick tags" before a preview. Everything
+ * else `formatPlatformLabel` prettifies is a fallback the app happens to
+ * support, not something to showcase as a headline feature. */
+export const CURATED_PLATFORMS = [
+  "youtube",
+  "tiktok",
+  "facebook",
+  "instagram",
+  "twitter_x",
+  "soundcloud",
+] as const;
