@@ -4,7 +4,9 @@ mod downloader;
 mod error;
 mod logging;
 mod models;
+mod notify;
 mod platform;
+mod tray;
 
 use std::sync::Arc;
 
@@ -19,6 +21,29 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        // Nút đóng cửa sổ: giấu xuống khay hay thoát hẳn (FR-129).
+        //
+        // Cài đặt được đọc lại ở ĐÂY, mỗi lần đóng, chứ không cache lúc khởi
+        // động — người dùng vừa bật/tắt chạy nền trong Cài đặt là có hiệu lực
+        // ngay, không phải khởi động lại ứng dụng.
+        //
+        // Không đọc được cài đặt (kể cả khi state chưa kịp đăng ký) thì
+        // `close_action` chọn thoát, đúng với mặc định tắt của
+        // `run_in_background`.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
+                let run_in_background = app
+                    .try_state::<Arc<Db>>()
+                    .and_then(|db| db.get_settings().ok())
+                    .map(|settings| settings.run_in_background);
+                if tray::close_action(run_in_background) == tray::CloseAction::HideToTray {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             // Đăng ký sớm nhất có thể: mọi `log_event` từ đây trở đi (kể cả
@@ -52,6 +77,12 @@ pub fn run() {
             app.manage(queue);
             app.manage(PreviewCache::default());
             app.manage(ActivePreviews::default());
+
+            // Sau `app.manage(queue)`: mục "Pause all downloads" của menu khay
+            // lấy hàng đợi ra từ state, nên state phải có trước khi khay tồn
+            // tại để người dùng bấm được.
+            tray::build_tray(app.handle())?;
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

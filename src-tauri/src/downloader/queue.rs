@@ -550,6 +550,17 @@ async fn finish_job(
                 .mark_job_for_retry(job_id, &next_retry_at, &err.message)
                 .is_ok()
             {
+                // Cố ý đi qua đúng cái chốt mà nhánh thất bại vĩnh viễn dùng,
+                // với trạng thái thật của job (`Queued`): `notification_for`
+                // trả `None` cho nó, nên một lần thử lại KHÔNG bắn thông báo.
+                // Gọi ở đây thay vì im lặng bỏ qua để quy tắc đó nằm trong một
+                // hàm thuần kiểm thử được, chứ không nằm ở chỗ thiếu một dòng.
+                crate::notify::notify_job_finished(
+                    &handles.app,
+                    &JobStatus::Queued,
+                    log_label,
+                    Some(&err.message),
+                );
                 emit_status_changed(
                     &handles.app,
                     job_id,
@@ -576,6 +587,15 @@ async fn finish_job(
     let _ = handles
         .db
         .update_job_status(job_id, JobStatus::Failed, Some(&err.message));
+    // Thất bại vĩnh viễn: mọi lần thử lại đã dùng hết hoặc lỗi không đáng thử
+    // lại. Đây là lúc người dùng cần biết, nhất là khi họ đã đóng cửa sổ đi
+    // làm việc khác (FR-128).
+    crate::notify::notify_job_finished(
+        &handles.app,
+        &JobStatus::Failed,
+        log_label,
+        Some(&err.message),
+    );
     emit_status_changed(&handles.app, job_id, JobStatus::Failed, Some(err.message), None);
 }
 
@@ -689,6 +709,15 @@ async fn run_job(
     handles
         .db
         .update_job_status(&job.id, JobStatus::Completed, None)?;
+    // Link nguồn là nhãn dự phòng khi job chưa bao giờ có tiêu đề (ví dụ một
+    // mục fan-out từ playlist phẳng): một thông báo "Download complete" trống
+    // không nói được vừa xong cái gì khi có nhiều tác vụ cùng chạy.
+    crate::notify::notify_job_finished(
+        &handles.app,
+        &JobStatus::Completed,
+        job.title.as_deref().unwrap_or(&job.source_url),
+        None,
+    );
     emit_status_changed(
         &handles.app,
         &job.id,
@@ -900,6 +929,15 @@ async fn run_gallery_job(
     handles
         .db
         .update_job_status(&job.id, JobStatus::Completed, None)?;
+    // Link nguồn là nhãn dự phòng khi job chưa bao giờ có tiêu đề (ví dụ một
+    // mục fan-out từ playlist phẳng): một thông báo "Download complete" trống
+    // không nói được vừa xong cái gì khi có nhiều tác vụ cùng chạy.
+    crate::notify::notify_job_finished(
+        &handles.app,
+        &JobStatus::Completed,
+        job.title.as_deref().unwrap_or(&job.source_url),
+        None,
+    );
     emit_status_changed(
         &handles.app,
         &job.id,
