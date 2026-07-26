@@ -14,11 +14,8 @@ const ACTIVE_STATUSES: [JobStatus; 4] = [
     JobStatus::Paused,
 ];
 
-const HISTORY_STATUSES: [JobStatus; 3] = [
-    JobStatus::Completed,
-    JobStatus::Failed,
-    JobStatus::Canceled,
-];
+const HISTORY_STATUSES: [JobStatus; 3] =
+    [JobStatus::Completed, JobStatus::Failed, JobStatus::Canceled];
 
 #[tauri::command]
 pub fn list_queue(db: State<Arc<Db>>) -> Result<Vec<DownloadJob>, AppError> {
@@ -40,7 +37,9 @@ pub fn open_containing_folder(
     db: State<Arc<Db>>,
     job_id: String,
 ) -> Result<(), AppError> {
-    let job = db.get_job(&job_id)?.ok_or_else(|| AppError::not_found("Job"))?;
+    let job = db
+        .get_job(&job_id)?
+        .ok_or_else(|| AppError::not_found("Job"))?;
     let file_path = job
         .output_file_path
         .ok_or_else(|| AppError::new("NOT_FOUND", "This job has no downloaded file yet"))?;

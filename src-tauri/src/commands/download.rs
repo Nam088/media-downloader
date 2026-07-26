@@ -65,7 +65,10 @@ pub struct CreateJobInput {
 /// there is nothing real to validate against yet — skip the check and let
 /// `queue::build_ytdlp_args` fall back to yt-dlp's own "best" selection for
 /// each fanned-out entry (T033).
-fn validate_quality(preview: &crate::models::MediaSource, input: &CreateJobInput) -> Result<(), AppError> {
+fn validate_quality(
+    preview: &crate::models::MediaSource,
+    input: &CreateJobInput,
+) -> Result<(), AppError> {
     if preview.is_playlist {
         return Ok(());
     }
@@ -102,7 +105,11 @@ fn validate_quality(preview: &crate::models::MediaSource, input: &CreateJobInput
                 .video_quality
                 .as_deref()
                 .ok_or_else(AppError::invalid_quality_option)?;
-            if !preview.available_video_qualities.iter().any(|opt| opt.label == quality) {
+            if !preview
+                .available_video_qualities
+                .iter()
+                .any(|opt| opt.label == quality)
+            {
                 return Err(AppError::invalid_quality_option());
             }
         }
@@ -202,9 +209,12 @@ pub async fn create_download_job(
     cache: State<'_, PreviewCache>,
     input: CreateJobInput,
 ) -> Result<Vec<DownloadJob>, AppError> {
-    let preview = cache
-        .get(&input.source_url)
-        .ok_or_else(|| AppError::new("PREVIEW_REQUIRED", "Call preview_media before creating a job"))?;
+    let preview = cache.get(&input.source_url).ok_or_else(|| {
+        AppError::new(
+            "PREVIEW_REQUIRED",
+            "Call preview_media before creating a job",
+        )
+    })?;
 
     validate_quality(&preview, &input)?;
 
@@ -322,7 +332,10 @@ pub async fn create_playlist_download_jobs(
     input: CreatePlaylistJobsInput,
 ) -> Result<Vec<DownloadJob>, AppError> {
     if input.items.is_empty() {
-        return Err(AppError::new("MISSING_QUALITY", "Select at least one video to download"));
+        return Err(AppError::new(
+            "MISSING_QUALITY",
+            "Select at least one video to download",
+        ));
     }
 
     let parent_playlist_id = uuid::Uuid::new_v4().to_string();
