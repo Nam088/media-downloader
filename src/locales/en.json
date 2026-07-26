@@ -95,7 +95,6 @@
     "no_audio_formats": "No audio quality options are available for this link.",
     "no_video_qualities": "No video quality options are available for this link.",
     "best_available": "Best available",
-    "size_unknown": "size unknown",
     "output_directory_label": "Save to",
     "choose_directory_button": "Choose folder",
     "no_directory_chosen": "No folder chosen yet",

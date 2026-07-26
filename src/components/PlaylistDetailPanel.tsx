@@ -169,7 +169,9 @@ function PlaylistDetailPanelInner({
       <div className="flex max-h-80 flex-col gap-1.5 overflow-y-auto pr-1">
         {entries.map((entry, index) => {
           const isSelected = selected.has(index);
-          const duration = formatDuration(entry.duration_seconds);
+          // Guard on the raw value so entries with no duration hide the clock
+          // badge instead of showing the `--:--` placeholder.
+          const duration = entry.duration_seconds != null ? formatDuration(entry.duration_seconds) : null;
           return (
             <div
               key={`${entry.url}-${index}`}

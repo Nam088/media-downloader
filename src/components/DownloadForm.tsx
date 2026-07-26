@@ -126,7 +126,7 @@ function QualityOptionsList({
             <span className="w-16 shrink-0 font-semibold text-foreground">{row.label}</span>
             <span className="flex-1 text-xs text-muted-foreground">{row.detail}</span>
             <span className="shrink-0 text-xs font-mono font-medium text-muted-foreground">
-              {row.size ?? t("downloadForm.size_unknown")}
+              {row.size}
             </span>
           </label>
         ))}
@@ -439,7 +439,12 @@ export function DownloadForm() {
       (mediaType === "gallery" || preview.is_playlist || selectedQuality),
   );
   const canDownloadBatch = Boolean(effectiveOutputDirectory && !submitting && urls.length > 0);
-  const duration = preview ? formatDuration(preview.duration_seconds) : null;
+  // Guard on the raw value, not the formatted string: formatDuration always
+  // returns a placeholder, so testing its result would show a `--:--` clock
+  // badge on sources with no duration (live streams). `!= null` rather than a
+  // truthiness check so a genuine zero-second source still renders.
+  const duration =
+    preview && preview.duration_seconds != null ? formatDuration(preview.duration_seconds) : null;
 
   return (
     <Card className="overflow-hidden rounded-lg border-border/80 bg-card shadow-2xs transition-all">

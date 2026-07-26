@@ -74,4 +74,31 @@ describe("DownloadForm", () => {
     expect(screen.getByText("160kbps")).toBeInTheDocument();
     expect(screen.queryByText("128kbps")).not.toBeInTheDocument();
   });
+
+  it("shows the duration badge when the source reported one", async () => {
+    mockGetSettingsThenPreview(SAMPLE_PREVIEW);
+    const user = userEvent.setup();
+    render(<DownloadForm />);
+
+    await user.type(screen.getByLabelText(/video or audio link/i), SAMPLE_PREVIEW.source_url);
+    await user.click(screen.getByRole("button", { name: /preview/i }));
+
+    expect(await screen.findByText("Sample video")).toBeInTheDocument();
+    expect(screen.getByText("2:00")).toBeInTheDocument();
+  });
+
+  // The badge is guarded on the raw duration, not on the formatted string --
+  // formatDuration always returns "--:--" for a missing value, so guarding on
+  // its result would put a meaningless clock badge on every live stream.
+  it("hides the duration badge entirely when the source has no duration", async () => {
+    mockGetSettingsThenPreview({ ...SAMPLE_PREVIEW, duration_seconds: null });
+    const user = userEvent.setup();
+    render(<DownloadForm />);
+
+    await user.type(screen.getByLabelText(/video or audio link/i), SAMPLE_PREVIEW.source_url);
+    await user.click(screen.getByRole("button", { name: /preview/i }));
+
+    expect(await screen.findByText("Sample video")).toBeInTheDocument();
+    expect(screen.queryByText("--:--")).not.toBeInTheDocument();
+  });
 });
