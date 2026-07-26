@@ -11,6 +11,7 @@ import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { ErrorBanner } from "@/components/ErrorBanner";
+import { GalleryItemPicker } from "@/components/GalleryItemPicker";
 import { PlaylistDetailPanel } from "@/components/PlaylistDetailPanel";
 import { PlaylistScopeDialog } from "@/components/PlaylistScopeDialog";
 import { useAppSettings } from "@/hooks/use-app-settings";
@@ -540,76 +541,11 @@ export function DownloadForm() {
               </div>
             ) : preview.is_gallery ? (
               <div className="flex flex-col gap-6 px-6 pt-2 pb-2">
-                {(() => {
-                  const imageItems = preview.gallery_items
-                    .map((item, index) => ({ item, index }))
-                    .filter(({ item }) => !item.is_audio);
-                  if (imageItems.length === 0) return null;
-                  const selectedCount = imageItems.filter(({ index }) => selectedGalleryIndices.has(index)).length;
-                  return (
-                    <div className="flex flex-col gap-2">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs font-medium text-muted-foreground">
-                          {t("downloadForm.gallery_selected_count", { selected: selectedCount, total: imageItems.length })}
-                        </span>
-                        <div className="flex items-center gap-3">
-                          <button
-                            type="button"
-                            onClick={() => setSelectedGalleryIndices(new Set(imageItems.map(({ index }) => index)))}
-                            className="text-xs font-semibold text-primary hover:underline"
-                          >
-                            {t("downloadForm.gallery_select_all")}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setSelectedGalleryIndices(new Set())}
-                            className="text-xs font-semibold text-muted-foreground hover:underline"
-                          >
-                            {t("downloadForm.gallery_select_none")}
-                          </button>
-                        </div>
-                      </div>
-                      <div className="grid grid-cols-4 gap-2 sm:grid-cols-6">
-                        {imageItems.slice(0, 24).map(({ item, index }) => {
-                          const isSelected = selectedGalleryIndices.has(index);
-                          return (
-                            <button
-                              type="button"
-                              key={index}
-                              onClick={() =>
-                                setSelectedGalleryIndices((prev) => {
-                                  const next = new Set(prev);
-                                  if (next.has(index)) {
-                                    next.delete(index);
-                                  } else {
-                                    next.add(index);
-                                  }
-                                  return next;
-                                })
-                              }
-                              className="group relative aspect-square overflow-hidden rounded-md border border-border/50 shadow-2xs"
-                            >
-                              <img
-                                src={item.url}
-                                alt=""
-                                className={`h-full w-full object-cover transition-opacity ${isSelected ? "" : "opacity-35"}`}
-                              />
-                              <span
-                                className={`absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full border text-[10px] font-bold transition-colors ${
-                                  isSelected
-                                    ? "border-primary bg-primary text-primary-foreground"
-                                    : "border-white/80 bg-black/30 text-transparent"
-                                }`}
-                              >
-                                ✓
-                              </span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  );
-                })()}
+                <GalleryItemPicker
+                  items={preview.gallery_items}
+                  selectedIndices={Array.from(selectedGalleryIndices)}
+                  onChange={(indices) => setSelectedGalleryIndices(new Set(indices))}
+                />
                 <p className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
                   <Images className="h-4 w-4" />
                   {t("downloadForm.gallery_item_count", { count: preview.gallery_items.length })}
