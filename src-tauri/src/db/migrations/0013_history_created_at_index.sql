@@ -1,0 +1,24 @@
+-- Lịch sử chuyển từ `ORDER BY updated_at DESC` sang `created_at DESC`.
+--
+-- Lý do không phải thẩm mỹ mà là tính đúng đắn của phân trang: `list_history_page`
+-- phân trang bằng LIMIT/OFFSET, và OFFSET chỉ có nghĩa khi khoá sắp xếp đứng yên
+-- trong lúc người dùng lật trang. `updated_at` thì không — một job đổi trạng thái
+-- khi người dùng đang ở trang 3 sẽ đẩy các dòng qua ranh giới trang, làm hiện lặp
+-- một mục hoặc nhảy mất một mục. `created_at` bất biến sau khi ghi.
+--
+-- Nó cũng khớp với điều người dùng mong đợi hơn: bấm Thử lại một job cũ trước đây
+-- kéo nó lên đầu Lịch sử. Trong dữ liệu thật có 10 dòng lệch như vậy — phần lớn là
+-- job bị treo dở, được `reset_interrupted_jobs` chuyển sang `paused` lúc khởi
+-- động rồi tiếp tục sau, nên chúng nằm trên những job được tải sau chúng.
+--
+-- Index này là bắt buộc chứ không phải tối ưu thêm: index duy nhất có `created_at`
+-- là `idx_download_jobs_dispatch (status, queue_position, created_at)`, mà
+-- `queue_position` chen vào giữa nên nó không phục vụ được `WHERE status IN (...)
+-- ORDER BY created_at DESC`. Thiếu index này thì mỗi lần lật trang SQLite phải
+-- dựng một b-tree tạm cho toàn bộ tập kết quả.
+--
+-- Cột `status` đứng trước để một tab cụ thể ("Hoàn tất"/"Thất bại"/"Đã huỷ") quét
+-- được đúng một khoảng liên tục; tab "Tất cả" vẫn dùng được index này cho phần
+-- sắp xếp. Khai báo DESC để chiều quét thuận khớp luôn với thứ tự cần trả về.
+CREATE INDEX IF NOT EXISTS idx_download_jobs_history
+    ON download_jobs (status, created_at DESC);
