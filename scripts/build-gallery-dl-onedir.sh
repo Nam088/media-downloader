@@ -38,8 +38,13 @@ case "$(uname -s)" in
   *) VENV_BIN="$BUILD_ROOT/venv/bin" ;;
 esac
 
-"$VENV_BIN/pip" install --quiet --upgrade pip
-"$VENV_BIN/pip" install --quiet "gallery-dl==$GALLERY_DL_VERSION" pyinstaller
+# `python -m pip`, never `pip` directly: on Windows the console script is
+# pip.exe, and Windows will not let a running executable replace itself, so
+# `pip install --upgrade pip` fails outright with "To modify pip, please run
+# the following command". It works on macOS and Linux, which is exactly why
+# this only ever broke on the Windows CI runner.
+"$VENV_BIN/python" -m pip install --quiet --upgrade pip
+"$VENV_BIN/python" -m pip install --quiet "gallery-dl==$GALLERY_DL_VERSION" pyinstaller
 
 GALLERY_DL_PKG_DIR="$("$VENV_BIN/python" -c 'import gallery_dl, os; print(os.path.dirname(gallery_dl.__file__))')"
 
