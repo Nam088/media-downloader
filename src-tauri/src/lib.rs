@@ -108,6 +108,8 @@ pub fn run() {
             commands::presets::set_default_preset,
             commands::history::list_queue,
             commands::history::list_history,
+            commands::history::count_history,
+            commands::history::clear_history,
             commands::history::open_containing_folder,
             commands::library::list_library,
             commands::library::library_stats,

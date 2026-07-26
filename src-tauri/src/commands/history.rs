@@ -5,7 +5,7 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::db::Db;
 use crate::error::AppError;
-use crate::models::{DownloadJob, JobStatus};
+use crate::models::{DownloadJob, HistoryQuery, JobStatus};
 
 const ACTIVE_STATUSES: [JobStatus; 4] = [
     JobStatus::Queued,
@@ -22,13 +22,27 @@ pub fn list_queue(db: State<Arc<Db>>) -> Result<Vec<DownloadJob>, AppError> {
     db.list_jobs_by_statuses(&ACTIVE_STATUSES)
 }
 
+/// Một trang Lịch sử: mới nhất trước (FR-007, data-model.md §4), lọc theo
+/// tab trạng thái + từ khoá ngay ở backend nên `count_history` cùng bộ lọc
+/// luôn khớp với đúng tập đang hiển thị — số trang không lệch khỏi thực tế
+/// như khi lọc phía giao diện trên một trang dữ liệu thô.
 #[tauri::command]
-pub fn list_history(db: State<Arc<Db>>) -> Result<Vec<DownloadJob>, AppError> {
-    let mut jobs = db.list_jobs_by_statuses(&HISTORY_STATUSES)?;
-    // `list_jobs_by_statuses` orders by `created_at ASC` (queue order); the
-    // history view wants most-recent-first (FR-007, data-model.md §4).
-    jobs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    Ok(jobs)
+pub fn list_history(db: State<Arc<Db>>, query: HistoryQuery) -> Result<Vec<DownloadJob>, AppError> {
+    db.list_history_page(&query)
+}
+
+/// Tổng số dòng khớp CÙNG bộ lọc của `list_history` — dùng để tính số trang.
+#[tauri::command]
+pub fn count_history(db: State<Arc<Db>>, query: HistoryQuery) -> Result<i64, AppError> {
+    db.count_history(&query)
+}
+
+/// Xoá toàn bộ Lịch sử (đã xong/thất bại/đã huỷ). Chỉ xoá bản ghi tác vụ —
+/// không đụng tới file đã tải hay chỉ mục Library, vốn là một khái niệm khác
+/// với vòng đời quản lý riêng (xoá/di chuyển/xoá khỏi chỉ mục ở trang Library).
+#[tauri::command]
+pub fn clear_history(db: State<Arc<Db>>) -> Result<usize, AppError> {
+    db.delete_jobs_by_statuses(&HISTORY_STATUSES)
 }
 
 #[tauri::command]

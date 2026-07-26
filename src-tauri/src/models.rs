@@ -789,6 +789,23 @@ pub enum SortDirection {
     Desc,
 }
 
+/// Trang Lịch sử, lọc ở backend nên số trang luôn khớp với kết quả đang lọc
+/// (cùng lý do với `LibraryQuery` ngay dưới đây). `status` là `None` = cả ba
+/// trạng thái kết thúc (tab "Tất cả"), `Some(x)` = chỉ tab đó — `x` luôn là
+/// một trong ba trạng thái kết thúc, không phải giá trị nào khác của
+/// `JobStatus`; lời gọi với một trạng thái đang-chạy đơn giản là không khớp
+/// dòng nào, vì Lịch sử luôn ép thêm điều kiện thuộc ba trạng thái đó.
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(default)]
+pub struct HistoryQuery {
+    /// Khớp URL nguồn, tên file đầu ra, hoặc tên nền tảng — không phân biệt
+    /// hoa thường, giống hệt bộ lọc phía giao diện trước đây.
+    pub search: Option<String>,
+    pub status: Option<JobStatus>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 /// Trạng thái duyệt thư viện (FR-307 → FR-310). `#[serde(default)]` ở cả
 /// struct: một lời gọi `list_library({})` là hợp lệ và có nghĩa "mọi thứ, mới
 /// nhất trước".

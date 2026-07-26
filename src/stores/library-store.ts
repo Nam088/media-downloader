@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 
 import i18n from "@/lib/i18n";
+import { totalPagesOf } from "@/lib/pagination";
 import type { AppError, DownloadJob, MediaType } from "@/types/download";
 import type {
   LibraryItem,
@@ -18,9 +19,9 @@ import type {
  *
  * FR-310 quyết định hình dạng của store này. Một thư viện 10.000 mục không được
  * đi qua IPC trong một nhịp, nên mọi lần nạp đều là **một trang** (`limit` +
- * `offset`) và các trang nối đuôi nhau vào `items` khi người dùng cuộn tới đáy.
- * Đổi bộ lọc, từ khoá hay thứ tự sắp xếp thì trang quay về 0 — vì `offset` chỉ
- * có nghĩa trong đúng một truy vấn.
+ * `offset`) — và người dùng chọn trang bằng số, giống hệt trang Lịch sử. Đổi bộ
+ * lọc, từ khoá, thứ tự sắp xếp hay cỡ trang thì quay về trang 1 — vì `offset`
+ * chỉ có nghĩa trong đúng một truy vấn.
  *
  * Ba thứ được nhớ giữa các phiên (FR-306, FR-309): kiểu hiển thị, tiêu chí sắp
  * xếp và chiều sắp xếp. Chúng nằm ở `localStorage` chứ không phải trong CSDL vì
@@ -28,9 +29,13 @@ import type {
  * không mất gì cả.
  */
 
-/** Số mục xin mỗi lần. Đủ để lấp đầy màn hình lưới rộng nhất ở lần đầu, đủ nhỏ
- * để 10.000 mục không bao giờ nằm cùng lúc trong một câu trả lời IPC. */
-export const LIBRARY_PAGE_SIZE = 60;
+/** Cỡ trang cho người dùng chọn — cùng bộ với trang Lịch sử, vì hai danh sách
+ * giờ là cùng một thao tác. */
+export const LIBRARY_PAGE_SIZES = [10, 20, 50] as const;
+
+/** Mặc định 20: thư viện thật của người dùng là 66 mục, tức bốn trang — đủ
+ * nhiều để thanh trang có việc để làm, đủ ít để không phải cuộn tìm nó. */
+export const DEFAULT_LIBRARY_PAGE_SIZE = 20;
 
 /**
  * FR-307 nói kết quả cập nhật "trong lúc người dùng gõ", không nói mỗi phím là
@@ -172,15 +177,22 @@ interface LibraryState {
   viewMode: LibraryViewMode;
   selectedIds: string[];
   loading: boolean;
-  loadingMore: boolean;
-  hasMore: boolean;
+  /** Trang đang xem, đếm từ 1 — cùng con số hiện trên nút. */
+  page: number;
+  pageSize: number;
+  /** Tổng số mục KHỚP BỘ LỌC hiện tại, do chính `library_stats` của lần nạp
+   * này trả về. Nó và `items` luôn tả cùng một truy vấn, nên số trang không bao
+   * giờ hứa một trang mà `list_library` không có gì để trả. */
+  totalItems: number;
   reconciling: boolean;
   error: AppError | null;
   initialized: boolean;
 
   ensureLoaded: () => Promise<void>;
+  /** Nạp lại ĐÚNG trang đang xem (kèm cắt xuống nếu nó không còn tồn tại). */
   reload: () => Promise<void>;
-  loadMore: () => Promise<void>;
+  setPage: (page: number) => Promise<void>;
+  setPageSize: (pageSize: number) => Promise<void>;
   setSearch: (value: string) => void;
   setFilters: (patch: Partial<LibraryFilterState>) => void;
   toggleMediaType: (mediaType: MediaType) => void;
@@ -229,6 +241,34 @@ export const useLibraryStore = create<LibraryState>((set, get) => {
     }
   }
 
+  /** Ảnh chụp KHÔNG áp bộ lọc dùng để dựng chính các bộ lọc. Tách khỏi `stats`
+   * một cách cố ý: `stats` tính THÔNG QUA bộ lọc đang áp, nên lấy nó dựng danh
+   * sách nền tảng thì chọn "youtube" xong sẽ không còn nền tảng nào khác để
+   * chọn nữa — một bộ lọc tự khoá mình lại. */
+  async function refreshFacets(stats: LibraryStats): Promise<void> {
+    const { filters, sort, direction } = get();
+    // Khi chưa có bộ lọc nào, `stats` CHÍNH LÀ tập lựa chọn đầy đủ — nên danh
+    // sách nền tảng/định dạng được làm mới miễn phí ở lần nạp đầu và mỗi lần
+    // người dùng xoá hết bộ lọc, không tốn thêm vòng IPC nào.
+    if (!hasActiveFilters(filters)) {
+      set({ facets: stats });
+      return;
+    }
+    // Chỉ chạy khi lần nạp đầu tiên đã có sẵn bộ lọc (khôi phục trạng thái,
+    // hoặc bấm vào một dòng thống kê trước khi lưới kịp nạp xong): không có
+    // ảnh chụp đầy đủ thì bộ lọc nền tảng sẽ rỗng vĩnh viễn.
+    if (get().facets !== null) return;
+    try {
+      set({
+        facets: await invoke<LibraryStats>("library_stats", {
+          query: toLibraryQuery(EMPTY_FILTERS, sort, direction),
+        }),
+      });
+    } catch (error) {
+      set({ error: toAppError(error) });
+    }
+  }
+
   /** Số liệu luôn tính trên đúng bộ lọc đang áp, nên chúng mô tả thứ đang hiển
    * thị chứ không phải toàn thư viện (SC-307). */
   async function refreshStats(): Promise<void> {
@@ -237,31 +277,82 @@ export const useLibraryStore = create<LibraryState>((set, get) => {
       const stats = await invoke<LibraryStats>("library_stats", {
         query: toLibraryQuery(filters, sort, direction),
       });
-      // Khi chưa có bộ lọc nào, `stats` CHÍNH LÀ tập lựa chọn đầy đủ — nên
-      // danh sách nền tảng/định dạng được làm mới miễn phí ở lần nạp đầu và
-      // mỗi lần người dùng xoá hết bộ lọc, không tốn thêm vòng IPC nào.
-      if (!hasActiveFilters(filters)) {
-        set({ stats, facets: stats });
-        return;
-      }
-      set({ stats });
-      // Chỉ chạy khi lần nạp đầu tiên đã có sẵn bộ lọc (khôi phục trạng thái,
-      // hoặc bấm vào một dòng thống kê trước khi lưới kịp nạp xong): không có
-      // ảnh chụp đầy đủ thì bộ lọc nền tảng sẽ rỗng vĩnh viễn.
-      if (get().facets === null) {
-        set({
-          facets: await invoke<LibraryStats>("library_stats", {
-            query: toLibraryQuery(EMPTY_FILTERS, sort, direction),
-          }),
-        });
-      }
+      set({ stats, totalItems: stats.total_items });
+      await refreshFacets(stats);
     } catch (error) {
       set({ error: toAppError(error) });
     }
   }
 
-  /** Thay tại chỗ những mục vừa đổi, thay vì nạp lại cả trang: người dùng vừa
-   * đổi tên mục thứ 200 không nên bị ném về đầu danh sách. */
+  /**
+   * Nạp một trang. Trang VÀ tổng số đi cùng một nhịp `Promise.all`, nên chúng
+   * luôn trả lời cùng một câu hỏi: hỏi rời nhau thì một lần xoá xen vào giữa sẽ
+   * cho ra "trang 4/3" — một thanh phân trang nói dối về chính danh sách nó
+   * đang phân trang.
+   */
+  async function loadPage(requested: number): Promise<void> {
+    const sequence = ++requestSequence;
+    const { filters, sort, direction, pageSize } = get();
+    const page = Math.max(1, Math.floor(requested));
+    set({ loading: true, error: null });
+
+    // Cùng bộ lọc, cùng thứ tự; chỉ khác đúng `limit`/`offset` — thứ mà
+    // `library_stats` không cần và không được nhận, vì nó đếm cả tập.
+    const pageQuery = toLibraryQuery(filters, sort, direction, {
+      limit: pageSize,
+      offset: (page - 1) * pageSize,
+    });
+    const countQuery = toLibraryQuery(filters, sort, direction);
+
+    let items: LibraryItem[];
+    let stats: LibraryStats;
+    try {
+      [items, stats] = await Promise.all([
+        invoke<LibraryItem[]>("list_library", { query: pageQuery }),
+        invoke<LibraryStats>("library_stats", { query: countQuery }),
+      ]);
+    } catch (error) {
+      // Câu trả lời của một truy vấn đã bị bỏ không được phép dựng lại lỗi
+      // của nó lên màn hình đang hiển thị kết quả khác.
+      if (sequence === requestSequence) set({ loading: false, error: toAppError(error) });
+      return;
+    }
+    if (sequence !== requestSequence) return;
+
+    // Danh sách teo lại dưới chân người dùng (vừa xoá, hoặc bộ lọc của người
+    // khác vừa cắt bớt): rơi xuống trang cuối CÒN TỒN TẠI thay vì hiện một
+    // trang rỗng và bắt họ tự bấm ngược lại. Đệ quy có đáy vì `pages < page`.
+    const pages = totalPagesOf(stats.total_items, pageSize);
+    if (page > pages) {
+      await loadPage(pages);
+      return;
+    }
+
+    set({
+      items,
+      stats,
+      totalItems: stats.total_items,
+      page,
+      loading: false,
+      // Ô tích thuộc về những dòng đang nhìn thấy: giữ lại id của trang trước
+      // thì thanh công cụ vẫn nói "đã chọn 3" trong khi không dòng nào trên
+      // màn hình được tích, và "xoá mục đã chọn" sẽ xoá thứ người dùng không
+      // còn thấy.
+      selectedIds: [],
+    });
+    await refreshFacets(stats);
+  }
+
+  /**
+   * Thay tại chỗ những mục vừa đổi, thay vì nạp lại cả trang.
+   *
+   * Đổi tên và di chuyển KHÔNG làm thay đổi số mục, nên số trang vẫn đúng và
+   * cái giá duy nhất của việc vá tại chỗ là: nếu đang sắp theo tiêu đề, dòng
+   * vừa đổi tên có thể lẽ ra phải nằm ở trang khác. Nó vẫn ở lại đây tới lần
+   * nạp sau — và đó là lựa chọn cố ý: bắn dòng người dùng vừa sửa sang một
+   * trang khác ngay giữa thao tác trông y hệt như vừa xoá nhầm nó, còn cái tên
+   * mới hiện ngay tại chỗ chính là câu xác nhận "đã đổi xong".
+   */
   function patchItems(updated: LibraryItem[]): void {
     if (updated.length === 0) return;
     const byId = new Map(updated.filter((item) => item != null).map((item) => [item.id, item]));
@@ -289,8 +380,9 @@ export const useLibraryStore = create<LibraryState>((set, get) => {
     viewMode: readStored<LibraryViewMode>(VIEW_MODE_KEY, ["grid", "list"], "grid"),
     selectedIds: [],
     loading: false,
-    loadingMore: false,
-    hasMore: false,
+    page: 1,
+    pageSize: DEFAULT_LIBRARY_PAGE_SIZE,
+    totalItems: 0,
     reconciling: false,
     error: null,
     initialized: false,
@@ -306,52 +398,18 @@ export const useLibraryStore = create<LibraryState>((set, get) => {
     },
 
     reload: async () => {
-      const sequence = ++requestSequence;
-      const { filters, sort, direction } = get();
-      set({ loading: true, error: null });
-      try {
-        const items = await invoke<LibraryItem[]>("list_library", {
-          query: toLibraryQuery(filters, sort, direction, {
-            limit: LIBRARY_PAGE_SIZE,
-            offset: 0,
-          }),
-        });
-        if (sequence !== requestSequence) return;
-        set({
-          items,
-          loading: false,
-          hasMore: items.length === LIBRARY_PAGE_SIZE,
-        });
-      } catch (error) {
-        if (sequence !== requestSequence) return;
-        set({ loading: false, error: toAppError(error) });
-      }
-      if (sequence === requestSequence) await refreshStats();
+      await loadPage(get().page);
     },
 
-    loadMore: async () => {
-      const { loading, loadingMore, hasMore, items, filters, sort, direction } = get();
-      if (loading || loadingMore || !hasMore) return;
-      const sequence = requestSequence;
-      set({ loadingMore: true });
-      try {
-        const page = await invoke<LibraryItem[]>("list_library", {
-          query: toLibraryQuery(filters, sort, direction, {
-            limit: LIBRARY_PAGE_SIZE,
-            offset: items.length,
-          }),
-        });
-        // Bộ lọc đã đổi trong lúc trang này đang bay: nó thuộc về một danh
-        // sách không còn tồn tại, nối vào sẽ trộn hai kết quả khác nhau.
-        if (sequence !== requestSequence) return;
-        set((state) => ({
-          items: [...state.items, ...page],
-          loadingMore: false,
-          hasMore: page.length === LIBRARY_PAGE_SIZE,
-        }));
-      } catch (error) {
-        set({ loadingMore: false, error: toAppError(error) });
-      }
+    setPage: async (page) => {
+      await loadPage(page);
+    },
+
+    // Đổi cỡ trang là đổi câu hỏi: "trang 3" của cỡ cũ không trỏ tới cùng
+    // những dòng ấy ở cỡ mới, nên quay về trang 1 thay vì giả vờ nó còn nghĩa.
+    setPageSize: async (pageSize) => {
+      set({ pageSize });
+      await loadPage(1);
     },
 
     setSearch: (value) => {
@@ -362,13 +420,14 @@ export const useLibraryStore = create<LibraryState>((set, get) => {
         const { searchInput, filters } = get();
         if (filters.search === searchInput) return;
         set({ filters: { ...filters, search: searchInput } });
-        void get().reload();
+        // Câu hỏi đã khác — "trang 3 của câu hỏi trước" không tả gì cả.
+        void loadPage(1);
       }, SEARCH_DEBOUNCE_MS);
     },
 
     setFilters: (patch) => {
       set((state) => ({ filters: { ...state.filters, ...patch } }));
-      void get().reload();
+      void loadPage(1);
     },
 
     toggleMediaType: (mediaType) => {
@@ -404,14 +463,17 @@ export const useLibraryStore = create<LibraryState>((set, get) => {
         searchTimer = null;
       }
       set({ filters: EMPTY_FILTERS, searchInput: "" });
-      void get().reload();
+      void loadPage(1);
     },
 
     setSort: (sort, direction) => {
       writeStored(SORT_KEY, sort);
       writeStored(DIRECTION_KEY, direction);
       set({ sort, direction });
-      void get().reload();
+      // Cùng tập kết quả nhưng khác thứ tự: mục thứ 41 của thứ tự cũ không nằm
+      // ở trang 3 của thứ tự mới, nên giữ nguyên số trang là giữ một chỗ ngẫu
+      // nhiên trong một danh sách khác.
+      void loadPage(1);
     },
 
     setViewMode: (mode) => {
@@ -485,11 +547,15 @@ export const useLibraryStore = create<LibraryState>((set, get) => {
       return true;
     },
 
+    // Xoá thì KHÁC đổi tên: nó làm tập kết quả co lại, nên trang đang xem vừa
+    // thủng một lỗ và tổng số trang có thể đã giảm. Bỏ dòng đi ngay để phản hồi
+    // tức thì, rồi nạp lại đúng trang ấy — `loadPage` sẽ kéo các dòng của trang
+    // sau lấp vào chỗ trống, và tự cắt xuống nếu trang này không còn tồn tại.
     deleteItems: async (itemIds) => {
       const deleted = await guard(() => invoke<number>("delete_library_items", { itemIds }));
       if (deleted === null) return false;
       dropItems(itemIds);
-      await refreshStats();
+      await loadPage(get().page);
       return true;
     },
 
@@ -497,7 +563,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => {
       const removed = await guard(() => invoke<number>("remove_library_items", { itemIds }));
       if (removed === null) return false;
       dropItems(itemIds);
-      await refreshStats();
+      await loadPage(get().page);
       return true;
     },
 

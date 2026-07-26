@@ -7,7 +7,7 @@ import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialo
 import i18n from "@/lib/i18n";
 import { Library } from "@/pages/Library";
 import { stopActiveMedia } from "@/components/MediaPlayer";
-import { useLibraryStore } from "@/stores/library-store";
+import { DEFAULT_LIBRARY_PAGE_SIZE, useLibraryStore } from "@/stores/library-store";
 import type { LibraryItem, LibraryQuery, LibraryStats } from "@/types/library";
 
 /**
@@ -131,8 +131,9 @@ function resetStore() {
     viewMode: "grid",
     selectedIds: [],
     loading: false,
-    loadingMore: false,
-    hasMore: false,
+    page: 1,
+    pageSize: DEFAULT_LIBRARY_PAGE_SIZE,
+    totalItems: 0,
     reconciling: false,
     error: null,
     initialized: false,
@@ -593,6 +594,98 @@ describe("Library — playlist export (FR-330)", () => {
         ["a", "b", "c"],
       ),
     );
+  });
+});
+
+describe("Library — numbered pages", () => {
+  /** The library this user actually has: 66 files, no thumbnails, no
+   * durations. Four pages at the default size — the size the page bar has to
+   * look right at, not the twenty-page case. */
+  function fillBackend(count: number) {
+    backendItems = Array.from({ length: count }, (_unused, index) =>
+      makeItem({ id: `i${index}`, title: `Track ${index}` }),
+    );
+    backendStats = statsFor(backendItems);
+  }
+
+  function pageOf(rows: HTMLElement[]) {
+    return rows.map((row) => row.dataset.itemId);
+  }
+
+  it("shows one button per page and says where the user is", async () => {
+    fillBackend(66);
+    await renderLibrary();
+
+    await screen.findByTestId("library-pagination");
+    expect(screen.getByTestId("library-page-1")).toHaveAttribute("aria-current", "page");
+    expect(screen.getByTestId("library-page-4")).toBeInTheDocument();
+    // 66 files is four pages, not five: the last page holds the leftover six.
+    expect(screen.queryByTestId("library-page-5")).toBeNull();
+    expect(screen.getByTestId("library-page-label")).toHaveTextContent("Page 1 of 4");
+    expect(rows()).toHaveLength(DEFAULT_LIBRARY_PAGE_SIZE);
+    // Nowhere to go back to from the first page.
+    expect(screen.getByTestId("library-prev-page")).toBeDisabled();
+  });
+
+  it("asks the backend for exactly the page that was clicked", async () => {
+    fillBackend(66);
+    await renderLibrary();
+
+    await userEvent.click(await screen.findByTestId("library-page-3"));
+
+    await waitFor(() => expect(lastQuery("list_library").offset).toBe(40));
+    expect(lastQuery("list_library").limit).toBe(DEFAULT_LIBRARY_PAGE_SIZE);
+    // The rows on screen are that page and nothing else — an infinite-scroll
+    // grid would be showing all sixty by now.
+    expect(pageOf(rows())[0]).toBe("i40");
+    expect(rows()).toHaveLength(DEFAULT_LIBRARY_PAGE_SIZE);
+    expect(screen.getByTestId("library-page-label")).toHaveTextContent("Page 3 of 4");
+    expect(screen.getByTestId("library-page-3")).toHaveAttribute("aria-current", "page");
+  });
+
+  it("walks to the last page with Next and stops there", async () => {
+    fillBackend(66);
+    await renderLibrary();
+
+    await userEvent.click(await screen.findByTestId("library-next-page"));
+    await waitFor(() => expect(lastQuery("list_library").offset).toBe(20));
+    await userEvent.click(screen.getByTestId("library-next-page"));
+    await waitFor(() => expect(lastQuery("list_library").offset).toBe(40));
+    await userEvent.click(screen.getByTestId("library-next-page"));
+    await waitFor(() => expect(lastQuery("list_library").offset).toBe(60));
+
+    // Six leftover rows, and no way to page past them.
+    expect(rows()).toHaveLength(6);
+    expect(screen.getByTestId("library-next-page")).toBeDisabled();
+  });
+
+  it("goes back to page one with a new page size", async () => {
+    fillBackend(66);
+    await renderLibrary();
+    await userEvent.click(await screen.findByTestId("library-page-3"));
+    await waitFor(() => expect(lastQuery("list_library").offset).toBe(40));
+
+    await userEvent.selectOptions(screen.getByTestId("library-page-size"), "10");
+
+    await waitFor(() => expect(lastQuery("list_library").limit).toBe(10));
+    // "Page 3" of twenty-a-page is a different set of files from "page 3" of
+    // ten-a-page, so staying on 3 would land the user somewhere arbitrary.
+    expect(lastQuery("list_library").offset).toBe(0);
+    expect(screen.getByTestId("library-page-label")).toHaveTextContent("Page 1 of 7");
+    expect(rows()).toHaveLength(10);
+  });
+
+  it("returns to page one when a filter narrows the library", async () => {
+    fillBackend(66);
+    await renderLibrary();
+    await userEvent.click(await screen.findByTestId("library-page-2"));
+    await waitFor(() => expect(lastQuery("list_library").offset).toBe(20));
+
+    await userEvent.click(screen.getByTestId("library-filter-media-type-audio"));
+
+    await waitFor(() => expect(lastQuery("list_library").media_types).toEqual(["audio"]));
+    expect(lastQuery("list_library").offset).toBe(0);
+    expect(screen.getByTestId("library-page-1")).toHaveAttribute("aria-current", "page");
   });
 });
 
