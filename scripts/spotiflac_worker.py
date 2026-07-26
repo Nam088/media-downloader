@@ -22,12 +22,15 @@ import contextlib
 import json
 import logging
 import os
+import platform
 import queue
 import re
+import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 
 PROTOCOL_VERSION = 1
 SENTINEL = "SPOTIFLAC_EVENT::"
@@ -140,8 +143,11 @@ class StdinBridge:
                 value = str(cmd.get("value", "")).strip()
                 if value:
                     self.grants.put(value)
-        # stdin closed by the parent: treat as cancel so we never linger.
-        self.cancel_event.set()
+        # EOF just means there are no more commands coming — it is NOT a
+        # cancel. Treating it as one made the worker abort instantly whenever
+        # stdin was not an open pipe, which is every run from a shell and any
+        # run where the parent closes its end early. Cancellation has exactly
+        # one signal: an explicit {"type":"cancel"} line.
 
 
 class ProviderLogWatcher(logging.Handler):
@@ -199,10 +205,11 @@ def install_module_logging(watcher: ProviderLogWatcher) -> None:
 #   2. the automated nodriver/Chrome solver
 #   3. _run_manual_terminal_verification(), which prompts on stdin
 #
-# We deliberately leave 1 unset so the automated solver still gets first
-# crack — most challenges never reach the user. Mode 3 is the seam we take
-# over: it already receives the fully-formed challenge URL and its only job
-# is to produce a grant string.
+# Which mode we get is decided by install_challenge_bridge() — see its
+# docstring. By default we leave 1 unset so the automated solver still gets
+# first crack (most challenges then never reach the user at all) and patch
+# mode 3 as the fallback; on macOS the solver's Chrome is hidden by PID so it
+# does not appear on screen.
 #
 # The Telegram path is ours to implement: the module does not read
 # TG_BOT_TOKEN at all (upstream's telegram_wrapper.py is an external process
@@ -296,37 +303,165 @@ def telegram_poll_grant(offset: int) -> tuple[str | None, int]:
     return None, offset
 
 
-def install_challenge_bridge(bridge: StdinBridge) -> None:
-    """Routes the module's manual-verification prompt through our protocol."""
+def _solver_profile_dir() -> str:
+    """Where the module's solver keeps its own Chrome profile.
+
+    Mirrors SpotiFLAC.core.solver._get_profile_dir. Used as the marker that
+    tells the solver's Chrome apart from the user's own: nothing else on the
+    machine runs with this --user-data-dir.
+    """
+    override = os.environ.get("TS_PROFILE_DIR")
+    if override:
+        return override
+    if platform.system() == "Windows":
+        base = os.environ.get("TEMP") or os.environ.get("TMP") or r"C:\Temp"
+        return os.path.join(base, "ts_profile")
+    return "/tmp/ts_profile"
+
+
+def hide_solver_windows(stop: threading.Event) -> None:
+    """Keeps the auto-solver's Chrome out of the user's face on macOS.
+
+    The solver must run ``headless=False`` (Turnstile detects headless) and
+    its own ``--window-position=-32000,-32000`` does not work here, because
+    macOS pulls off-screen windows back onto a display. So the window is
+    hidden the way macOS actually supports: System Events, addressed by unix
+    id so only the solver's own process is touched and a Chrome the user has
+    open stays exactly where it was.
+
+    Best effort by construction — the window can still flash for the moment
+    between Chrome creating it and this loop noticing.
+    """
+    if platform.system() != "Darwin":
+        return
+    marker = f"user-data-dir={_solver_profile_dir()}"
+    hidden: set[str] = set()
+    while not stop.wait(0.3):
+        try:
+            found = subprocess.run(
+                ["pgrep", "-f", marker],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.split()
+        except Exception:  # noqa: BLE001 - a failed probe is just "not yet"
+            continue
+        for pid in found:
+            if pid in hidden:
+                continue
+            try:
+                subprocess.run(
+                    [
+                        "osascript",
+                        "-e",
+                        'tell application "System Events" to set visible of '
+                        f"(first process whose unix id is {pid}) to false",
+                    ],
+                    capture_output=True,
+                    timeout=10,
+                )
+                hidden.add(pid)
+            except Exception:  # noqa: BLE001
+                continue
+
+
+def await_grant(bridge: StdinBridge, challenge_url: str) -> str:
+    """Blocks until a grant arrives from the app (stdin) or Telegram."""
+    tg_offset = telegram_notify(challenge_url)
+    deadline = time.monotonic() + GRANT_WAIT_TIMEOUT_S
+    next_tg_poll = 0.0
+    while time.monotonic() < deadline:
+        if bridge.cancel_event.is_set():
+            msg = "verification cancelled"
+            raise RuntimeError(msg)
+        try:
+            return bridge.grants.get(timeout=0.5)
+        except queue.Empty:
+            pass
+        if tg_offset is not None and time.monotonic() >= next_tg_poll:
+            grant, tg_offset = telegram_poll_grant(tg_offset)
+            next_tg_poll = time.monotonic() + TELEGRAM_POLL_INTERVAL_S
+            if grant:
+                return grant
+    msg = "no grant code was provided in time"
+    raise RuntimeError(msg)
+
+
+def install_challenge_bridge(bridge: StdinBridge, auto_solver: bool) -> None:
+    """Routes Cloudflare verification through our protocol instead of a browser.
+
+    Two shapes, because the module picks its mode by which hooks are set:
+
+    ``auto_solver=False`` (default) registers the GUI handlers, which makes
+    the module take mode 1 and never reach its nodriver solver — so no Chrome
+    window is ever launched. The module then blocks on its own grant queue,
+    fed by the local callback server whose URL it embeds in the challenge link
+    as ``cb``; we hand the user's grant to that same endpoint, so the module
+    resumes through its own machinery rather than anything we bolt on.
+
+    ``auto_solver=True`` leaves mode 1 unset so the nodriver solver runs first
+    and most challenges resolve without the user, and only patches mode 3 (the
+    terminal prompt) as the fallback. The cost is a real Chrome window: the
+    solver must run ``headless=False`` because Turnstile detects headless, and
+    its ``--window-position=-32000,-32000`` trick does not survive macOS,
+    which pulls off-screen windows back onto a display.
+    """
     try:
         from SpotiFLAC.core import signed_session_desktop
     except Exception as exc:  # noqa: BLE001 - older module layout
         write_log(f"challenge bridge unavailable: {exc}")
         return
 
-    def wait_for_grant(challenge_url: str) -> str:
+    if auto_solver:
+        def wait_for_grant(challenge_url: str) -> str:
+            emit({"type": "cloudflare_challenge", "challenge_url": challenge_url})
+            return await_grant(bridge, challenge_url)
+
+        signed_session_desktop._run_manual_terminal_verification = wait_for_grant  # noqa: SLF001
+        return
+
+    def deliver_grant(challenge_url: str) -> None:
+        callback_url = _callback_url_from(challenge_url)
+        try:
+            grant = await_grant(bridge, challenge_url)
+        except Exception as exc:  # noqa: BLE001 - the module's own timeout takes over
+            write_log(f"no grant delivered: {exc}")
+            return
+        if not callback_url:
+            write_log("challenge URL carried no cb= callback, cannot deliver the grant")
+            return
+        import requests
+
+        separator = "&" if "?" in callback_url else "?"
+        try:
+            requests.get(
+                f"{callback_url}{separator}grant={urllib.parse.quote(grant)}",
+                timeout=20,
+            )
+        except Exception as exc:  # noqa: BLE001
+            write_log(f"failed to deliver the grant to the local callback: {exc}")
+
+    def open_challenge(challenge_url: str) -> None:
+        # Must return promptly: the module blocks on its grant queue the
+        # moment this returns, so the wait happens on its own thread.
         emit({"type": "cloudflare_challenge", "challenge_url": challenge_url})
-        tg_offset = telegram_notify(challenge_url)
+        threading.Thread(
+            target=deliver_grant,
+            args=(challenge_url,),
+            daemon=True,
+        ).start()
 
-        deadline = time.monotonic() + GRANT_WAIT_TIMEOUT_S
-        next_tg_poll = 0.0
-        while time.monotonic() < deadline:
-            if bridge.cancel_event.is_set():
-                msg = "verification cancelled"
-                raise RuntimeError(msg)
-            try:
-                return bridge.grants.get(timeout=0.5)
-            except queue.Empty:
-                pass
-            if tg_offset is not None and time.monotonic() >= next_tg_poll:
-                grant, tg_offset = telegram_poll_grant(tg_offset)
-                next_tg_poll = time.monotonic() + TELEGRAM_POLL_INTERVAL_S
-                if grant:
-                    return grant
-        msg = "no grant code was provided in time"
-        raise RuntimeError(msg)
+    signed_session_desktop.set_community_verification_handlers(open_challenge, lambda: None)
 
-    signed_session_desktop._run_manual_terminal_verification = wait_for_grant  # noqa: SLF001
+
+def _callback_url_from(challenge_url: str) -> str | None:
+    """The module's own local callback endpoint, which it embeds as ``cb``."""
+    try:
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(challenge_url).query)
+    except Exception:  # noqa: BLE001
+        return None
+    values = query.get("cb") or []
+    return values[0] if values else None
 
 
 def track_to_preview_entry(track) -> dict:
@@ -384,6 +519,36 @@ async def run_preview(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+AUDIO_SUFFIXES = (".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aac", ".alac")
+
+
+def find_downloaded_audio(output_dir: str) -> str | None:
+    """The audio file the module just wrote, or None if it wrote nothing.
+
+    Success is decided by what is on disk, not by the module's own progress
+    broadcaster: that broadcaster is an internal singleton whose payload shape
+    is not part of any published contract, and a download that genuinely
+    succeeded was being reported as "no provider delivered the track" purely
+    because its completion event never reached us. The parent hands us a
+    job-exclusive directory, so anything audio-shaped inside it can only be
+    this download. Largest file wins — a provider that also drops a cover
+    image or an .lrc beside the track should not decide the result.
+    """
+    candidates: list[tuple[int, str]] = []
+    for root, _dirs, files in os.walk(output_dir):
+        for name in files:
+            if not name.lower().endswith(AUDIO_SUFFIXES):
+                continue
+            path = os.path.join(root, name)
+            try:
+                candidates.append((os.path.getsize(path), path))
+            except OSError:
+                continue
+    if not candidates:
+        return None
+    return max(candidates)[1]
+
+
 class BroadcastListener:
     """Subscribes to the module's DownloadBroadcaster and re-emits protocol
     events (progress / track_done) from the per-item stats it streams."""
@@ -437,7 +602,15 @@ async def run_download(args: argparse.Namespace, bridge: StdinBridge) -> int:
     services = [s.strip() for s in args.services.split(",") if s.strip()]
     watcher = ProviderLogWatcher()
     install_module_logging(watcher)
-    install_challenge_bridge(bridge)
+    auto_solver = not args.no_auto_solver
+    install_challenge_bridge(bridge, auto_solver)
+
+    # Only meaningful with the solver on: nothing launches Chrome otherwise.
+    hide_stop = threading.Event()
+    if auto_solver:
+        threading.Thread(
+            target=hide_solver_windows, args=(hide_stop,), daemon=True
+        ).start()
 
     listener = BroadcastListener(watcher)
 
@@ -486,11 +659,15 @@ async def run_download(args: argparse.Namespace, bridge: StdinBridge) -> int:
             with contextlib.suppress(asyncio.CancelledError):
                 await cancel_task
 
-    if listener.completed_path:
+    hide_stop.set()
+
+    # Disk first, broadcaster second — see find_downloaded_audio().
+    output_path = find_downloaded_audio(args.output_dir) or listener.completed_path
+    if output_path:
         emit(
             {
                 "type": "track_done",
-                "file_path": os.path.abspath(listener.completed_path),
+                "file_path": os.path.abspath(output_path),
                 "provider": watcher.current_provider or (services[0] if services else None),
             },
         )
@@ -519,6 +696,12 @@ def build_parser() -> argparse.ArgumentParser:
     download.add_argument("--services", default="tidal,qobuz,deezer,amazon")
     download.add_argument("--tier", choices=sorted(TIER_TO_QUALITY), default="flac16")
     download.add_argument("--no-extensions-fallback", action="store_true")
+    download.add_argument(
+        "--no-auto-solver",
+        action="store_true",
+        help="skip the module's nodriver solver and ask for the grant in-app "
+             "straight away; nothing launches Chrome at all",
+    )
     download.add_argument("--timeout-s", type=int, default=None)
     return parser
 
