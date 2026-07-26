@@ -695,15 +695,173 @@ pub struct PlaylistEntryPreview {
     pub thumbnail_url: Option<String>,
 }
 
-/// Mirrors `data-model.md` §3 (DownloadedFile).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DownloadedFile {
+/// Một mục trong Thư viện (FR-301) — đúng một file trên đĩa do chính ứng dụng
+/// tải về, cùng mọi thứ cần để hiện nó lên lưới mà không phải hỏi lại nguồn.
+///
+/// Đây là hình dạng đầy đủ của một dòng `downloaded_files` (`data-model.md`
+/// §3). Struct `DownloadedFile` cũ — chỉ có đường dẫn, định dạng, dung lượng,
+/// thời điểm — đã bị thay hẳn bằng struct này: nó là thứ duy nhất đọc bảng
+/// ấy, và giữ lại một hình dạng thứ hai chỉ để mô tả nửa số cột là cách chắc
+/// chắn để hai bên trôi khỏi nhau.
+///
+/// `downloaded_at` map thẳng vào cột `completed_at`: tên cột giữ nguyên (đổi
+/// tên cột là một migration cho một thứ thuần hiển thị), nhưng tên trường
+/// theo hợp đồng đã chốt với tầng giao diện.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LibraryItem {
     pub id: String,
+    pub file_path: String,
+    pub title: String,
+    pub media_type: MediaType,
+    pub file_format: String,
+    pub file_size_bytes: i64,
+    /// `None` = **không biết**, không phải 0. Mọi mục nạp lại từ lịch sử cũ
+    /// (FR-303) đều như vậy: thời lượng chỉ đo được bằng cách mở chính file
+    /// ấy, và làm việc đó cho cả thư viện lúc khởi động đúng là thứ FR-327
+    /// cấm. Từ phase này trở đi, mỗi tác vụ hoàn tất đều đo một lần rồi ghi.
+    pub duration_seconds: Option<i64>,
+    pub platform: String,
+    pub source_url: String,
+    /// Đường dẫn ảnh đại diện **cục bộ** (FR-304), không phải URL. `None` khi
+    /// nguồn không hề có ảnh, hoặc khi mục này được nạp lại từ lịch sử cũ —
+    /// giao diện dùng ảnh thay thế theo `media_type` thay vì để ô trống.
+    pub thumbnail_path: Option<String>,
+    pub downloaded_at: String,
+    pub is_missing: bool,
+    pub job_id: String,
+}
+
+/// Tiêu chí sắp xếp thư viện (FR-309).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LibrarySort {
+    #[default]
+    DownloadedAt,
+    Title,
+    FileSize,
+    Duration,
+}
+
+impl LibrarySort {
+    /// Mệnh đề `ORDER BY`. Không bao giờ ghép từ chuỗi do người dùng gửi lên:
+    /// tiêu chí sắp xếp là một enum đóng, nên câu lệnh sinh ra chỉ có thể là
+    /// một trong bốn chuỗi hằng dưới đây.
+    ///
+    /// `NULLS LAST` cho thời lượng là chủ ý: mục chưa biết thời lượng
+    /// (`NULL`) phải nằm cuối ở CẢ hai chiều, vì "không biết" không phải là
+    /// "ngắn nhất". SQLite mặc định xếp NULL TRƯỚC ở chiều tăng dần, nên vế
+    /// tăng dần cần nói rõ. Viết dưới dạng `NULLS LAST` chứ không phải mẹo
+    /// `duration_seconds IS NULL ASC, ...` vì chỉ dạng thứ nhất dùng được chỉ
+    /// mục — dạng thứ hai là một biểu thức, và nó kéo cả câu lệnh về `USE
+    /// TEMP B-TREE FOR ORDER BY` (đã kiểm bằng `EXPLAIN QUERY PLAN`).
+    ///
+    /// Vế phụ `rowid` giữ cho phân trang ổn định khi hai mục bằng nhau ở tiêu
+    /// chí chính — thiếu nó, cùng một mục có thể xuất hiện ở cả trang 1 lẫn
+    /// trang 2. Chiều của vế phụ phải khớp với chiều quét chỉ mục, nếu không
+    /// SQLite lại phải dựng b-tree tạm: `completed_at` có chỉ mục khai báo
+    /// `DESC`, nên quét xuôi cho ra `completed_at DESC` kèm `rowid ASC` —
+    /// ngược chiều nhau — trong khi các chỉ mục còn lại khai báo `ASC` nên hai
+    /// vế cùng chiều. Cả tám tổ hợp dưới đây đều đã được kiểm là không sinh
+    /// b-tree tạm (xem test `every_sort_option_is_served_by_an_index`).
+    pub fn order_by(self, direction: SortDirection) -> &'static str {
+        match (self, direction) {
+            (LibrarySort::DownloadedAt, SortDirection::Asc) => "completed_at ASC, rowid DESC",
+            (LibrarySort::DownloadedAt, SortDirection::Desc) => "completed_at DESC, rowid ASC",
+            (LibrarySort::Title, SortDirection::Asc) => "title COLLATE NOCASE ASC, rowid ASC",
+            (LibrarySort::Title, SortDirection::Desc) => "title COLLATE NOCASE DESC, rowid DESC",
+            (LibrarySort::FileSize, SortDirection::Asc) => "file_size_bytes ASC, rowid ASC",
+            (LibrarySort::FileSize, SortDirection::Desc) => "file_size_bytes DESC, rowid DESC",
+            (LibrarySort::Duration, SortDirection::Asc) => {
+                "duration_seconds ASC NULLS LAST, rowid ASC"
+            }
+            (LibrarySort::Duration, SortDirection::Desc) => {
+                "duration_seconds DESC NULLS LAST, rowid DESC"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SortDirection {
+    Asc,
+    #[default]
+    Desc,
+}
+
+/// Trạng thái duyệt thư viện (FR-307 → FR-310). `#[serde(default)]` ở cả
+/// struct: một lời gọi `list_library({})` là hợp lệ và có nghĩa "mọi thứ, mới
+/// nhất trước".
+///
+/// Mọi bộ lọc kết hợp theo logic VÀ (FR-308). Bên trong MỘT bộ lọc nhiều giá
+/// trị (ví dụ `platforms: ["youtube", "tiktok"]`) thì là HOẶC — đó là cách
+/// một nhóm ô chọn hoạt động, và là cách duy nhất để `platforms` có nhiều hơn
+/// một phần tử mà vẫn trả về dòng nào đó.
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(default)]
+pub struct LibraryQuery {
+    /// Khớp với tiêu đề HOẶC tên file, không phân biệt hoa thường kể cả với
+    /// tiếng Việt — xem cột `search_text` trong migration 0012.
+    pub search: Option<String>,
+    pub media_types: Vec<MediaType>,
+    pub platforms: Vec<String>,
+    pub formats: Vec<String>,
+    /// Khoảng thời gian tải, so sánh trực tiếp trên chuỗi RFC 3339 (đã lưu ở
+    /// dạng sắp xếp được theo thứ tự từ điển). Bao gồm cả hai đầu.
+    pub downloaded_from: Option<String>,
+    pub downloaded_to: Option<String>,
+    /// `None` = không quan tâm; `Some(true)` = chỉ các mục đang thiếu (màn
+    /// hình dọn dẹp của FR-324); `Some(false)` = chỉ các mục còn file.
+    pub is_missing: Option<bool>,
+    pub sort: LibrarySort,
+    pub direction: SortDirection,
+    /// Phân trang. FR-310: giao diện không bao giờ nhận cả 10.000 dòng qua
+    /// cầu IPC trong một lần — nó xin từng trang khi người dùng cuộn tới.
+    /// `None` = không giới hạn (dùng cho xuất danh sách phát theo bộ lọc).
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// Một dòng trong phân bố của FR-328 (theo nền tảng hoặc theo loại nội dung).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LibraryBreakdownEntry {
+    pub key: String,
+    pub item_count: i64,
+    pub total_size_bytes: i64,
+}
+
+/// FR-328. Được tính bằng chính bộ lọc đang áp, nên con số luôn khớp với thứ
+/// người dùng đang nhìn (SC-307) thay vì mô tả một tập khác.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LibraryStats {
+    pub total_items: i64,
+    pub total_size_bytes: i64,
+    pub missing_items: i64,
+    pub by_platform: Vec<LibraryBreakdownEntry>,
+    pub by_media_type: Vec<LibraryBreakdownEntry>,
+    /// Danh sách định dạng thật sự có trong thư viện, để bộ lọc FR-308 chào
+    /// đúng những gì tồn tại chứ không phải một danh sách cứng.
+    pub formats: Vec<String>,
+}
+
+/// Dữ liệu ghi vào chỉ mục khi một tác vụ tạo ra một file (FR-301, FR-302).
+///
+/// Là một struct chứ không phải chín tham số vị trí: `insert_downloaded_file`
+/// từng nhận bốn tham số cùng kiểu chuỗi và đã đủ dễ ghi nhầm thứ tự; chín
+/// thì chắc chắn có ngày lẫn `platform` với `source_url` mà vẫn biên dịch
+/// được.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewLibraryFile {
     pub job_id: String,
     pub file_path: String,
     pub file_format: String,
     pub file_size_bytes: i64,
-    pub completed_at: String,
+    pub title: String,
+    pub media_type: MediaType,
+    pub platform: String,
+    pub source_url: String,
+    pub duration_seconds: Option<i64>,
+    pub thumbnail_path: Option<String>,
 }
 
 /// Mirrors `data-model.md` §5 (AppSettings).
