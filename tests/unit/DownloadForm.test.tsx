@@ -471,6 +471,7 @@ describe("DownloadForm", () => {
 
     await previewSingleLink(user, PREVIEW_WITH_EXTRAS);
     await user.click(screen.getByRole("button", { name: /output options/i }));
+    await user.click(screen.getByTestId("subtitle-language-trigger"));
     await user.click(screen.getByRole("checkbox", { name: /Vietnamese/ }));
     await user.click(screen.getByRole("button", { name: /download video/i }));
 

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { SubtitleOptionsPicker } from "@/components/SubtitleOptionsPicker";
@@ -12,6 +12,14 @@ const TRACKS: SubtitleTrackPreview[] = [
   { language: "en", label: "English", auto_generated: false },
   { language: "ja", label: null, auto_generated: true },
 ];
+
+const TRIGGER_TEST_ID = "subtitle-language-trigger";
+
+/** The language checklist lives behind the select-style trigger now (FR-217
+ * still holds — this just opens the popover that reveals it). */
+async function openPicker(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByTestId(TRIGGER_TEST_ID));
+}
 
 /** Controlled component: without somewhere to keep what it emits, a click
  * would report a change that never comes back as a new `value`. */
@@ -49,23 +57,26 @@ describe("SubtitleOptionsPicker (FR-217 → FR-221)", () => {
    * "checked, there are none" are different claims about the world, and an
    * empty list of checkboxes reads as neither — it reads as "still loading".
    */
-  it("tells the three states of the subtitle list apart", () => {
+  it("tells the three states of the subtitle list apart", async () => {
+    const user = userEvent.setup();
+
     const unchecked = render(<Harness tracks={null} />);
     expect(screen.getByText(/never checked/i)).toBeInTheDocument();
-    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(screen.queryByTestId(TRIGGER_TEST_ID)).not.toBeInTheDocument();
     expect(screen.queryByText(/offers no subtitles/i)).not.toBeInTheDocument();
     unchecked.unmount();
 
     const none = render(<Harness tracks={[]} />);
     expect(screen.getByText(/offers no subtitles/i)).toBeInTheDocument();
-    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(screen.queryByTestId(TRIGGER_TEST_ID)).not.toBeInTheDocument();
     expect(screen.queryByText(/never checked/i)).not.toBeInTheDocument();
     none.unmount();
 
     render(<Harness tracks={TRACKS} />);
-    expect(screen.getAllByRole("checkbox")).toHaveLength(3);
     expect(screen.queryByText(/never checked/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/offers no subtitles/i)).not.toBeInTheDocument();
+    await openPicker(user);
+    expect(screen.getAllByRole("checkbox")).toHaveLength(3);
   });
 
   // `undefined` reaches this component from an older preview fixture and from
@@ -74,11 +85,13 @@ describe("SubtitleOptionsPicker (FR-217 → FR-221)", () => {
     render(<Harness tracks={undefined} />);
 
     expect(screen.getByText(/never checked/i)).toBeInTheDocument();
-    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(screen.queryByTestId(TRIGGER_TEST_ID)).not.toBeInTheDocument();
   });
 
-  it("lists only the languages the source really has (FR-217)", () => {
+  it("lists only the languages the source really has (FR-217)", async () => {
+    const user = userEvent.setup();
     render(<Harness tracks={TRACKS} />);
+    await openPicker(user);
 
     expect(screen.getByRole("checkbox", { name: /Vietnamese/ })).toBeInTheDocument();
     expect(screen.getByRole("checkbox", { name: /English/ })).toBeInTheDocument();
@@ -89,8 +102,10 @@ describe("SubtitleOptionsPicker (FR-217 → FR-221)", () => {
     expect(screen.queryByRole("checkbox", { name: /French/i })).not.toBeInTheDocument();
   });
 
-  it("marks author-provided and machine-made subtitles differently (FR-217)", () => {
+  it("marks author-provided and machine-made subtitles differently (FR-217)", async () => {
+    const user = userEvent.setup();
     render(<Harness tracks={TRACKS} />);
+    await openPicker(user);
 
     expect(screen.getByRole("checkbox", { name: /Vietnamese.*From the author/i })).toBeInTheDocument();
     expect(screen.getByRole("checkbox", { name: /ja.*Auto-generated/i })).toBeInTheDocument();
@@ -100,6 +115,7 @@ describe("SubtitleOptionsPicker (FR-217 → FR-221)", () => {
     const changes: SubtitleOptions[] = [];
     const user = userEvent.setup();
     render(<Harness tracks={TRACKS} onChange={(next) => changes.push(next)} />);
+    await openPicker(user);
 
     await user.click(screen.getByRole("checkbox", { name: /Vietnamese/ }));
     await user.click(screen.getByRole("checkbox", { name: /English/ }));
@@ -113,6 +129,7 @@ describe("SubtitleOptionsPicker (FR-217 → FR-221)", () => {
     const changes: SubtitleOptions[] = [];
     const user = userEvent.setup();
     render(<Harness tracks={TRACKS} onChange={(next) => changes.push(next)} />);
+    await openPicker(user);
 
     await user.click(screen.getByRole("checkbox", { name: /Vietnamese/ }));
     await user.click(screen.getByRole("checkbox", { name: /Vietnamese/ }));
@@ -130,6 +147,7 @@ describe("SubtitleOptionsPicker (FR-217 → FR-221)", () => {
     const changes: SubtitleOptions[] = [];
     const user = userEvent.setup();
     render(<Harness tracks={TRACKS} onChange={(next) => changes.push(next)} />);
+    await openPicker(user);
 
     await user.click(screen.getByRole("checkbox", { name: /Vietnamese/ }));
     expect(changes[changes.length - 1].include_auto_generated).toBe(false);
@@ -141,12 +159,88 @@ describe("SubtitleOptionsPicker (FR-217 → FR-221)", () => {
     expect(changes[changes.length - 1].include_auto_generated).toBe(false);
   });
 
+  it("shows a placeholder on the trigger until a language is picked, then a count", async () => {
+    const user = userEvent.setup();
+    render(<Harness tracks={TRACKS} />);
+
+    expect(screen.getByTestId(TRIGGER_TEST_ID)).toHaveTextContent(/choose/i);
+
+    await openPicker(user);
+    await user.click(screen.getByRole("checkbox", { name: /Vietnamese/ }));
+
+    expect(screen.getByTestId(TRIGGER_TEST_ID)).toHaveTextContent(/1/);
+
+    await user.click(screen.getByRole("checkbox", { name: /English/ }));
+
+    expect(screen.getByTestId(TRIGGER_TEST_ID)).toHaveTextContent(/2/);
+  });
+
+  it("filters the language list as the user types (search)", async () => {
+    const user = userEvent.setup();
+    render(<Harness tracks={TRACKS} />);
+    await openPicker(user);
+
+    await user.type(screen.getByRole("textbox", { name: /search/i }), "vi");
+
+    expect(screen.getByRole("checkbox", { name: /Vietnamese/ })).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: /English/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: /^ja/ })).not.toBeInTheDocument();
+  });
+
+  it("matches by language code as well as by label (search)", async () => {
+    const user = userEvent.setup();
+    render(<Harness tracks={TRACKS} />);
+    await openPicker(user);
+
+    await user.type(screen.getByRole("textbox", { name: /search/i }), "ja");
+
+    expect(screen.getByRole("checkbox", { name: /^ja/ })).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: /Vietnamese/ })).not.toBeInTheDocument();
+  });
+
+  it("shows a message when no language matches the search", async () => {
+    const user = userEvent.setup();
+    render(<Harness tracks={TRACKS} />);
+    await openPicker(user);
+
+    await user.type(screen.getByRole("textbox", { name: /search/i }), "zzz-none");
+
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    expect(screen.getByText(/no language matches/i)).toBeInTheDocument();
+  });
+
+  it("keeps a selection checked after the search that found it is cleared", async () => {
+    const user = userEvent.setup();
+    render(<Harness tracks={TRACKS} />);
+    await openPicker(user);
+
+    const search = screen.getByRole("textbox", { name: /search/i });
+    await user.type(search, "vi");
+    await user.click(screen.getByRole("checkbox", { name: /Vietnamese/ }));
+    await user.clear(search);
+
+    expect(screen.getByRole("checkbox", { name: /Vietnamese/ })).toBeChecked();
+  });
+
+  it("has no trigger or search box when there is no language list to filter", () => {
+    render(<Harness tracks={null} />);
+    expect(screen.queryByTestId(TRIGGER_TEST_ID)).not.toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: /search/i })).not.toBeInTheDocument();
+
+    cleanup();
+
+    render(<Harness tracks={[]} />);
+    expect(screen.queryByTestId(TRIGGER_TEST_ID)).not.toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: /search/i })).not.toBeInTheDocument();
+  });
+
   it("keeps the delivery choice out of the way until a language is picked", async () => {
     const user = userEvent.setup();
     render(<Harness tracks={TRACKS} />);
 
     expect(screen.queryByRole("radio", { name: /^separate files/i })).not.toBeInTheDocument();
 
+    await openPicker(user);
     await user.click(screen.getByRole("checkbox", { name: /Vietnamese/ }));
 
     expect(screen.getByRole("radio", { name: /^separate files/i })).toBeInTheDocument();
@@ -156,6 +250,7 @@ describe("SubtitleOptionsPicker (FR-217 → FR-221)", () => {
     const onChange = vi.fn();
     const user = userEvent.setup();
     render(<Harness tracks={TRACKS} onChange={onChange} />);
+    await openPicker(user);
 
     await user.click(screen.getByRole("checkbox", { name: /Vietnamese/ }));
     await user.click(screen.getByRole("radio", { name: /inside the file/i }));
@@ -176,6 +271,7 @@ describe("SubtitleOptionsPicker (FR-217 → FR-221)", () => {
         embedBlockedReasonKey="downloadForm.subtitles_embed_unavailable_audio"
       />,
     );
+    await openPicker(user);
 
     await user.click(screen.getByRole("checkbox", { name: /Vietnamese/ }));
 
