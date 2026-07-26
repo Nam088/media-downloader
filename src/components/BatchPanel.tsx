@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AlertCircle, CheckCircle2, Circle, Download, Loader2 } from "lucide-react";
 
@@ -11,6 +10,14 @@ interface BatchPanelProps {
   urls: string[];
   items: BatchItem[];
   running: boolean;
+  /**
+   * Controlled from the form rather than held here, because the shared output
+   * picker above this panel needs the same answer: an audio batch must offer
+   * audio formats and a video batch a container (FR-232). Two copies of this
+   * choice would let the two disagree.
+   */
+  mediaType: BatchMediaType;
+  onMediaTypeChange: (mediaType: BatchMediaType) => void;
   onRun: (mediaType: BatchMediaType) => void;
   /** Set when something outside this panel blocks the run (no output folder). */
   disabled?: boolean;
@@ -23,11 +30,16 @@ const STATUS_ICON: Record<BatchItemStatus, typeof Circle> = {
   error: AlertCircle,
 };
 
-export function BatchPanel({ urls, items, running, onRun, disabled = false }: BatchPanelProps) {
+export function BatchPanel({
+  urls,
+  items,
+  running,
+  mediaType,
+  onMediaTypeChange,
+  onRun,
+  disabled = false,
+}: BatchPanelProps) {
   const { t } = useTranslation();
-  // Audio is the common case, so it stays the default — but it is now a
-  // default the user can move off, instead of a value forced on every link.
-  const [mediaType, setMediaType] = useState<BatchMediaType>("audio");
 
   return (
     <div className="flex flex-col gap-4 px-6 pb-5">
@@ -37,7 +49,7 @@ export function BatchPanel({ urls, items, running, onRun, disabled = false }: Ba
         </Label>
         <RadioGroup
           value={mediaType}
-          onValueChange={(value) => setMediaType(value as BatchMediaType)}
+          onValueChange={(value) => onMediaTypeChange(value as BatchMediaType)}
           className="flex flex-row gap-3"
           disabled={running}
         >

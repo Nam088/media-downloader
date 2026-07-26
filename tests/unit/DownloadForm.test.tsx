@@ -6,6 +6,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { DownloadForm } from "@/components/DownloadForm";
 import { useQueueStore } from "@/stores/queue-store";
 import { useSettingsStore } from "@/stores/settings-store";
+import { NEW_JOB_OUTPUT_OPTIONS } from "@/types/download";
 import type { CreateJobInput, DownloadJob, MediaSource } from "@/types/download";
 import type { AppSettings } from "@/types/settings";
 
@@ -43,6 +44,20 @@ const SAMPLE_PREVIEW: MediaSource = {
   is_gallery: false,
   gallery_items: [],
   playlist_entries: [],
+};
+
+/** The same link, but with the two source-dependent lists actually filled in
+ * — the state a real single-video preview comes back in. */
+const PREVIEW_WITH_EXTRAS: MediaSource = {
+  ...SAMPLE_PREVIEW,
+  subtitles: [
+    { language: "vi", label: "Vietnamese", auto_generated: false },
+    { language: "en", label: "English", auto_generated: true },
+  ],
+  chapters: [
+    { title: "Intro", start_seconds: 0, end_seconds: 30 },
+    { title: "Rest", start_seconds: 30, end_seconds: 120 },
+  ],
 };
 
 /** A settings row with a save folder already chosen, so the batch run button
@@ -444,6 +459,153 @@ describe("DownloadForm", () => {
     // render — the output picker is the only thing missing.
     expect(screen.getByText(/what to download/i)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /output options/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/audio format/i)).not.toBeInTheDocument();
+  });
+
+  // FR-217/FR-218 — the languages come from this link's own list, and the one
+  // the user ticked is what the job carries.
+  it("sends the subtitle languages picked from the source's own list (FR-217/FR-218)", async () => {
+    mockSingleJobBackend(PREVIEW_WITH_EXTRAS);
+    const user = userEvent.setup();
+    render(<DownloadForm />);
+
+    await previewSingleLink(user, PREVIEW_WITH_EXTRAS);
+    await user.click(screen.getByRole("button", { name: /output options/i }));
+    await user.click(screen.getByRole("checkbox", { name: /Vietnamese/ }));
+    await user.click(screen.getByRole("button", { name: /download video/i }));
+
+    await waitFor(() => expect(createdInputs()).toHaveLength(1));
+    expect(createdInputs()[0].output_options?.subtitles).toEqual({
+      languages: ["vi"],
+      delivery: "separate_files",
+      include_auto_generated: false,
+    });
+  });
+
+  // FR-217/FR-221 — the same form, three different things to say about a
+  // subtitle list, depending on what the preview actually found out.
+  it("distinguishes an unchecked subtitle list from a source that has none", async () => {
+    mockGetSettingsThenPreview({ ...SAMPLE_PREVIEW, subtitles: null });
+    const user = userEvent.setup();
+    const unchecked = render(<DownloadForm />);
+
+    await previewSingleLink(user);
+    await user.click(screen.getByRole("button", { name: /output options/i }));
+    expect(screen.getByText(/subtitles was never checked/i)).toBeInTheDocument();
+    unchecked.unmount();
+
+    mockGetSettingsThenPreview({ ...SAMPLE_PREVIEW, subtitles: [] });
+    render(<DownloadForm />);
+
+    await previewSingleLink(user);
+    await user.click(screen.getByRole("button", { name: /output options/i }));
+    expect(screen.getByText(/offers no subtitles/i)).toBeInTheDocument();
+    expect(screen.queryByText(/subtitles was never checked/i)).not.toBeInTheDocument();
+  });
+
+  // FR-223. The picker names the reason at the field; the form refuses to
+  // create the job at all while that reason stands.
+  it("blocks the download while the trim range is unusable (FR-223)", async () => {
+    mockSingleJobBackend(PREVIEW_WITH_EXTRAS);
+    const user = userEvent.setup();
+    render(<DownloadForm />);
+
+    await previewSingleLink(user, PREVIEW_WITH_EXTRAS);
+    // Enabled to begin with, so its later disabling means something.
+    expect(screen.getByRole("button", { name: /download video/i })).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: /output options/i }));
+    await user.click(screen.getByRole("radio", { name: /just one part/i }));
+
+    expect(screen.getByRole("button", { name: /download video/i })).toBeDisabled();
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText(/start at/i), "1:00");
+    await user.type(screen.getByLabelText(/end at/i), "0:30");
+    expect(screen.getByRole("button", { name: /download video/i })).toBeDisabled();
+
+    await user.clear(screen.getByLabelText(/end at/i));
+    await user.type(screen.getByLabelText(/end at/i), "1:30");
+
+    const download = screen.getByRole("button", { name: /download video/i });
+    expect(download).toBeEnabled();
+    await user.click(download);
+
+    await waitFor(() => expect(createdInputs()).toHaveLength(1));
+    expect(createdInputs()[0].output_options?.segment).toEqual({
+      mode: "trim",
+      start_seconds: 60,
+      end_seconds: 90,
+      accurate_cut: false,
+    });
+  });
+
+  // FR-225 — offered only for a source that really has chapters, and
+  // explained rather than hidden when it does not.
+  it("offers the chapter split only for a source with chapters (FR-225)", async () => {
+    mockGetSettingsThenPreview(PREVIEW_WITH_EXTRAS);
+    const user = userEvent.setup();
+    const withChapters = render(<DownloadForm />);
+
+    await previewSingleLink(user, PREVIEW_WITH_EXTRAS);
+    await user.click(screen.getByRole("button", { name: /output options/i }));
+    expect(screen.getByRole("radio", { name: /split into 2 chapters/i })).toBeEnabled();
+    withChapters.unmount();
+
+    mockGetSettingsThenPreview({ ...SAMPLE_PREVIEW, chapters: [] });
+    render(<DownloadForm />);
+
+    await previewSingleLink(user);
+    await user.click(screen.getByRole("button", { name: /output options/i }));
+    expect(screen.getByRole("radio", { name: /one file per chapter/i })).toBeDisabled();
+    expect(screen.getByText(/no chapter list/i)).toBeInTheDocument();
+  });
+
+  // FR-232. The batch used to be the path where every output choice was
+  // dropped: `buildJobInput` was called without any, so a pasted list always
+  // produced the pre-Phase-2 defaults.
+  it("carries the shared output options into every job of a pasted batch (FR-232)", async () => {
+    mockBatchBackend();
+    const user = userEvent.setup();
+    render(<DownloadForm />);
+
+    await user.type(
+      screen.getByLabelText(/video or audio link/i),
+      "https://youtube.com/1\nhttps://youtube.com/2",
+    );
+    await user.click(screen.getByRole("button", { name: /output options/i }));
+    await user.click(screen.getByRole("radio", { name: /^FLAC$/ }));
+    await user.click(screen.getByRole("button", { name: /download 2 links/i }));
+
+    await waitFor(() => expect(createdInputs()).toHaveLength(2));
+    for (const input of createdInputs()) {
+      expect(input.output_options).toEqual({
+        ...NEW_JOB_OUTPUT_OPTIONS,
+        audio: { format: "flac" },
+      });
+    }
+  });
+
+  // The batch picker has to describe what the batch will produce, so the two
+  // choices cannot be held separately.
+  it("switches the batch output picker to video controls when the batch does (FR-232)", async () => {
+    mockBatchBackend();
+    const user = userEvent.setup();
+    render(<DownloadForm />);
+
+    await user.type(
+      screen.getByLabelText(/video or audio link/i),
+      "https://youtube.com/1\nhttps://youtube.com/2",
+    );
+    await user.click(screen.getByRole("button", { name: /output options/i }));
+
+    // Audio is the default for a pasted batch.
+    expect(screen.getByText(/audio format/i)).toBeInTheDocument();
+    expect(screen.queryByText(/video container/i)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("radio", { name: /full video/i }));
+
+    expect(screen.getByText(/video container/i)).toBeInTheDocument();
     expect(screen.queryByText(/audio format/i)).not.toBeInTheDocument();
   });
 

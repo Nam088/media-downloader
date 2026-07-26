@@ -5,6 +5,8 @@ import { toast } from "sonner";
 import { Clock, Download, Loader2, Music, Video } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ErrorBanner } from "@/components/ErrorBanner";
+import { OutputOptionsPicker } from "@/components/OutputOptionsPicker";
+import { trimErrorFor } from "@/lib/trim-input";
 import { useQueueStore } from "@/stores/queue-store";
 import {
   GENERIC_PLAYLIST_AUDIO_QUALITIES,
@@ -18,12 +20,22 @@ import type {
   CreatePlaylistJobsInput,
   DownloadJob,
   MediaSource,
+  OutputOptions,
   PlaylistItemJobInput,
 } from "@/types/download";
 
 interface PlaylistDetailPanelProps {
   preview: MediaSource | null;
   outputDirectory: string | null;
+  /**
+   * The output choices for every video queued from this panel (FR-232).
+   *
+   * Owned by the form rather than by this panel, and shared with the
+   * single-link picker, so switching a link between "one video" and "the whole
+   * playlist" cannot quietly change the format the file comes out in.
+   */
+  outputOptions: OutputOptions;
+  onOutputOptionsChange: (next: OutputOptions) => void;
 }
 
 /** The per-video type toggle, a compact two-way pill, same visual language
@@ -73,9 +85,13 @@ function ItemTypeToggle({
 function PlaylistDetailPanelInner({
   preview,
   outputDirectory,
+  outputOptions,
+  onOutputOptionsChange,
 }: {
   preview: MediaSource;
   outputDirectory: string | null;
+  outputOptions: OutputOptions;
+  onOutputOptionsChange: (next: OutputOptions) => void;
 }) {
   const { t } = useTranslation();
   const entries = preview.playlist_entries;
@@ -89,6 +105,9 @@ function PlaylistDetailPanelInner({
   const [error, setError] = useState<AppError | null>(null);
 
   const selectedCount = selected.size;
+  // FR-223 — the same block as the single-link form; a playlist submission is
+  // still a job creation.
+  const trimError = trimErrorFor(outputOptions, preview.duration_seconds);
   const hasVideoSelected = Array.from(selected).some((i) => itemType[i] === "video");
   const hasAudioSelected = Array.from(selected).some((i) => itemType[i] === "audio");
 
@@ -123,7 +142,15 @@ function PlaylistDetailPanelInner({
             title: entry.title,
           };
         });
-      const input: CreatePlaylistJobsInput = { output_directory: outputDirectory, items, playlist_title: preview.title };
+      const input: CreatePlaylistJobsInput = {
+        output_directory: outputDirectory,
+        items,
+        playlist_title: preview.title,
+        // The field existed from the first day of this command and nothing
+        // filled it, which made this the second path (with the batch) where
+        // every output choice was dropped on the floor.
+        output_options: outputOptions,
+      };
       const createdJobs = await invoke<DownloadJob[]>("create_playlist_download_jobs", { input });
       useQueueStore.getState().upsertJobs(createdJobs);
       toast.success(t("playlistDetail.added_to_queue", { count: createdJobs.length }));
@@ -249,8 +276,23 @@ function PlaylistDetailPanelInner({
         </div>
       )}
 
+      {/* One picker for the whole selection. Its media type follows what is
+          actually selected: a list queued entirely as audio gets the audio
+          format choices, anything with a video in it gets the container and
+          codec ones. */}
+      <OutputOptionsPicker
+        mediaType={hasVideoSelected ? "video" : "audio"}
+        value={outputOptions}
+        onChange={onOutputOptionsChange}
+        source={preview}
+      />
+
       <div className="flex justify-end border-t border-border/60 pt-3">
-        <Button onClick={handleSubmit} disabled={submitting || selectedCount === 0 || !outputDirectory} className="gap-2">
+        <Button
+          onClick={handleSubmit}
+          disabled={submitting || selectedCount === 0 || !outputDirectory || trimError !== null}
+          className="gap-2"
+        >
           {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
           {t("playlistDetail.submit_button", { count: selectedCount })}
         </Button>
@@ -266,8 +308,21 @@ function PlaylistDetailPanelInner({
  * backend reported no real per-entry list (e.g. some flat-playlist sources
  * yt-dlp can enumerate a count for but not individual entries). `DownloadForm`
  * falls back to `PlaylistScopeDialog` for that case. */
-export function PlaylistDetailPanel({ preview, outputDirectory }: PlaylistDetailPanelProps) {
+export function PlaylistDetailPanel({
+  preview,
+  outputDirectory,
+  outputOptions,
+  onOutputOptionsChange,
+}: PlaylistDetailPanelProps) {
   if (!preview || preview.playlist_entries.length === 0) return null;
 
-  return <PlaylistDetailPanelInner key={preview.source_url} preview={preview} outputDirectory={outputDirectory} />;
+  return (
+    <PlaylistDetailPanelInner
+      key={preview.source_url}
+      preview={preview}
+      outputDirectory={outputDirectory}
+      outputOptions={outputOptions}
+      onOutputOptionsChange={onOutputOptionsChange}
+    />
+  );
 }

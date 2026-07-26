@@ -4,7 +4,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { buildJobInput } from "@/lib/build-job-input";
 import { audioQualityValue } from "@/lib/generic-quality-options";
 import { useQueueStore } from "@/stores/queue-store";
-import type { CreateJobInput, DownloadJob, MediaSource, MediaType } from "@/types/download";
+import type {
+  CreateJobInput,
+  DownloadJob,
+  MediaSource,
+  MediaType,
+  OutputOptions,
+} from "@/types/download";
 
 /**
  * How many links are previewed at the same time.
@@ -39,6 +45,16 @@ export interface RunBatchArgs {
   urls: string[];
   mediaType: BatchMediaType;
   outputDirectory: string;
+  /**
+   * One set of output choices for the whole paste (FR-232) — the same object
+   * for every link, which is what makes a preset applicable to a batch.
+   *
+   * Omitting it is still supported and still means the pre-Phase-2 behaviour,
+   * but the batch flow no longer *has* to omit it: before this existed, a
+   * pasted list was the one path that silently ignored every output choice the
+   * user had made.
+   */
+  outputOptions?: OutputOptions;
 }
 
 export interface BatchSummary {
@@ -74,7 +90,12 @@ export function useBatchDownload() {
   }, []);
 
   const run = useCallback(
-    async ({ urls, mediaType, outputDirectory }: RunBatchArgs): Promise<BatchSummary> => {
+    async ({
+      urls,
+      mediaType,
+      outputDirectory,
+      outputOptions,
+    }: RunBatchArgs): Promise<BatchSummary> => {
       if (inFlight.current || urls.length === 0) {
         return { created: 0, failed: 0 };
       }
@@ -115,6 +136,10 @@ export function useBatchDownload() {
               // audio/video quality concept at all: "audio" means keep just
               // the backing track, "video" means take the files as they are.
               galleryMode: mediaType === "audio" ? "audio_only" : "files",
+              // FR-232 — the shared picker above the list, applied to every
+              // link. `buildJobInput` drops it for a gallery-backed link,
+              // which reads none of it (FR-234).
+              outputOptions,
             });
 
             const createdJobs = await invoke<DownloadJob[]>("create_download_job", { input });
