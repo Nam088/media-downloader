@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "media-downloader",
+  "productName": "Media Downloader",
   "version": "0.1.0",
   "identifier": "io.github.nam088.mediadownloader",
   "build": {
@@ -59,7 +59,8 @@
     "externalBin": ["binaries/ffmpeg"],
     "resources": {
       "binaries/yt-dlp-onedir": "yt-dlp-onedir",
-      "binaries/gallery-dl-onedir": "gallery-dl-onedir"
+      "binaries/gallery-dl-onedir": "gallery-dl-onedir",
+      "binaries/spotiflac-onedir": "spotiflac-onedir"
     }
   }
 }

@@ -61,7 +61,7 @@ Khi nhà cung cấp nguồn phát yêu cầu xác minh Cloudflare CAPTCHA, hệ 
 
 - Link Spotify bài hát không tồn tại trên các nhà cung cấp (Tidal/Qobuz/Deezer/Amazon) → Thông báo lỗi không tìm thấy nguồn phát FLAC tương ứng và đề xuất chuyển sang phương thức tải thông thường qua `yt-dlp`.
 - Bài hát bị giới hạn bản quyền theo quốc gia/khu vực → Tự động chuyển sang nhà cung cấp khả dụng tiếp theo trong danh sách ưu tiên.
-- Mất kết nối mạng giữa chừng khi đang tải luồng FLAC → Cho phép thử lại tác vụ và nối lại tiến trình.
+- Mất kết nối mạng giữa chừng khi đang tải luồng FLAC → Tự động thử lại theo backoff hoặc cho phép thử lại thủ công; mỗi lần thử tải lại track từ đầu (không resume giữa file — track FLAC dung lượng nhỏ nên chấp nhận được).
 - Thiếu môi trường Node.js trên máy người dùng khi dùng JS Extensions → Hệ thống tự nhận biết và thông báo hỗ trợ người dùng cài đặt/kích hoạt Node.js hoặc chuyển sang dùng native provider.
 
 ---
@@ -70,7 +70,7 @@ Khi nhà cung cấp nguồn phát yêu cầu xác minh Cloudflare CAPTCHA, hệ 
 
 ### Functional Requirements
 
-- **FR-001**: Hệ thống PHẢI tự động nhận diện các định dạng URL liên kết Spotify (Track, Album, Playlist, Artist) cũng như các dịch vụ stream được hỗ trợ khác (Tidal, Apple Music, SoundCloud, YouTube, Pandora).
+- **FR-001**: Hệ thống PHẢI tự động nhận diện các định dạng URL liên kết Spotify (Track, Album, Playlist, Artist) cũng như các dịch vụ stream được hỗ trợ khác (Tidal, Apple Music, SoundCloud, YouTube, Pandora). Trong đó Spotify, Tidal, Apple Music và Pandora được định tuyến sang engine SpotiFLAC; SoundCloud và YouTube tiếp tục được nhận diện và xử lý qua engine `yt-dlp` hiện có (hai nguồn này vốn không phân phối lossless).
 - **FR-002**: Hệ thống PHẢI tích hợp engine `SpotiFLAC` (dựa trên repo `BartolomeoRusso9/SpotiFLAC-Module-Version`) dưới dạng một module tải nhạc lossless chuyên dụng bên cạnh `yt-dlp` và `gallery-dl`.
 - **FR-003**: Hệ thống PHẢI cho phép người dùng tùy chọn mức chất lượng âm thanh mong muốn bao gồm: FLAC 16-bit (Lossless Standard), FLAC 24-bit (Hi-Res Audio) và MP3 320kbps (High Quality).
 - **FR-004**: Hệ thống PHẢI cho phép người dùng thiết lập và sắp xếp thứ tự ưu tiên các nhà cung cấp nguồn âm thanh (Tidal, Qobuz, Deezer, Amazon Music).

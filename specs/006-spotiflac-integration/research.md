@@ -10,7 +10,8 @@
 - URL input hỗ trợ: Spotify (track/album/playlist/artist), Tidal, Apple Music, SoundCloud, YouTube, Pandora. SoundCloud/YouTube chỉ ra MP3 (không lossless).
 - Metadata: tự gắn tag + cover art, MusicBrainz enrichment, lyrics nhúng (LRC), download validation (phát hiện file preview/corrupt và tự thử provider kế).
 - Retry: `track_max_retries` (exponential backoff, xoay vòng providers), `timeout_s` per-track, `loop` re-queue phút.
-- Cloudflare: `core/solver.py` tự giải bằng **nodriver + Chrome hệ thống** (bắt `grant` từ network); môi trường headless dùng **Telegram bridge** qua env `TG_BOT_TOKEN`/`TG_CHAT_ID` — bot gửi challenge URL, người dùng reply grant code, module inject và tiếp tục.
+- Cloudflare: `core/solver.py` tự giải bằng **nodriver + Chrome hệ thống** (bắt `grant` từ network). Khi solver hụt, `core/signed_session_desktop.py` rơi về `_run_manual_terminal_verification()` đọc `input()` — chi tiết và hệ quả ở [R4](#r4--luồng-cloudflare-challenge--grant-code-fr-007-us3).
+- **Telegram KHÔNG nằm trong module**: `TG_BOT_TOKEN`/`TG_CHAT_ID` chỉ được `telegram_wrapper.py` (script ngoài ở gốc repo upstream) đọc — xem R4.
 - JS Extensions cần Node.js; nếu thiếu, module **tự ý cài Node** qua package manager hệ thống (apt/brew/winget/choco).
 
 ---
@@ -49,13 +50,15 @@
 ## R4 — Luồng Cloudflare challenge & grant code (FR-007, US3)
 
 **Decision**: Ba lớp, thứ tự ưu tiên:
-1. **Auto-solver của module** (nodriver + Chrome): mặc định để nguyên — đa số challenge tự giải, người dùng không thấy gì.
-2. **Telegram bridge**: nếu người dùng cấu hình trong Settings, Rust truyền `TG_BOT_TOKEN`/`TG_CHAT_ID` vào env của worker process — module xử lý trọn vòng Telegram (FR-008, US3-AS2) mà app không phải viết gì thêm.
-3. **In-app dialog**: worker chặn được sự kiện challenge (patch hook prompt/notify của module) → emit `cloudflare_challenge {challenge_url}` qua stdout → Rust chuyển job sang status mới `waiting_input`, emit event `job:cloudflare_challenge` → frontend hiện dialog (mở URL bằng trình duyệt + ô nhập grant) → command `submit_cloudflare_grant(job_id, grant)` → Rust ghi JSON xuống **stdin worker** → worker inject grant, job quay lại `downloading`.
+1. **Auto-solver của module** (nodriver + Chrome): để nguyên — đa số challenge tự giải, người dùng không thấy gì.
+2. **In-app dialog**: worker chiếm chỗ prompt thủ công của module → emit `cloudflare_challenge {challenge_url}` qua stdout → Rust chuyển job sang `waiting_input`, emit `job:cloudflare_challenge` → frontend hiện dialog → `submit_cloudflare_grant(job_id, grant)` → Rust ghi JSON xuống **stdin worker** → worker trả grant về cho module, job quay lại `downloading`.
+3. **Telegram**: chạy song song với dialog — worker gửi challenge URL qua Bot API rồi poll `getUpdates` chờ reply từ đúng `TG_CHAT_ID`; grant nào tới trước thì thắng.
 
-**Rationale**: Tận dụng tối đa cơ chế có sẵn của module (solver + Telegram đã hoàn chỉnh); phần app chỉ phải xây kênh round-trip stdin/stdout — khớp quy ước sentinel-line hiện hành.
+**Hook đã XÁC MINH** (đọc source v1.5.5, `SpotiFLAC/core/signed_session_desktop.py::run_community_verification`): module giải challenge theo ba mode — (1) handler GUI đăng ký qua `set_community_verification_handlers`, (2) auto-solver `solver.solve_with_callback`, (3) `_run_manual_terminal_verification(challenge_url)` đọc `input()` từ stdin. Worker **cố ý KHÔNG đăng ký handler GUI** (mode 1 chạy trước và sẽ chặn mất auto-solver), mà thay hàm của mode 3 — nó đã nhận sẵn challenge URL hoàn chỉnh và chỉ cần trả về chuỗi grant. Đúng thứ tự lớp ở trên, không phải patch gì sâu hơn.
 
-**Risk / verify khi implement**: điểm hook chính xác trong module để (a) bắt challenge URL và (b) inject grant từ bên ngoài chưa xác minh được từ README (solver.py giải tự động; đường Telegram inject qua bot). Nhiệm vụ implement phải đọc `core/solver.py` + provider gọi nó để tìm hook; **fallback đã định**: nếu không có hook công khai, worker tự bắt exception challenge, tự chạy vòng chờ grant (gọi lại verify endpoint với grant do người dùng nhập) — mức tệ nhất vẫn còn nguyên đường Telegram cho US3-AS2.
+**SỬA GIẢ ĐỊNH BAN ĐẦU — Telegram KHÔNG có sẵn trong module**: `TG_BOT_TOKEN`/`TG_CHAT_ID` chỉ được đọc bởi `telegram_wrapper.py` ở gốc repo upstream — một tiến trình **bên ngoài**, spawn CLI rồi regex output để bắt challenge URL và ghi grant vào stdin của nó. Đó đúng bằng vai trò mà app này đang đóng, nên truyền env xuống rồi trông chờ module tự xử lý là vô nghĩa: FR-008 do **chính worker implement** (gửi `sendMessage`, poll `getUpdates`, chỉ chấp nhận reply từ đúng chat ID đã cấu hình — thứ chặn người lạ tìm ra bot rồi chiếm phiên).
+
+**Alternatives considered**: đăng ký `set_community_verification_handlers` (API công khai, sạch hơn) — bị loại vì mode 1 chạy TRƯỚC auto-solver, biến mọi challenge thành một lần hỏi người dùng dù máy thừa sức tự giải.
 
 ## R5 — JS Extensions & Node.js (FR-005, edge case thiếu Node)
 

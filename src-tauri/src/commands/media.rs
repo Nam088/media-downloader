@@ -5,15 +5,22 @@ use tauri::{AppHandle, State};
 
 use crate::downloader::gallery_dl;
 use crate::downloader::gallery_dl::GalleryDump;
+use crate::downloader::spotiflac;
+use crate::downloader::spotiflac::MusicPreview;
 use crate::downloader::ytdlp;
 use crate::downloader::ytdlp::YtDlpChild;
 use crate::error::AppError;
 use crate::logging::log_event;
 use crate::models::{
-    AudioFormatOption, ChapterPreview, GalleryItemPreview, MediaSource, SubtitleTrackPreview,
-    VideoQualityOption,
+    AudioFormatOption, ChapterPreview, GalleryItemPreview, MediaSource, PlaylistEntryPreview,
+    SubtitleTrackPreview, VideoQualityOption,
 };
-use crate::platform::detect_platform;
+use crate::platform::{detect_platform, is_music_url};
+
+/// Ba tier mà mọi preview nhạc chào ra (FR-003). Worker không probe trước
+/// được tier nào provider thật sự có — `allow_fallback` của module tự hạ khi
+/// tải — nên danh sách này là hằng, không phải kết quả đo.
+pub const MUSIC_TIERS: [&str; 3] = ["flac16", "flac24", "mp3_320"];
 
 /// Tracks the yt-dlp process backing each in-flight `preview_media` call, so
 /// `cancel_preview_media` can actually kill it instead of just letting the
@@ -103,6 +110,31 @@ pub async fn preview_media(
     previews: State<'_, ActivePreviews>,
     source_url: String,
 ) -> Result<MediaSource, AppError> {
+    // Link nhạc lossless (Spotify/Tidal/Apple Music/Pandora) đi qua engine
+    // SpotiFLAC TRƯỚC khi yt-dlp được hỏi: yt-dlp không lỗi "sạch" với các
+    // link này (nó trả một preview rỗng thay vì UNSUPPORTED_PLATFORM, nên cơ
+    // chế `looks_empty_handed` bên dưới không bắt được đáng tin cậy —
+    // research.md R2 của specs/006). Worker lỗi thì rơi tiếp xuống chuỗi
+    // yt-dlp → gallery-dl hiện hành, nên một link nhạc mà SpotiFLAC bó tay
+    // vẫn còn đường tải thường.
+    if is_music_url(&source_url) {
+        match try_music_preview(&app, &previews, &source_url).await {
+            Some((source, entry_urls)) => {
+                cache.store(source.clone(), entry_urls);
+                return Ok(source);
+            }
+            None => {
+                log_event(
+                    &app,
+                    "WARN",
+                    format!(
+                        "preview_media: spotiflac preview failed for {source_url}, falling back to yt-dlp"
+                    ),
+                );
+            }
+        }
+    }
+
     // Whether a link is supported is yt-dlp's call, not ours: it recognizes
     // ~1,600 working extractors today (`yt-dlp --list-extractors`), and
     // FR-014 requires the architecture to accept new platforms without code
@@ -205,6 +237,100 @@ pub async fn preview_media(
 
     cache.store(source.clone(), playlist_entry_urls);
     Ok(source)
+}
+
+/// Chạy preview của spotiflac-worker cho một link nhạc và dựng `MediaSource`
+/// từ kết quả. Trả `None` cho MỌI thất bại (worker chưa build, module lỗi,
+/// mạng đứt…) — người gọi còn nguyên chuỗi yt-dlp → gallery-dl để thử tiếp,
+/// nên một lần SpotiFLAC hụt chân không bao giờ tự nó là fatal.
+async fn try_music_preview(
+    app: &AppHandle,
+    previews: &ActivePreviews,
+    source_url: &str,
+) -> Option<(MediaSource, Vec<String>)> {
+    let result = spotiflac::run_music_preview(app, source_url, |child| {
+        previews.insert(source_url.to_string(), child.child);
+    })
+    .await;
+    previews.remove(source_url);
+
+    match result {
+        Ok(preview) => Some(build_music_media_source(source_url, &preview)),
+        Err(err) => {
+            log_event(
+                app,
+                "WARN",
+                format!("preview_media: spotiflac worker failed for {source_url}: {err}"),
+            );
+            None
+        }
+    }
+}
+
+/// `MediaSource` cho một preview nhạc. Track đơn hiện "Artist – Title"; album/
+/// playlist/artist thành preview playlist với mỗi track một entry — đi tiếp
+/// qua đúng cơ chế fan-out mỗi-bài-một-job hiện có (research.md R7).
+fn build_music_media_source(
+    source_url: &str,
+    preview: &MusicPreview,
+) -> (MediaSource, Vec<String>) {
+    let platform = detect_platform(source_url)
+        .map(str::to_string)
+        .unwrap_or_else(|| "unknown".to_string());
+    let is_collection = preview.kind != "track" && preview.tracks.len() > 1
+        || matches!(preview.kind.as_str(), "album" | "playlist" | "artist");
+
+    let playlist_entries: Vec<PlaylistEntryPreview> = if is_collection {
+        preview
+            .tracks
+            .iter()
+            .map(|track| PlaylistEntryPreview {
+                url: track.url.clone(),
+                title: format!("{} – {}", track.artist, track.title),
+                duration_seconds: track.duration_seconds,
+                thumbnail_url: track.thumbnail_url.clone(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let entry_urls: Vec<String> = playlist_entries.iter().map(|e| e.url.clone()).collect();
+
+    let title = if is_collection {
+        preview.title.clone()
+    } else {
+        format!("{} – {}", preview.artist, preview.title)
+    };
+    let duration_seconds = if is_collection {
+        None
+    } else {
+        preview.tracks.first().and_then(|t| t.duration_seconds)
+    };
+
+    let source = MediaSource {
+        source_url: source_url.to_string(),
+        title,
+        thumbnail_url: preview
+            .thumbnail_url
+            .clone()
+            .or_else(|| preview.tracks.first().and_then(|t| t.thumbnail_url.clone())),
+        duration_seconds,
+        platform,
+        is_playlist: is_collection,
+        playlist_item_count: is_collection.then_some(preview.tracks.len() as i64),
+        available_video_qualities: Vec::new(),
+        available_audio_formats: Vec::new(),
+        is_gallery: false,
+        gallery_items: Vec::new(),
+        is_music: true,
+        available_music_tiers: MUSIC_TIERS.iter().map(|t| t.to_string()).collect(),
+        playlist_entries,
+        // Nhạc không có khái niệm phụ đề/chương — "chưa kiểm tra" để giao diện
+        // ẩn hẳn hai ô chọn đó, cùng quy ước với gallery.
+        subtitles: None,
+        chapters: None,
+    };
+    (source, entry_urls)
 }
 
 /// Runs gallery-dl's own preview (`--dump-json --no-download`) for
@@ -430,6 +556,8 @@ fn build_media_source(source_url: &str, platform: &str, raw: &serde_json::Value)
         available_audio_formats,
         is_gallery: false,
         gallery_items: Vec::new(),
+        is_music: false,
+        available_music_tiers: Vec::new(),
         playlist_entries,
         subtitles,
         chapters,
@@ -609,6 +737,8 @@ fn build_gallery_media_source(source_url: &str, platform: &str, dump: &GalleryDu
         available_audio_formats: Vec::new(),
         is_gallery: true,
         gallery_items,
+        is_music: false,
+        available_music_tiers: Vec::new(),
         playlist_entries: Vec::new(),
         // gallery-dl không có khái niệm phụ đề hay chương, nên đây là "chưa
         // kiểm tra" chứ không phải "không có" — giao diện nói "không rõ" thay

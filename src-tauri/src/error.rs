@@ -27,6 +27,17 @@ pub const NETWORK_ERROR_CODE: &str = "NETWORK_ERROR";
 /// `queue`) lẫn nơi đọc (`retry::decide_outcome`).
 pub const CANCELED_ERROR_CODE: &str = "CANCELED";
 
+/// Engine SpotiFLAC (specs/006): không provider nào có bài — khác hẳn lỗi
+/// mạng (không đáng thử lại tự động) và message gợi ý tải thường qua yt-dlp.
+pub const SPOTIFLAC_NO_SOURCE_CODE: &str = "SPOTIFLAC_NO_SOURCE";
+/// Mọi provider đều từ chối vì giới hạn khu vực.
+pub const SPOTIFLAC_REGION_BLOCKED_CODE: &str = "SPOTIFLAC_REGION_BLOCKED";
+/// Job đứng ở `waiting_input` quá 15 phút hoặc nhập grant sai quá 3 lần.
+pub const SPOTIFLAC_CHALLENGE_TIMEOUT_CODE: &str = "SPOTIFLAC_CHALLENGE_TIMEOUT";
+/// Cảnh báo (không fail job): máy thiếu Node.js nên JS extensions fallback bị
+/// tắt cho lần chạy này.
+pub const SPOTIFLAC_NODE_MISSING_CODE: &str = "SPOTIFLAC_NODE_MISSING";
+
 impl AppError {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
@@ -60,6 +71,13 @@ impl AppError {
 
     pub fn not_found(what: &str) -> Self {
         Self::new("NOT_FOUND", format!("{what} not found"))
+    }
+
+    pub fn spotiflac_challenge_timeout() -> Self {
+        Self::new(
+            SPOTIFLAC_CHALLENGE_TIMEOUT_CODE,
+            "Cloudflare verification was not completed in time",
+        )
     }
 
     pub fn internal(err: impl std::fmt::Display) -> Self {

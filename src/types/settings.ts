@@ -1,3 +1,5 @@
+import type { MusicQualityTier } from "@/types/download";
+
 export type ThemePreference = "system" | "light" | "dark";
 export type LanguagePreference = "system" | "en" | "vi";
 
@@ -18,4 +20,20 @@ export interface AppSettings {
   max_retry_attempts: number;
   /** Closing the window minimises to the tray instead of quitting. */
   run_in_background: boolean;
+  /**
+   * Provider priority for SpotiFLAC music downloads, as a CSV of provider
+   * ids — default `"tidal,qobuz,deezer,amazon"`. The backend only accepts a
+   * subset/permutation of those four, never an empty string.
+   */
+  spotiflac_service_order: string;
+  /** Default quality tier a new music job starts on; default `"flac16"`. */
+  spotiflac_quality: MusicQualityTier;
+  /** Let the worker fall back to JS-extension providers when the four native
+   * ones fail (needs Node on PATH); default true. */
+  spotiflac_extensions_fallback: boolean;
+  /** Telegram bot token for Cloudflare-challenge notifications. Stored as
+   * plaintext in the settings table — empty means "not configured". */
+  tg_bot_token: string;
+  /** Telegram chat id the bot writes to; digits only, or empty. */
+  tg_chat_id: string;
 }

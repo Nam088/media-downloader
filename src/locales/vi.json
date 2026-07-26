@@ -26,7 +26,24 @@
     "rate_limit_label": "Giới hạn tốc độ (KB/s)",
     "rate_limit_hint": "0 nghĩa là không giới hạn. Giới hạn này áp dụng cho từng lượt tải, không phải cho tổng của cả ứng dụng — khi có {{concurrency}} lượt tải chạy cùng lúc, tốc độ cộng lại có thể lên tới {{concurrency}}× con số này.",
     "background_label": "Tiếp tục chạy nền",
-    "background_hint": "Đóng cửa sổ sẽ thu nhỏ ứng dụng xuống khay hệ thống và các lượt tải vẫn chạy tiếp."
+    "background_hint": "Đóng cửa sổ sẽ thu nhỏ ứng dụng xuống khay hệ thống và các lượt tải vẫn chạy tiếp.",
+    "spotiflac": {
+      "section": "Tải nhạc",
+      "serviceOrder": "Thứ tự ưu tiên nguồn phát",
+      "serviceOrderHint": "Liên kết nhạc được thử theo đúng thứ tự này; nguồn nào không có bài thì tự chuyển sang nguồn kế tiếp.",
+      "moveUp": "Đưa {{provider}} lên trên",
+      "moveDown": "Đưa {{provider}} xuống dưới",
+      "quality": "Chất lượng nhạc mặc định",
+      "qualityHint": "Mức khởi tạo cho liên kết nhạc vừa xem trước. Bạn vẫn đổi được cho từng lượt tải.",
+      "extensionsFallback": "Dùng nguồn mở rộng khi hết cách",
+      "extensionsFallbackHint": "Thử các nguồn JavaScript của cộng đồng khi cả bốn nguồn trên đều không có bài. Cần cài Node.js; nếu thiếu thì lượt tải vẫn chạy tiếp mà bỏ qua chúng.",
+      "tgBotToken": "Token bot Telegram",
+      "tgBotTokenPlaceholder": "Bỏ trống để tắt thông báo Telegram",
+      "tgChatId": "Chat ID Telegram",
+      "tgChatIdPlaceholder": "Chỉ gồm chữ số",
+      "telegramHint": "Khi một lượt tải cần xác minh Cloudflare, bot sẽ gửi liên kết vào cuộc trò chuyện này để bạn xử lý dù không ngồi trước máy.",
+      "plaintextWarning": "Token được lưu dạng văn bản thuần trong cơ sở dữ liệu cục bộ của ứng dụng. Hãy dùng một bot tạo riêng cho ứng dụng này."
+    }
   },
   "theme": {
     "toggle_label": "Đổi giao diện",
@@ -87,6 +104,7 @@
     "media_type_audio": "Âm thanh",
     "media_type_video": "Video",
     "media_type_gallery": "Hình ảnh",
+    "media_type_music": "Nhạc",
     "active_filters_label": "Đang lọc theo",
     "active_search": "Từ khoá: {{term}}",
     "active_date_from": "Từ {{date}}",
@@ -108,6 +126,8 @@
     "prev_page": "Trang trước",
     "next_page": "Trang sau",
     "missing_badge": "Không tìm thấy tệp",
+    "provider_extension": "{{name}} (ext)",
+    "provider_badge_title": "Được tải từ {{provider}}",
     "select_item": "Chọn {{title}}",
     "select_all": "Chọn tất cả",
     "select_none": "Bỏ chọn",
@@ -198,6 +218,9 @@
     "reorder_failed": "Không thể sắp xếp lại hàng đợi.",
     "progress_unknown": "Không rõ tiến độ — nguồn này không báo tổng dung lượng",
     "downloaded_so_far": "Đã tải {{size}}",
+    "provider": "Nguồn: {{provider}}",
+    "waitingInput": "Chờ xác minh",
+    "openChallenge": "Xác minh ngay",
     "status": {
       "queued": "Đang chờ",
       "fetching_metadata": "Đang lấy thông tin…",
@@ -206,6 +229,18 @@
       "completed": "Hoàn tất",
       "failed": "Lỗi",
       "canceled": "Đã huỷ"
+    }
+  },
+  "music": {
+    "challenge": {
+      "title": "Lượt tải này cần xác minh nhanh",
+      "instructions": "Nguồn phát yêu cầu kiểm tra Cloudflare. Hãy mở trang bên dưới, hoàn tất kiểm tra, rồi dán mã nhận được vào đây — lượt tải sẽ chạy tiếp đúng chỗ đang dừng.",
+      "openBrowser": "Mở trang xác minh",
+      "grantLabel": "Mã xác minh",
+      "grantPlaceholder": "Dán mã lấy từ trang xác minh",
+      "submit": "Tải tiếp",
+      "attemptsLeft_other": "Còn {{count}} lần thử trước khi lượt tải bị huỷ",
+      "submit_failed": "Mã đó không được chấp nhận. Hãy xem lại trang xác minh và dán mã mới nhất."
     }
   },
   "downloadForm": {
@@ -361,7 +396,16 @@
     "presets_adjusted_subtitles_dropped": "Liên kết này không có phụ đề {{languages}}, nên các ngôn ngữ đó đã bị bỏ khỏi lựa chọn.",
     "presets_adjusted_subtitles_unavailable": "Liên kết này không có phụ đề nào, nên các ngôn ngữ phụ đề trong preset đã được xoá.",
     "presets_adjusted_subtitles_not_embeddable": "Định dạng đầu ra đã chọn không chứa được track phụ đề, nên phụ đề sẽ được lưu thành file riêng.",
-    "presets_adjusted_chapters_unavailable": "Liên kết này không có chương, nên sẽ tải thành một file trọn vẹn."
+    "presets_adjusted_chapters_unavailable": "Liên kết này không có chương, nên sẽ tải thành một file trọn vẹn.",
+    "musicTier": {
+      "label": "Chất lượng nhạc",
+      "flac16": "FLAC 16-bit Lossless",
+      "flac16Hint": "Chất lượng CD (16-bit / 44.1 kHz) — không mất dữ liệu, lựa chọn thông dụng",
+      "flac24": "FLAC 24-bit Hi-Res",
+      "flac24Hint": "Chất lượng phòng thu Hi-Res (tối đa 24-bit) — dung lượng lớn nhất",
+      "mp3_320": "MP3 320kbps",
+      "mp3_320Hint": "Chuyển từ bản lossless sau khi tải — tệp nhẹ hơn, phát được ở mọi nơi"
+    }
   },
   "logs": {
     "description": "Hoạt động gần đây của backend — job lỗi, thử lại, và các quyết định dự phòng. Hữu ích để tìm hiểu vì sao một lượt tải không như mong đợi.",
@@ -391,7 +435,11 @@
     "TRASH_FAILED": "Không chuyển được tệp vào thùng rác của hệ thống, nên tệp vẫn nằm nguyên chỗ cũ.",
     "INVALID_FILE_NAME": "Tên đó không còn ký tự nào mà hệ thống tệp lưu được. Hãy chọn một tên khác.",
     "NOT_A_FILE": "Đường dẫn đó là một thư mục chứ không phải một tệp. Hãy trỏ đúng vào tệp.",
-    "EMPTY_PLAYLIST": "Hãy chọn ít nhất một tệp trước khi xuất danh sách phát."
+    "EMPTY_PLAYLIST": "Hãy chọn ít nhất một tệp trước khi xuất danh sách phát.",
+    "SPOTIFLAC_NO_SOURCE": "Không nguồn phát nào cung cấp được bài này — có thể bài hát không tồn tại trên các nguồn lossless. Hãy thử tải thường bằng engine mặc định (yt-dlp) thay thế.",
+    "SPOTIFLAC_REGION_BLOCKED": "Mọi nguồn phát đều từ chối bài này do giới hạn khu vực, nên không tải được từ đây.",
+    "SPOTIFLAC_CHALLENGE_TIMEOUT": "Chưa hoàn tất xác minh trong thời gian cho phép nên lượt tải đã dừng. Hãy thử lại để nhận liên kết xác minh mới.",
+    "SPOTIFLAC_NODE_MISSING": "Không tìm thấy Node.js nên các nguồn mở rộng không khả dụng — lượt tải vẫn tiếp tục với các nguồn có sẵn."
   },
   "compliance": {
     "title": "Trước khi bắt đầu tải",

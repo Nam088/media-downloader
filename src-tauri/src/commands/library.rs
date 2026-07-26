@@ -571,6 +571,7 @@ mod tests {
             source_url: format!("https://example.com/{job_id}"),
             duration_seconds: duration,
             thumbnail_path: None,
+            source_provider: None,
         })
         .unwrap();
         db.library_items_for_job(&job_id).unwrap().remove(0)

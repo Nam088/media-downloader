@@ -117,7 +117,7 @@ async function dragRow(
 
 describe("QueueList", () => {
   beforeEach(() => {
-    useQueueStore.setState({ jobs: {}, liveProgress: {} });
+    useQueueStore.setState({ jobs: {}, liveProgress: {}, challenges: {} });
     vi.mocked(invoke).mockReset();
     vi.mocked(invoke).mockImplementation(() => Promise.resolve(undefined));
   });
@@ -171,6 +171,73 @@ describe("QueueList", () => {
     expect(
       screen.queryByRole("progressbar", { name: /progress unknown/i }),
     ).not.toBeInTheDocument();
+  });
+
+  // FR-009 — a music job says which provider it is actually pulling from.
+  it("names the provider a running music job is downloading from", () => {
+    useQueueStore.setState({
+      jobs: { "job-1": makeJob({ media_type: "music", platform: "spotify" }) },
+      liveProgress: { "job-1": { progress_percent: 42, downloaded_bytes: 100, provider: "tidal" } },
+    });
+    render(<QueueList />);
+
+    // Through `formatPlatformLabel`, so the branded name shows rather than
+    // the raw provider id the worker sends.
+    expect(screen.getByText("Source: TIDAL")).toBeInTheDocument();
+  });
+
+  it("shows no provider badge for a non-music job that somehow has one", () => {
+    useQueueStore.setState({
+      jobs: { "job-1": makeJob({ media_type: "audio" }) },
+      liveProgress: { "job-1": { progress_percent: 42, downloaded_bytes: 100, provider: "tidal" } },
+    });
+    render(<QueueList />);
+
+    expect(screen.queryByText(/Source:/)).not.toBeInTheDocument();
+  });
+
+  // A job parked on a Cloudflare check is still active: hiding it would leave
+  // the user with a download that never finishes and no way to unblock it.
+  it("keeps a waiting_input job on screen with its own status and no pause button", () => {
+    useQueueStore.setState({
+      jobs: { "job-1": makeJob({ media_type: "music", status: "waiting_input" }) },
+    });
+    render(<QueueList />);
+
+    expect(screen.getByText("Waiting for verification")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /verify now/i })).toBeInTheDocument();
+    // Pausing would kill the worker holding the challenge open.
+    expect(screen.queryByRole("button", { name: /^pause$/i })).not.toBeInTheDocument();
+  });
+
+  it("re-reads the pending challenge when the user asks to verify again", async () => {
+    const user = userEvent.setup();
+    useQueueStore.setState({
+      jobs: { "job-1": makeJob({ media_type: "music", status: "waiting_input" }) },
+      // Already dismissed once, so the dialog is closed and the row's button
+      // is the only way back to it.
+      challenges: {
+        "job-1": { challengeUrl: "https://challenge.example/v", attempts: 1, dismissed: true },
+      },
+    });
+    render(<QueueList />);
+
+    await user.click(screen.getByRole("button", { name: /verify now/i }));
+
+    expect(invoke).toHaveBeenCalledWith("get_pending_challenge", { jobId: "job-1" });
+  });
+
+  it("opens the grant dialog for an undismissed challenge", () => {
+    useQueueStore.setState({
+      jobs: { "job-1": makeJob({ media_type: "music", status: "waiting_input" }) },
+      challenges: {
+        "job-1": { challengeUrl: "https://challenge.example/v", attempts: 0, dismissed: false },
+      },
+    });
+    render(<QueueList />);
+
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByText("https://challenge.example/v")).toBeInTheDocument();
   });
 
   it("does not list completed jobs among active downloads", () => {

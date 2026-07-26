@@ -58,9 +58,13 @@ pub fn notification_for(
             "Download failed",
             error.unwrap_or(label).to_string(),
         )),
+        // `WaitingInput` không phải trạng thái kết thúc: job đang chờ người
+        // dùng nhập Cloudflare grant — dialog/queue đã hiển thị việc đó, một
+        // thông báo hệ thống "tải xong/thất bại" ở đây đều là nói dối.
         JobStatus::Queued
         | JobStatus::FetchingMetadata
         | JobStatus::Downloading
+        | JobStatus::WaitingInput
         | JobStatus::Paused
         | JobStatus::Canceled => None,
     }
