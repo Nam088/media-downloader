@@ -26,6 +26,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/0010_job_output_options.sql")),
         M::up(include_str!("migrations/0011_output_presets.sql")),
         M::up(include_str!("migrations/0012_library_index.sql")),
+        M::up(include_str!("migrations/0013_history_created_at_index.sql")),
     ])
 }
 
@@ -257,7 +258,10 @@ impl Db {
         let conn = self.conn();
         let filter = HistoryFilterSql::build(query);
         let sql = format!(
-            "SELECT * FROM download_jobs {} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+            // `created_at`, không phải `updated_at`: OFFSET chỉ có nghĩa khi khoá
+            // sắp xếp đứng yên trong lúc người dùng lật trang, và `updated_at`
+            // đổi mỗi lần job được chạm tới. Xem migration 0013.
+            "SELECT * FROM download_jobs {} ORDER BY created_at DESC LIMIT ? OFFSET ?",
             filter.where_clause
         );
         let mut params = filter.params;
@@ -1749,10 +1753,14 @@ mod tests {
         assert_eq!(loaded, job);
     }
 
-    fn job_with_status(id: &str, status: JobStatus, updated_at: &str) -> DownloadJob {
+    /// Lịch sử sắp theo `created_at`, nên fixture đặt cả hai mốc bằng nhau —
+    /// trường hợp thường gặp, khi job chạy xong không lâu sau lúc được tạo.
+    /// Test nào cần hai mốc lệch nhau thì chỉnh `updated_at` sau khi gọi.
+    fn job_with_status(id: &str, status: JobStatus, created_at: &str) -> DownloadJob {
         let mut job = sample_job(id);
         job.status = status;
-        job.updated_at = updated_at.to_string();
+        job.created_at = created_at.to_string();
+        job.updated_at = created_at.to_string();
         job
     }
 
@@ -1803,6 +1811,39 @@ mod tests {
         assert_eq!(
             page2.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
             vec!["a"]
+        );
+    }
+
+    /// Trước đây Lịch sử sắp theo `updated_at`, nên một job cũ bị chạm lại —
+    /// tiếp tục sau khi tạm dừng, hoặc bấm Thử lại — nhảy thẳng lên đầu danh
+    /// sách. Trong cơ sở dữ liệu thật có 10 dòng như vậy.
+    ///
+    /// Nó cũng phá phân trang: OFFSET chỉ có nghĩa khi khoá sắp xếp đứng yên
+    /// giữa các lần lật trang, mà `updated_at` thì đổi ngay dưới chân người
+    /// dùng — đủ để một mục hiện hai lần hoặc biến mất hẳn.
+    #[test]
+    fn history_order_follows_when_a_job_started_not_when_it_was_last_touched() {
+        let db = temp_db();
+
+        // Tạo trước, nhưng bị chạm lại sau cùng.
+        let mut resumed_later = job_with_status("old", JobStatus::Completed, "2026-07-25T08:00:00Z");
+        resumed_later.updated_at = "2026-07-26T23:00:00Z".to_string();
+        db.insert_job(&resumed_later).unwrap();
+
+        // Tạo sau, và không bị chạm lại.
+        db.insert_job(&job_with_status(
+            "new",
+            JobStatus::Completed,
+            "2026-07-26T09:00:00Z",
+        ))
+        .unwrap();
+
+        let page = db.list_history_page(&history_query(10, 0)).unwrap();
+
+        assert_eq!(
+            page.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            vec!["new", "old"],
+            "job được tải sau phải đứng trên, dù job cũ vừa được chạm lại"
         );
     }
 
