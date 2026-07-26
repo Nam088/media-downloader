@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { useTranslation } from "react-i18next";
-import { ChevronDown, ChevronRight, Pause, Play, X, RotateCcw } from "lucide-react";
+import { ChevronDown, ChevronRight, GripVertical, Pause, Play, X, RotateCcw } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { Button } from "@/components/ui/button";
 import { QueueToolbar } from "@/components/QueueToolbar";
@@ -17,6 +17,29 @@ const FINISHED_STATUSES = new Set(["completed", "failed", "canceled"]);
 // PlaylistGroup below). It only disappears once every one of its jobs
 // reaches one of these fully-resolved states.
 const RESOLVED_STATUSES = new Set(["completed", "canceled"]);
+
+/**
+ * How far the pointer must travel before a press on a drag handle becomes a
+ * reorder. Without it, the tiny movement between pressing and releasing a
+ * mouse button would be read as a drag and swallow ordinary clicks.
+ */
+const DRAG_THRESHOLD_PX = 4;
+
+/**
+ * The press that may or may not become a drag. Kept in a ref rather than
+ * state because every pointer event has to read the *current* value
+ * synchronously — a stale closure here would drop the gesture.
+ */
+type DragOrigin = {
+  jobId: string;
+  pointerId: number;
+  startX: number;
+  startY: number;
+  /** Set once the pointer has travelled past `DRAG_THRESHOLD_PX`. */
+  started: boolean;
+  /** Id of the row the pointer was last over, i.e. what the indicator shows. */
+  overId: string | null;
+};
 
 function JobControls({ job }: { job: DownloadJob }) {
   const { pauseJob, resumeJob, cancelJob, retryJob } = useQueueStore();
@@ -181,13 +204,38 @@ export function QueueList() {
   const allJobs = useQueueStore(useShallow((state) => state.orderedJobs()));
   const moveJob = useQueueStore((state) => state.moveJob);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  // Reordering runs on pointer events, not the HTML5 drag-and-drop API: this
+  // is a Tauri v2 webview, where `dragDropEnabled` defaults to true and the
+  // OS-level drag handler swallows `dragstart`/`drop` before the page sees
+  // them. Turning that flag off would fix reordering but also kill the
+  // `tauri://drag-drop` event that dropping a .txt of URLs onto the window
+  // needs (FR-104/FR-105) — one switch governs both. Pointer events are never
+  // routed through that handler, so they work either way.
   const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<{ id: string; position: "before" | "after" } | null>(null);
+  const rowRefs = useRef(new Map<string, HTMLLIElement>());
+  const dragOrigin = useRef<DragOrigin | null>(null);
 
   useEffect(() => {
     ensureQueueListeners();
     // The queue outlives the window: reload whatever the database still holds.
     void useQueueStore.getState().hydrate();
   }, []);
+
+  // Escape abandons a drag in progress without committing it — the usual way
+  // out of a gesture the user started by accident. Only listening while a drag
+  // is actually running keeps the handler off every other keystroke.
+  useEffect(() => {
+    if (!draggingId) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      dragOrigin.current = null;
+      setDraggingId(null);
+      setDropTarget(null);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [draggingId]);
 
   const groupsMap = new Map<string, DownloadJob[]>();
   for (const job of allJobs) {
@@ -220,23 +268,115 @@ export function QueueList() {
     return job.status === "queued" || job.status === "paused";
   }
 
-  function handleDrop(targetId: string) {
-    if (!draggingId || draggingId === targetId) return;
+  function resetDrag() {
+    dragOrigin.current = null;
+    setDraggingId(null);
+    setDropTarget(null);
+  }
+
+  /** Which row the pointer is over, found by geometry rather than by event
+   * target: once a row's handle has captured the pointer, every move and up
+   * event is delivered to that handle no matter where the cursor actually is.
+   * A pointer past either end of the list snaps to the nearest row. */
+  function rowUnderPointer(clientY: number): string | null {
+    let nearestId: string | null = null;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+    for (const job of standaloneJobs) {
+      const element = rowRefs.current.get(job.id);
+      if (!element) continue;
+      const rect = element.getBoundingClientRect();
+      if (clientY >= rect.top && clientY <= rect.bottom) return job.id;
+      const distance = clientY < rect.top ? rect.top - clientY : clientY - rect.bottom;
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestId = job.id;
+      }
+    }
+    return nearestId;
+  }
+
+  /** Where the dragged row would land relative to the row under the pointer.
+   * Dragging downwards puts it after that row, upwards before it — the same
+   * rule the drop-on-a-row mechanism this replaced followed. */
+  function dropIndicatorFor(draggedId: string, overId: string | null) {
+    if (!overId || overId === draggedId) return null;
+    const ids = standaloneJobs.map((job) => job.id);
+    const from = ids.indexOf(draggedId);
+    const to = ids.indexOf(overId);
+    if (from === -1 || to === -1) return null;
+    return { id: overId, position: from < to ? ("after" as const) : ("before" as const) };
+  }
+
+  function commitMove(draggedId: string, overId: string | null) {
+    if (!overId || draggedId === overId) return;
 
     // Work out the list as it will look after the drop, purely to read off the
     // dragged job's two new neighbours. Only those three ids are sent — the
     // backend writes one row from them, so a job enqueued mid-drag keeps its
     // place instead of being renumbered from a stale snapshot.
     const ids = standaloneJobs.map((job) => job.id);
-    const from = ids.indexOf(draggingId);
-    const to = ids.indexOf(targetId);
+    const from = ids.indexOf(draggedId);
+    const to = ids.indexOf(overId);
     if (from === -1 || to === -1) return;
 
     ids.splice(to, 0, ids.splice(from, 1)[0]);
-    const landed = ids.indexOf(draggingId);
+    const landed = ids.indexOf(draggedId);
 
-    setDraggingId(null);
-    void moveJob(draggingId, ids[landed - 1] ?? null, ids[landed + 1] ?? null);
+    void moveJob(draggedId, ids[landed - 1] ?? null, ids[landed + 1] ?? null);
+  }
+
+  function handlePointerDown(job: DownloadJob, event: ReactPointerEvent<HTMLElement>) {
+    // `button` is 0 for touch and pen too; this only rejects right/middle click.
+    if (!isDraggable(job) || event.button !== 0) return;
+    dragOrigin.current = {
+      jobId: job.id,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      started: false,
+      overId: null,
+    };
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Capture is an optimisation, not a requirement: without it the drag
+      // still works as long as the pointer stays over the handle.
+    }
+    // Keeps the press from starting a text selection or a native drag.
+    event.preventDefault();
+  }
+
+  function handlePointerMove(event: ReactPointerEvent<HTMLElement>) {
+    const origin = dragOrigin.current;
+    if (!origin || origin.pointerId !== event.pointerId) return;
+
+    if (!origin.started) {
+      const travelled = Math.hypot(event.clientX - origin.startX, event.clientY - origin.startY);
+      if (travelled < DRAG_THRESHOLD_PX) return;
+      origin.started = true;
+      setDraggingId(origin.jobId);
+    }
+
+    origin.overId = rowUnderPointer(event.clientY);
+    setDropTarget(dropIndicatorFor(origin.jobId, origin.overId));
+  }
+
+  function handlePointerUp(event: ReactPointerEvent<HTMLElement>) {
+    const origin = dragOrigin.current;
+    if (!origin || origin.pointerId !== event.pointerId) return;
+    try {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    } catch {
+      // The pointer is already gone; nothing left to release.
+    }
+
+    const { jobId, started, overId } = origin;
+    resetDrag();
+    // A press that never passed the threshold was a click, not a drag.
+    if (!started) return;
+    // Commit exactly what the indicator was showing, rather than re-deriving
+    // it from this event: a pointerup carries no movement of its own.
+    commitMove(jobId, overId);
   }
 
   return (
@@ -262,30 +402,50 @@ export function QueueList() {
             {standaloneJobs.map((job) => (
               <li
                 key={job.id}
-                draggable={isDraggable(job)}
-                onDragStart={(event) => {
-                  setDraggingId(job.id);
-                  // Firefox refuses to start a drag without payload; the id is
-                  // also what a drop from outside the list would carry.
-                  event.dataTransfer?.setData("text/plain", job.id);
+                ref={(element) => {
+                  if (element) rowRefs.current.set(job.id, element);
+                  else rowRefs.current.delete(job.id);
                 }}
-                onDragEnd={() => setDraggingId(null)}
-                onDragOver={(event) => {
-                  // Preventing the default is what marks this row as a valid
-                  // drop target at all.
-                  if (draggingId) event.preventDefault();
-                }}
-                onDrop={(event) => {
-                  event.preventDefault();
-                  handleDrop(job.id);
-                }}
-                className={
-                  isDraggable(job)
-                    ? `cursor-grab ${draggingId === job.id ? "opacity-50" : ""}`
-                    : undefined
-                }
+                data-dragging={draggingId === job.id ? "true" : undefined}
+                data-drop-position={dropTarget?.id === job.id ? dropTarget.position : undefined}
+                className={`relative flex items-stretch gap-2 ${draggingId === job.id ? "opacity-50" : ""}`}
               >
-                <JobRow job={job} />
+                {dropTarget?.id === job.id && (
+                  <div
+                    aria-hidden
+                    className={`pointer-events-none absolute inset-x-0 h-0.5 rounded-full bg-primary ${
+                      dropTarget.position === "before" ? "-top-1" : "-bottom-1"
+                    }`}
+                  />
+                )}
+                {/* The handle is the whole discoverability story for FR-119:
+                    rows that cannot be reordered (a running job already holds
+                    its slot) get an empty spacer instead, so "this row will
+                    not move" reads differently from "dragging is broken". */}
+                {isDraggable(job) ? (
+                  <button
+                    type="button"
+                    aria-label={t("queue.drag_handle", {
+                      defaultValue: "Reorder {{title}}",
+                      title: job.title ?? job.source_url,
+                    })}
+                    title={t("queue.drag_handle_hint", { defaultValue: "Drag to reorder" })}
+                    // `touch-none`: without it the browser claims the gesture
+                    // for scrolling and never sends the moves.
+                    className="flex w-7 shrink-0 cursor-grab touch-none items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground active:cursor-grabbing"
+                    onPointerDown={(event) => handlePointerDown(job, event)}
+                    onPointerMove={handlePointerMove}
+                    onPointerUp={handlePointerUp}
+                    onPointerCancel={resetDrag}
+                  >
+                    <GripVertical className="h-4 w-4" />
+                  </button>
+                ) : (
+                  <div aria-hidden className="w-7 shrink-0" />
+                )}
+                <div className="min-w-0 flex-1">
+                  <JobRow job={job} />
+                </div>
               </li>
             ))}
           </ul>
