@@ -82,6 +82,27 @@ function jobFor(url: string): DownloadJob {
   };
 }
 
+/** Settings with a save folder + a preview + a working create call, so a
+ * single-link download can actually be submitted. */
+function mockSingleJobBackend(preview: MediaSource) {
+  vi.mocked(invoke).mockImplementation((cmd: string) => {
+    if (cmd === "get_settings") return Promise.resolve(SETTINGS_WITH_FOLDER);
+    if (cmd === "preview_media") return Promise.resolve(preview);
+    if (cmd === "create_download_job") return Promise.resolve([jobFor(preview.source_url)]);
+    return Promise.resolve(undefined);
+  });
+}
+
+/** Paste the link and preview it, leaving the form on the preview screen. */
+async function previewSingleLink(
+  user: ReturnType<typeof userEvent.setup>,
+  preview: MediaSource = SAMPLE_PREVIEW,
+) {
+  await user.type(screen.getByLabelText(/video or audio link/i), preview.source_url);
+  await user.click(screen.getByRole("button", { name: /^preview$/i }));
+  expect(await screen.findByText(preview.title)).toBeInTheDocument();
+}
+
 function mockGetSettingsThenPreview(preview: MediaSource) {
   vi.mocked(invoke).mockImplementation((cmd: string) => {
     if (cmd === "get_settings") return Promise.resolve(SAMPLE_SETTINGS);
@@ -298,6 +319,134 @@ describe("DownloadForm", () => {
   // The badge is guarded on the raw duration, not on the formatted string --
   // formatDuration always returns "--:--" for a missing value, so guarding on
   // its result would put a meaningless clock badge on every live stream.
+  // The whole point of the picker: before it existed every job was created
+  // with backend defaults, so none of the shipped output formats were
+  // reachable.
+  it("sends the output format the user picked with the job (FR-201/FR-235)", async () => {
+    mockSingleJobBackend(SAMPLE_PREVIEW);
+    const user = userEvent.setup();
+    render(<DownloadForm />);
+
+    await previewSingleLink(user);
+    await user.click(screen.getByRole("button", { name: /audio only/i }));
+    await user.click(screen.getByRole("button", { name: /output options/i }));
+    await user.click(screen.getByRole("radio", { name: /^FLAC$/ }));
+    await user.click(screen.getByRole("switch", { name: /embed title and artist/i }));
+    await user.click(screen.getByRole("button", { name: /download audio/i }));
+
+    await waitFor(() => expect(createdInputs()).toHaveLength(1));
+    expect(createdInputs()[0].output_options).toEqual({
+      audio: { format: "flac" },
+      video_container: "mp4",
+      codec_preference: "compatibility",
+      embed_metadata: false,
+      embed_thumbnail: true,
+    });
+  });
+
+  // FR-208/FR-209: on for a new job. Sending nothing would instead reproduce
+  // the pre-Phase-2 behaviour (both flags off), which is what
+  // `NEW_JOB_OUTPUT_OPTIONS` exists to distinguish.
+  it("sends the new-job defaults even when the picker is never opened (FR-208/FR-209)", async () => {
+    mockSingleJobBackend(SAMPLE_PREVIEW);
+    const user = userEvent.setup();
+    render(<DownloadForm />);
+
+    await previewSingleLink(user);
+    await user.click(screen.getByRole("button", { name: /download video/i }));
+
+    await waitFor(() => expect(createdInputs()).toHaveLength(1));
+    expect(createdInputs()[0].output_options).toEqual({
+      audio: { format: "mp3" },
+      video_container: "mp4",
+      codec_preference: "compatibility",
+      embed_metadata: true,
+      embed_thumbnail: true,
+    });
+  });
+
+  // FR-206. `SAMPLE_PREVIEW`'s audio formats are Opus, so the old
+  // `MP3 / ${codec}` label printed "MP3 / OPUS" — a file no pipeline can
+  // produce. The row now names the real source codec and the real target.
+  it("labels audio rows with the conversion that will actually happen (FR-206)", async () => {
+    mockGetSettingsThenPreview(SAMPLE_PREVIEW);
+    const user = userEvent.setup();
+    render(<DownloadForm />);
+
+    await previewSingleLink(user);
+    await user.click(screen.getByRole("button", { name: /audio only/i }));
+
+    expect(screen.getAllByText("OPUS → MP3")).toHaveLength(2);
+    expect(screen.queryByText("MP3 / OPUS")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /output options/i }));
+    await user.click(screen.getByRole("radio", { name: /^FLAC$/ }));
+
+    expect(screen.getAllByText("OPUS → FLAC")).toHaveLength(2);
+    expect(screen.queryByText("OPUS → MP3")).not.toBeInTheDocument();
+  });
+
+  it("labels an audio row as untouched when the source format is kept (FR-206/FR-202)", async () => {
+    mockGetSettingsThenPreview(SAMPLE_PREVIEW);
+    const user = userEvent.setup();
+    render(<DownloadForm />);
+
+    await previewSingleLink(user);
+    await user.click(screen.getByRole("button", { name: /audio only/i }));
+    await user.click(screen.getByRole("button", { name: /output options/i }));
+    await user.click(screen.getByRole("radio", { name: /keep source/i }));
+
+    expect(screen.getAllByText("OPUS · kept as-is")).toHaveLength(2);
+    expect(screen.queryByText(/→/)).not.toBeInTheDocument();
+  });
+
+  // The video detail column used to be the constant "MP4 / H264 / AAC",
+  // printed even for an MKV/quality-codec job.
+  it("labels video rows from the container and codec actually chosen (FR-206)", async () => {
+    mockGetSettingsThenPreview(SAMPLE_PREVIEW);
+    const user = userEvent.setup();
+    render(<DownloadForm />);
+
+    await previewSingleLink(user);
+
+    // Three: one detail line per quality row (720p, 480p) plus the picker's
+    // own collapsed summary, which describes the same output.
+    expect(screen.getAllByText("MP4 · H.264 / AAC")).toHaveLength(3);
+    expect(screen.queryByText("MP4 / H264 / AAC")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /output options/i }));
+    await user.click(screen.getByRole("radio", { name: /^MKV$/ }));
+    await user.click(screen.getByRole("radio", { name: /^Quality/ }));
+
+    expect(screen.getAllByText("MKV · Best codec the source has")).toHaveLength(3);
+    // The old label is gone from the rows entirely (the words "H.264 / AAC"
+    // still appear once, inside the compatibility option's own hint).
+    expect(screen.queryByText("MP4 · H.264 / AAC")).not.toBeInTheDocument();
+  });
+
+  it("hides the output options entirely for a gallery source (FR-234)", async () => {
+    mockGetSettingsThenPreview({
+      ...SAMPLE_PREVIEW,
+      is_gallery: true,
+      available_audio_formats: [],
+      available_video_qualities: [],
+      gallery_items: [
+        { url: "https://cdn.example/1.jpg", extension: "jpg", is_audio: false },
+        { url: "https://cdn.example/2.jpg", extension: "jpg", is_audio: false },
+      ],
+    });
+    const user = userEvent.setup();
+    render(<DownloadForm />);
+
+    await previewSingleLink(user);
+
+    // The gallery-specific controls are there, so the preview really did
+    // render — the output picker is the only thing missing.
+    expect(screen.getByText(/what to download/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /output options/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/audio format/i)).not.toBeInTheDocument();
+  });
+
   it("hides the duration badge entirely when the source has no duration", async () => {
     mockGetSettingsThenPreview({ ...SAMPLE_PREVIEW, duration_seconds: null });
     const user = userEvent.setup();

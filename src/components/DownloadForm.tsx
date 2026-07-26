@@ -22,6 +22,7 @@ import { Badge } from "@/components/ui/badge";
 import { ErrorBanner } from "@/components/ErrorBanner";
 import { BatchPanel } from "@/components/BatchPanel";
 import { GalleryItemPicker } from "@/components/GalleryItemPicker";
+import { OutputOptionsPicker } from "@/components/OutputOptionsPicker";
 import { PlaylistDetailPanel } from "@/components/PlaylistDetailPanel";
 import { PlaylistScopeDialog } from "@/components/PlaylistScopeDialog";
 import { useAppSettings } from "@/hooks/use-app-settings";
@@ -34,8 +35,10 @@ import {
   audioQualityValue,
 } from "@/lib/generic-quality-options";
 import { buildJobInput } from "@/lib/build-job-input";
+import { audioOutputDetail, videoOutputDetail } from "@/lib/output-format-labels";
 import { formatDuration, formatFileSize } from "@/lib/format";
 import { dedupeUrls, extractUrlsFromText } from "@/lib/url-parsing";
+import { NEW_JOB_OUTPUT_OPTIONS } from "@/types/download";
 import type {
   AppError,
   AudioFormatOption,
@@ -44,6 +47,7 @@ import type {
   GalleryMode,
   MediaSource,
   MediaType,
+  OutputOptions,
   VideoQualityOption,
 } from "@/types/download";
 
@@ -67,17 +71,25 @@ function platformDisplayName(platform: string): string {
 /** One row in the quality picker — mirrors the reference layout: radio +
  * bold quality label + codec detail + right-aligned estimated size. Options
  * are rendered exactly as the backend returned them (FR-004/FR-019); this
- * component never invents a quality tier that isn't in `options`. */
+ * component never invents a quality tier that isn't in `options`.
+ *
+ * The detail column is derived from the source's own codec plus the current
+ * output selection (FR-206). It used to be `MP3 / ${codec}` for audio and the
+ * constant `"MP4 / H264 / AAC"` for video — the first printed impossible
+ * pairs like "MP3 / OPUS", and the second kept claiming H.264/AAC/MP4 no
+ * matter what the job would actually produce. */
 function QualityOptionsList({
   qualityLabel,
   audioOptions,
   videoOptions,
+  outputOptions,
   value,
   onChange,
 }: {
   qualityLabel: string;
   audioOptions?: AudioFormatOption[];
   videoOptions?: VideoQualityOption[];
+  outputOptions: OutputOptions;
   value: string | undefined;
   onChange: (value: string) => void;
 }) {
@@ -86,13 +98,13 @@ function QualityOptionsList({
     ? audioOptions.map((opt) => ({
         value: audioQualityValue(opt.bitrate_kbps),
         label: opt.bitrate_kbps == null ? t("downloadForm.best_available") : `${opt.bitrate_kbps}kbps`,
-        detail: `MP3 / ${opt.codec.toUpperCase()}`,
+        detail: audioOutputDetail(t, opt.codec, outputOptions.audio),
         size: formatFileSize(opt.filesize_bytes),
       }))
     : (videoOptions ?? []).map((opt) => ({
         value: opt.label,
         label: opt.label,
-        detail: "MP4 / H264 / AAC",
+        detail: videoOutputDetail(t, outputOptions),
         size: formatFileSize(opt.filesize_bytes),
       }));
 
@@ -211,6 +223,11 @@ export function DownloadForm() {
   // a selection against a fresh re-crawl by ordinal position instead; see
   // `models::DownloadJob.selected_gallery_indices`'s doc comment).
   const [selectedGalleryIndices, setSelectedGalleryIndices] = useState<Set<number>>(new Set());
+  // FR-208/FR-209 start ON for a *new* job, which is why this is
+  // `NEW_JOB_OUTPUT_OPTIONS` and not the Rust-side `OutputOptions::default()`
+  // — the latter answers "what did a job created before Phase 2 mean?" and
+  // has both embed flags off.
+  const [outputOptions, setOutputOptions] = useState<OutputOptions>(NEW_JOB_OUTPUT_OPTIONS);
   const [outputDirectory, setOutputDirectory] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<AppError | null>(null);
@@ -360,6 +377,7 @@ export function DownloadForm() {
         galleryMode,
         selectedGalleryIndices: Array.from(selectedGalleryIndices),
         playlistScope: scope,
+        outputOptions,
       });
       const createdJobs = await invoke<DownloadJob[]>("create_download_job", { input });
       useQueueStore.getState().upsertJobs(createdJobs);
@@ -623,6 +641,7 @@ export function DownloadForm() {
                     <QualityOptionsList
                       qualityLabel={t("downloadForm.audio_quality_label")}
                       audioOptions={preview.is_playlist ? GENERIC_PLAYLIST_AUDIO_QUALITIES : preview.available_audio_formats}
+                      outputOptions={outputOptions}
                       value={audioQuality}
                       onChange={setAudioQuality}
                     />
@@ -633,6 +652,7 @@ export function DownloadForm() {
                     <QualityOptionsList
                       qualityLabel={t("downloadForm.video_quality_label")}
                       videoOptions={preview.is_playlist ? GENERIC_PLAYLIST_VIDEO_QUALITIES : preview.available_video_qualities}
+                      outputOptions={outputOptions}
                       value={videoQuality}
                       onChange={setVideoQuality}
                     />
@@ -646,6 +666,21 @@ export function DownloadForm() {
                       : t("downloadForm.no_video_qualities")}
                   </p>
                 )}
+              </div>
+            )}
+
+            {/* FR-201→FR-211. Rendered for gallery previews too: the picker
+                itself decides that none of it applies there (FR-234), so the
+                rule lives with the component rather than being re-derived by
+                every caller. Skipped only for the inline playlist panel,
+                which submits through its own per-item path. */}
+            {!(preview.is_playlist && preview.playlist_entries.length > 0) && (
+              <div className="px-6 pt-3 pb-1">
+                <OutputOptionsPicker
+                  mediaType={mediaType}
+                  value={outputOptions}
+                  onChange={setOutputOptions}
+                />
               </div>
             )}
           </>
