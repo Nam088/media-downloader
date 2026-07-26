@@ -5,6 +5,9 @@ import { toast } from "sonner";
 import i18n from "@/lib/i18n";
 import type { DownloadJob, JobProgressEvent, JobStatusChangedEvent } from "@/types/download";
 
+/** Statuses a job never leaves on its own — the ones `clearFinished` hides. */
+const FINISHED_STATUSES = new Set(["completed", "failed", "canceled"]);
+
 interface QueueState {
   jobs: Record<string, DownloadJob>;
   upsertJob: (job: DownloadJob) => void;
@@ -13,6 +16,11 @@ interface QueueState {
   applyStatusChanged: (event: JobStatusChangedEvent) => void;
   hydrate: () => Promise<void>;
   orderedJobs: () => DownloadJob[];
+  pauseAll: () => Promise<void>;
+  resumeAll: () => Promise<void>;
+  cancelAll: () => Promise<void>;
+  clearFinished: () => void;
+  moveJob: (jobId: string, beforeJobId: string | null, afterJobId: string | null) => Promise<void>;
   pauseJob: (jobId: string) => Promise<void>;
   resumeJob: (jobId: string) => Promise<void>;
   cancelJob: (jobId: string) => Promise<void>;
@@ -95,6 +103,90 @@ export const useQueueStore = create<QueueState>((set, get) => ({
     Object.values(get().jobs).sort(
       (a, b) => a.queue_position - b.queue_position || a.created_at.localeCompare(b.created_at),
     ),
+  /* The three bulk commands below return the ids they actually changed, but we
+   * deliberately drop that list: the backend already emits one
+   * `job:status_changed` per affected job before returning, and
+   * `applyStatusChanged` has written the new status by the time the promise
+   * resolves. Re-applying the returned ids here would either be a no-op or,
+   * worse, overwrite a newer status that landed in between. */
+  pauseAll: async () => {
+    await invoke("pause_all_jobs");
+  },
+  resumeAll: async () => {
+    await invoke("resume_all_jobs");
+  },
+  cancelAll: async () => {
+    await invoke("cancel_all_jobs");
+  },
+  /**
+   * Drops finished jobs from the queue view only. Nothing is deleted: those
+   * rows are exactly what the History page reads, so this must never reach the
+   * database (FR-118). A later `hydrate()` would bring them back, which is
+   * fine — this is a "tidy up what I'm looking at" action, not a delete.
+   */
+  clearFinished: () => {
+    set((state) => ({
+      jobs: Object.fromEntries(
+        Object.entries(state.jobs).filter(([, job]) => !FINISHED_STATUSES.has(job.status)),
+      ),
+    }));
+  },
+  /**
+   * Puts a job between two new neighbours (either may be null for head/tail).
+   *
+   * Only the moved job and its two neighbour ids go over the wire — never a
+   * full ordered list. A job enqueued while the drag was in flight would
+   * otherwise have its position clobbered by our stale snapshot.
+   *
+   * The optimistic position uses the same formula the backend does (midpoint,
+   * or ±1.0 at the ends) so the row lands where it was dropped instead of
+   * snapping back for the length of the round-trip. If the command fails —
+   * `NOT_FOUND` when a neighbour finished mid-drag, `INVALID_ARGUMENT` when the
+   * ids collide — the guess is thrown away and real positions are re-read,
+   * because at that point we have no idea whether the move landed.
+   */
+  moveJob: async (jobId, beforeJobId, afterJobId) => {
+    const { jobs } = get();
+    const before = beforeJobId ? jobs[beforeJobId]?.queue_position : undefined;
+    const after = afterJobId ? jobs[afterJobId]?.queue_position : undefined;
+
+    const optimisticPosition =
+      before !== undefined && after !== undefined
+        ? (before + after) / 2
+        : before !== undefined
+          ? before + 1
+          : after !== undefined
+            ? after - 1
+            : 0;
+
+    set((state) =>
+      state.jobs[jobId]
+        ? {
+            jobs: {
+              ...state.jobs,
+              [jobId]: { ...state.jobs[jobId], queue_position: optimisticPosition },
+            },
+          }
+        : state,
+    );
+
+    try {
+      await invoke("reorder_queue", { jobId, beforeJobId, afterJobId });
+    } catch (error) {
+      console.error("failed to reorder the queue", error);
+      toast.error(i18n.t("queue.reorder_failed", { defaultValue: "Could not reorder the queue." }));
+      // Not a rollback to the remembered position: the failure may itself have
+      // been caused by the queue moving underneath us, so re-read instead of
+      // guessing. `upsertJobs`, not `hydrate` — hydrate only adds jobs it has
+      // never seen and would leave the bad position in place.
+      try {
+        const rows = await invoke<DownloadJob[]>("list_queue");
+        if (Array.isArray(rows)) get().upsertJobs(rows);
+      } catch (resyncError) {
+        console.error("failed to re-read the queue after a rejected reorder", resyncError);
+      }
+    }
+  },
   pauseJob: async (jobId) => {
     await invoke("pause_job", { jobId });
   },
