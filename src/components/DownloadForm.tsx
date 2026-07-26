@@ -251,7 +251,9 @@ export function DownloadForm() {
   async function handleImportUrlList() {
     const selected = await openDialog({
       multiple: false,
-      filters: [{ name: "URL list", extensions: [...URL_LIST_EXTENSIONS] }],
+      filters: [
+        { name: t("downloadForm.url_list_filter_name"), extensions: [...URL_LIST_EXTENSIONS] },
+      ],
     });
     if (typeof selected !== "string") return;
     setError(null);
@@ -456,7 +458,7 @@ export function DownloadForm() {
                 )}
                 {urls.length > 0 && (
                   <span className="text-xs font-mono font-semibold text-primary">
-                    {isBatchMode ? `${urls.length} URLs` : "Single URL"}
+                    {t("downloadForm.url_count", { count: urls.length })}
                   </span>
                 )}
               </div>
@@ -514,7 +516,9 @@ export function DownloadForm() {
             {/* Quick Supported Platform Tags */}
             {!isBatchMode && !preview && (
               <div className="flex flex-wrap items-center gap-2 pt-1">
-                <span className="text-xs font-semibold text-muted-foreground mr-1">Supported:</span>
+                <span className="text-xs font-semibold text-muted-foreground mr-1">
+                  {t("downloadForm.supported_label")}
+                </span>
                 {Object.values(PLATFORM_DISPLAY_NAMES).map((plat) => (
                   <span key={plat} className="rounded-md bg-muted/70 px-2.5 py-1 text-xs font-semibold text-foreground/80 border border-border/50">
                     {plat}

@@ -156,14 +156,12 @@ export function Settings() {
         <div className="flex items-center justify-between gap-6 py-1">
           <div className="flex min-w-0 flex-col gap-0.5">
             <Label htmlFor="max-concurrent-downloads" className="text-sm font-medium">
-              {t("settings.max_concurrent_label", { defaultValue: "Concurrent downloads" })}
+              {t("settings.max_concurrent_label")}
             </Label>
             <span className="text-xs text-muted-foreground">
               {t("settings.max_concurrent_hint", {
                 min: MIN_CONCURRENT_DOWNLOADS,
                 max: MAX_CONCURRENT_DOWNLOADS,
-                defaultValue:
-                  "How many downloads run at the same time ({{min}}–{{max}}). More is not always faster — sources rate-limit too.",
               })}
             </span>
           </div>
@@ -188,15 +186,13 @@ export function Settings() {
         <div className="flex items-center justify-between gap-6 py-1">
           <div className="flex min-w-0 flex-col gap-0.5">
             <Label htmlFor="rate-limit-kbps" className="text-sm font-medium">
-              {t("settings.rate_limit_label", { defaultValue: "Speed limit (KB/s)" })}
+              {t("settings.rate_limit_label")}
             </Label>
             {/* Required, not decoration: the cap is passed to each download
                 process separately, so N downloads can use up to N times it. */}
             <span className="text-xs text-muted-foreground">
               {t("settings.rate_limit_hint", {
                 concurrency: savedConcurrency ?? MIN_CONCURRENT_DOWNLOADS,
-                defaultValue:
-                  "0 means unlimited. The limit applies per download, not to the app total — with {{concurrency}} running at once the combined speed can reach {{concurrency}}× this number.",
               })}
             </span>
           </div>
@@ -220,13 +216,10 @@ export function Settings() {
         <div className="flex items-center justify-between gap-6 py-1">
           <div className="flex min-w-0 flex-col gap-0.5">
             <Label htmlFor="run-in-background" className="text-sm font-medium">
-              {t("settings.background_label", { defaultValue: "Keep running in the background" })}
+              {t("settings.background_label")}
             </Label>
             <span className="text-xs text-muted-foreground">
-              {t("settings.background_hint", {
-                defaultValue:
-                  "Closing the window minimises to the system tray and downloads keep going.",
-              })}
+              {t("settings.background_hint")}
             </span>
           </div>
           <Switch

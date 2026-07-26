@@ -100,10 +100,7 @@ export function GalleryItemPicker({ items, selectedIndices, onChange }: GalleryI
                 type="checkbox"
                 checked={isSelected}
                 onChange={() => toggle(originalIndex)}
-                aria-label={t("downloadForm.gallery_item_label", {
-                  defaultValue: "Image {{number}}",
-                  number: position + 1,
-                })}
+                aria-label={t("downloadForm.gallery_item_label", { number: position + 1 })}
                 className="absolute right-1 top-1 z-10 h-4 w-4 accent-primary"
               />
               <img
