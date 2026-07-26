@@ -22,7 +22,28 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'",
+        "font-src": "'self' data:",
+        "img-src": "'self' asset: http://asset.localhost https: data: blob:",
+        "media-src": "'self' asset: http://asset.localhost blob:",
+        "connect-src": "'self' ipc: http://ipc.localhost",
+        "worker-src": "'self' blob:",
+        "object-src": "'none'",
+        "frame-src": "'none'",
+        "base-uri": "'self'",
+        "form-action": "'none'"
+      },
+      "assetProtocol": {
+        "enable": true,
+        "scope": {
+          "allow": ["$DOWNLOAD/**", "$VIDEO/**", "$AUDIO/**", "$PICTURE/**"],
+          "deny": [],
+          "requireLiteralLeadingDot": true
+        }
+      }
     }
   },
   "bundle": {
