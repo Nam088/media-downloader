@@ -102,7 +102,7 @@
     "download_video_button": "Download video",
     "download_gallery_button": "Download",
     "added_to_queue": "Added to the download queue",
-    "gallery_item_count": "{{count}} file found",
+    "gallery_item_count_one": "{{count}} file found",
     "gallery_item_count_other": "{{count}} files found",
     "gallery_selected_count": "{{selected}} of {{total}} images selected",
     "gallery_select_all": "Select all",
