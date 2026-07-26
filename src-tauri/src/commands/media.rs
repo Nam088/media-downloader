@@ -9,7 +9,10 @@ use crate::downloader::ytdlp;
 use crate::downloader::ytdlp::YtDlpChild;
 use crate::error::AppError;
 use crate::logging::log_event;
-use crate::models::{AudioFormatOption, GalleryItemPreview, MediaSource, VideoQualityOption};
+use crate::models::{
+    AudioFormatOption, ChapterPreview, GalleryItemPreview, MediaSource, SubtitleTrackPreview,
+    VideoQualityOption,
+};
 use crate::platform::detect_platform;
 
 /// Tracks the yt-dlp process backing each in-flight `preview_media` call, so
@@ -391,6 +394,17 @@ fn build_media_source(source_url: &str, platform: &str, raw: &serde_json::Value)
         Vec::new()
     };
 
+    // `None` = chưa kiểm tra. Một preview playlist phẳng không hề lấy metadata
+    // của từng video (đó là cả điểm của `--flat-playlist`), nên nó không biết
+    // gì về phụ đề hay chương — và "không biết" phải khác hẳn "đã kiểm tra,
+    // không có cái nào", vốn là thứ duy nhất được phép vô hiệu hoá ô chọn kèm
+    // giải thích (FR-221/FR-225).
+    let (subtitles, chapters) = if is_playlist {
+        (None, None)
+    } else {
+        (Some(extract_subtitles(raw)), Some(extract_chapters(raw)))
+    };
+
     MediaSource {
         source_url: source_url.to_string(),
         // A whitespace-only title is exactly as useless as a missing one, so
@@ -417,7 +431,90 @@ fn build_media_source(source_url: &str, platform: &str, raw: &serde_json::Value)
         is_gallery: false,
         gallery_items: Vec::new(),
         playlist_entries,
+        subtitles,
+        chapters,
     }
+}
+
+/// Ngôn ngữ phụ đề nguồn thật sự có, đọc thẳng từ JSON của yt-dlp (FR-217).
+///
+/// yt-dlp trả về hai bản đồ tách bạch — `subtitles` (do người tạo nội dung
+/// cung cấp) và `automatic_captions` (máy sinh) — nên sự phân biệt mà FR-217
+/// đòi hỏi là dữ liệu có sẵn, không phải thứ ta suy đoán.
+///
+/// Một ngôn ngữ đã có bản do người tạo cung cấp thì bản tự động của cùng ngôn
+/// ngữ ấy bị bỏ qua: nó luôn là bản kém hơn, và trên YouTube danh sách tự động
+/// còn kèm cả trăm ngôn ngữ dịch máy — liệt kê hết sẽ chôn vùi đúng những lựa
+/// chọn tốt mà người dùng đang tìm.
+fn extract_subtitles(raw: &serde_json::Value) -> Vec<SubtitleTrackPreview> {
+    // Không phải một ngôn ngữ: YouTube trả về bản ghi chat trực tiếp của một
+    // video đã phát xong dưới dạng một "phụ đề" tên `live_chat`.
+    const LIVE_CHAT_PSEUDO_LANGUAGE: &str = "live_chat";
+
+    let mut tracks: Vec<SubtitleTrackPreview> = Vec::new();
+    for (key, auto_generated) in [("subtitles", false), ("automatic_captions", true)] {
+        let Some(map) = raw.get(key).and_then(|value| value.as_object()) else {
+            continue;
+        };
+        // Thứ tự trong JSON không có gì bảo đảm; sắp xếp để cùng một link luôn
+        // cho ra cùng một danh sách, không nhảy chỗ giữa hai lần xem trước.
+        let mut languages: Vec<_> = map.iter().collect();
+        languages.sort_by(|left, right| left.0.cmp(right.0));
+
+        for (language, entries) in languages {
+            if language == LIVE_CHAT_PSEUDO_LANGUAGE {
+                continue;
+            }
+            // Một mã ngôn ngữ trỏ tới danh sách rỗng nghĩa là không có file
+            // phụ đề nào đằng sau nó — hiện nó ra là mời người dùng chọn một
+            // thứ sẽ về tay không.
+            if entries.as_array().is_none_or(|list| list.is_empty()) {
+                continue;
+            }
+            if tracks.iter().any(|track| &track.language == language) {
+                continue;
+            }
+            tracks.push(SubtitleTrackPreview {
+                language: language.clone(),
+                label: subtitle_label(entries),
+                auto_generated,
+            });
+        }
+    }
+    tracks
+}
+
+/// Tên đọc được của một ngôn ngữ, nếu nguồn có kèm (`"name": "Vietnamese"`).
+fn subtitle_label(entries: &serde_json::Value) -> Option<String> {
+    entries
+        .as_array()?
+        .iter()
+        .find_map(|entry| entry.get("name").and_then(|name| name.as_str()))
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// Danh sách chương của nội dung (FR-225). yt-dlp trả `chapters: null` cho
+/// video không có chương, và đó là "đã kiểm tra, không có" — người gọi bọc kết
+/// quả này trong `Some` đúng vì thế.
+fn extract_chapters(raw: &serde_json::Value) -> Vec<ChapterPreview> {
+    raw.get("chapters")
+        .and_then(|value| value.as_array())
+        .map(|chapters| {
+            chapters
+                .iter()
+                .map(|chapter| ChapterPreview {
+                    title: chapter
+                        .get("title")
+                        .and_then(|value| value.as_str())
+                        .filter(|title| !title.trim().is_empty())
+                        .map(str::to_string),
+                    start_seconds: chapter.get("start_time").and_then(|value| value.as_f64()),
+                    end_seconds: chapter.get("end_time").and_then(|value| value.as_f64()),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Best-effort thumbnail for a flat-playlist entry: yt-dlp's own `thumbnail`
@@ -513,6 +610,11 @@ fn build_gallery_media_source(source_url: &str, platform: &str, dump: &GalleryDu
         is_gallery: true,
         gallery_items,
         playlist_entries: Vec::new(),
+        // gallery-dl không có khái niệm phụ đề hay chương, nên đây là "chưa
+        // kiểm tra" chứ không phải "không có" — giao diện nói "không rõ" thay
+        // vì hiện một ô chọn rỗng.
+        subtitles: None,
+        chapters: None,
     }
 }
 
@@ -838,6 +940,151 @@ mod tests {
             "message should quote the link that failed, got: {}",
             error.message
         );
+    }
+
+    // ---- specs/003-media-output: phụ đề & chương (FR-217, FR-221, FR-225) --
+
+    /// Đúng hình dạng `yt-dlp --dump-single-json` trả về cho một video có cả
+    /// phụ đề người tạo cung cấp lẫn phụ đề máy sinh: hai bản đồ tách bạch,
+    /// mỗi mã ngôn ngữ trỏ tới danh sách các file phụ đề của nó.
+    fn dump_with_subtitles() -> serde_json::Value {
+        json!({
+            "_type": "video",
+            "title": "Bài giảng",
+            "subtitles": {
+                "vi": [{ "ext": "vtt", "url": "https://x/vi.vtt", "name": "Vietnamese" }],
+                "en": [{ "ext": "vtt", "url": "https://x/en.vtt", "name": "English" }],
+                // Bản ghi chat của một buổi phát trực tiếp — yt-dlp xếp nó
+                // chung chỗ với phụ đề, nhưng nó không phải một ngôn ngữ.
+                "live_chat": [{ "ext": "json", "url": "https://x/chat.json" }],
+            },
+            "automatic_captions": {
+                // Cùng ngôn ngữ với một bản do người tạo cung cấp ở trên.
+                "en": [{ "ext": "vtt", "url": "https://x/en-auto.vtt" }],
+                "ja": [{ "ext": "vtt", "url": "https://x/ja-auto.vtt" }],
+                // Mã ngôn ngữ không có file nào đằng sau.
+                "ko": [],
+            }
+        })
+    }
+
+    #[test]
+    fn subtitle_languages_come_from_the_source_and_say_which_are_automatic() {
+        // FR-217: danh sách phải là ngôn ngữ nguồn THẬT SỰ có, và phải phân
+        // biệt được phụ đề người tạo cung cấp với phụ đề máy sinh — hai thứ ấy
+        // nằm ở hai trường khác nhau trong JSON, không phải thứ ta suy ra.
+        let source = build_media_source("https://x/1", "youtube", &dump_with_subtitles());
+        let subtitles = source.subtitles.expect("preview yt-dlp luôn có kiểm tra");
+
+        let languages: Vec<_> = subtitles
+            .iter()
+            .map(|track| (track.language.as_str(), track.auto_generated))
+            .collect();
+        assert_eq!(languages, vec![("en", false), ("vi", false), ("ja", true)]);
+        assert_eq!(subtitles[0].label.as_deref(), Some("English"));
+    }
+
+    #[test]
+    fn the_live_chat_transcript_is_not_offered_as_a_subtitle_language() {
+        let source = build_media_source("https://x/1", "youtube", &dump_with_subtitles());
+        let subtitles = source.subtitles.unwrap();
+
+        assert!(
+            !subtitles.iter().any(|track| track.language == "live_chat"),
+            "một bản ghi chat không phải ngôn ngữ phụ đề: {subtitles:?}"
+        );
+    }
+
+    #[test]
+    fn a_language_with_no_actual_subtitle_file_behind_it_is_not_offered() {
+        // Chọn nó chỉ dẫn tới một lần tải về tay không mà không có lỗi nào.
+        let source = build_media_source("https://x/1", "youtube", &dump_with_subtitles());
+        assert!(!source
+            .subtitles
+            .unwrap()
+            .iter()
+            .any(|track| track.language == "ko"));
+    }
+
+    #[test]
+    fn a_source_with_no_subtitles_says_so_instead_of_saying_nothing() {
+        // FR-221 sống hay chết ở chỗ này: "đã kiểm tra, không có phụ đề nào"
+        // (`Some([])`) phải khác hẳn "chưa kiểm tra" (`None`). Gộp cả hai vào
+        // một danh sách rỗng thì giao diện không còn cách nào phân biệt giữa
+        // "nguồn này không có phụ đề" và "đang tải, chờ chút" — và ô chọn cứ
+        // thế quay mãi.
+        let raw = json!({ "_type": "video", "title": "Không phụ đề" });
+        let source = build_media_source("https://x/1", "youtube", &raw);
+
+        assert_eq!(source.subtitles, Some(Vec::new()));
+        assert_eq!(source.chapters, Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_flat_playlist_preview_admits_it_never_looked() {
+        // `--flat-playlist` cố tình không lấy metadata từng video, nên nó
+        // không biết gì về phụ đề hay chương của chúng.
+        let raw = json!({
+            "_type": "playlist",
+            "title": "Danh sách",
+            "playlist_count": 2,
+            "entries": [
+                { "webpage_url": "https://x/a", "title": "A" },
+                { "webpage_url": "https://x/b", "title": "B" },
+            ]
+        });
+        let source = build_media_source("https://x/list", "youtube", &raw);
+
+        assert_eq!(source.subtitles, None);
+        assert_eq!(source.chapters, None);
+    }
+
+    #[test]
+    fn chapters_come_back_with_their_names_and_timestamps() {
+        // FR-225: giao diện cần đếm được số chương để hiện ra và mở khoá tuỳ
+        // chọn tách chương.
+        let raw = json!({
+            "_type": "video",
+            "title": "Podcast",
+            "chapters": [
+                { "start_time": 0.0, "end_time": 61.0, "title": "Mở đầu" },
+                { "start_time": 61.0, "end_time": 900.5, "title": "Nội dung chính" },
+                // Chương không tên: giữ lại (nó vẫn là một file kết quả) nhưng
+                // KHÔNG bịa tên cho nó (FR-211).
+                { "start_time": 900.5, "end_time": 1200.0 },
+            ]
+        });
+
+        let chapters = build_media_source("https://x/1", "youtube", &raw)
+            .chapters
+            .expect("preview yt-dlp luôn có kiểm tra");
+
+        assert_eq!(chapters.len(), 3);
+        assert_eq!(chapters[0].title.as_deref(), Some("Mở đầu"));
+        assert_eq!(chapters[1].start_seconds, Some(61.0));
+        assert_eq!(chapters[1].end_seconds, Some(900.5));
+        assert_eq!(chapters[2].title, None);
+    }
+
+    #[test]
+    fn a_gallery_preview_reports_neither_subtitles_nor_chapters_as_unknown() {
+        // gallery-dl không có khái niệm nào tương ứng, nên đây là "chưa kiểm
+        // tra" — không phải "đã kiểm tra và không có".
+        let dump = GalleryDump {
+            entries: vec![gallery_dl::GalleryEntry {
+                url: "https://x/1.jpg".to_string(),
+                filename: Some("1".to_string()),
+                extension: Some("jpg".to_string()),
+            }],
+            title: Some("Bài đăng".to_string()),
+            category: Some("tiktok".to_string()),
+            queue_url: None,
+        };
+
+        let source = build_gallery_media_source("https://x/post", "tiktok", &dump);
+
+        assert_eq!(source.subtitles, None);
+        assert_eq!(source.chapters, None);
     }
 
     #[test]

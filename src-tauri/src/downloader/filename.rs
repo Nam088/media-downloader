@@ -34,10 +34,6 @@
 //! để ô xem trước hiển thị đúng cái tên sẽ nhận được. Hai bản phải khớp nhau
 //! tới từng ký tự — một ô xem trước nói dối còn tệ hơn không có ô nào.
 
-// Module mới hạ cánh trước phần nối dây (`queue.rs` đang do việc khác giữ).
-// Khi `queue.rs` gọi tới `render_filename`/`deduplicate_path`, xoá dòng này.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 /// Giới hạn độ dài một thành phần tên file, tính theo **byte UTF-8**.
@@ -80,6 +76,13 @@ const MAX_DEDUP_ATTEMPTS: u32 = 9999;
 
 /// Các trường dùng được trong mẫu. Danh sách cho phép: mọi thứ ngoài đây không
 /// được thay thế (FR-212).
+///
+/// Không có mã sản phẩm nào đọc tới: [`render_filename`] tự liệt kê chính các
+/// tên ấy trong `field_value`, còn giao diện dùng bản sao TypeScript
+/// (`src/lib/filename-template.ts`) để dựng danh sách gợi ý. Hằng số này tồn
+/// tại để hai bản đó có một chỗ duy nhất đối chiếu, và
+/// `template_fields_and_fallbacks_stay_in_step` là thứ giữ nó khỏi lệch.
+#[allow(dead_code)]
 pub const TEMPLATE_FIELDS: [&str; 6] = [
     "title",
     "channel",

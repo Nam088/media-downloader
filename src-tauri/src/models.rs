@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::downloader::filename;
+
 /// Mirrors `data-model.md` §1 (DownloadJob). `status` values are also enforced
 /// by a CHECK constraint in `db/migrations/0001_init.sql`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -158,6 +160,215 @@ pub enum CodecPreference {
     Quality,
 }
 
+/// Phụ đề được giao thành file riêng hay nhúng thẳng vào file media (FR-219).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SubtitleDelivery {
+    /// Mặc định: file `.vtt`/`.srt` nằm cạnh file media. Chạy được với mọi
+    /// định dạng đầu ra, kể cả audio.
+    #[default]
+    SeparateFiles,
+    /// Nhúng thành track chọn được bên trong file media. Chỉ container video
+    /// mới chứa được — xem `queue::subtitle_embed_support` (FR-220).
+    Embedded,
+}
+
+/// Lựa chọn phụ đề của một tác vụ (FR-217→FR-221).
+///
+/// `languages` rỗng nghĩa là "không tải phụ đề", và đó là mặc định — nên một
+/// tác vụ có trước tính năng này không đột nhiên kéo thêm file phụ đề về.
+///
+/// Mã ngôn ngữ ở đây PHẢI đến từ danh sách thật của nguồn
+/// (`MediaSource.subtitles`, do `commands::media` đọc ra từ chính JSON yt-dlp
+/// trả về). Không có danh sách ngôn ngữ cố định nào trong mã nguồn — FR-217
+/// cấm đúng điều đó.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SubtitleOptions {
+    /// Nhiều ngôn ngữ cùng lúc (FR-218), theo đúng thứ tự người dùng thấy.
+    pub languages: Vec<String>,
+    pub delivery: SubtitleDelivery,
+    /// Có lấy cả phụ đề máy sinh hay không.
+    ///
+    /// Tách khỏi `languages` chứ không nhét một cờ vào từng mã ngôn ngữ, vì
+    /// đây đúng là cách yt-dlp nhận tham số: `--sub-langs` là một danh sách
+    /// mã, còn "được phép dùng bản tự động sinh" là một cờ riêng
+    /// (`--write-auto-subs`) áp cho cả danh sách. Giao diện biết mã nào chỉ có
+    /// bản tự động (`MediaSource.subtitles[].auto_generated`) nên bật cờ này
+    /// khi người dùng chọn một mã như vậy.
+    pub include_auto_generated: bool,
+}
+
+impl SubtitleOptions {
+    /// Danh sách mã ngôn ngữ đã bỏ trùng, giữ nguyên thứ tự — thứ thật sự đi
+    /// vào `--sub-langs`.
+    pub fn normalized_languages(&self) -> Vec<String> {
+        let mut seen = Vec::with_capacity(self.languages.len());
+        for language in &self.languages {
+            let language = language.trim();
+            if !language.is_empty() && !seen.iter().any(|kept: &String| kept == language) {
+                seen.push(language.to_string());
+            }
+        }
+        seen
+    }
+}
+
+/// Mã ngôn ngữ hợp lệ: chữ/số ASCII, có thể kèm `-`, `_`, `.` ở giữa (`vi`,
+/// `en-US`, `zh-Hans`, `en-orig`). Kiểm ở tầng lệnh chứ không chỉ ở giao diện
+/// vì `create_download_job` gọi trực tiếp được, và giá trị này đi thẳng vào
+/// đối số `--sub-langs` — nơi yt-dlp còn hiểu cả cú pháp biểu thức chính quy.
+pub fn is_valid_language_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= 32
+        && tag.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Khoảng thời gian cần tải (FR-222→FR-224). Ít nhất một trong hai mốc phải có
+/// mặt — một `TrimRange` không mốc nào chính là "tải cả video", vốn đã là
+/// [`SegmentMode::Whole`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TrimRange {
+    /// `None` = từ đầu.
+    pub start_seconds: Option<f64>,
+    /// `None` = tới hết.
+    pub end_seconds: Option<f64>,
+    /// FR-224: cắt đúng tại thời điểm yêu cầu bằng cách mã hoá lại quanh điểm
+    /// cắt (`--force-keyframes-at-cuts`). Giao diện PHẢI nói rõ tuỳ chọn này
+    /// làm tăng thời gian xử lý; mặc định `false` để một lần cắt thường vẫn
+    /// nhanh như cũ (chỉ cắt tại keyframe gần nhất).
+    pub accurate_cut: bool,
+}
+
+/// Vì sao một khoảng thời gian bị từ chối. Là kiểu riêng chứ không phải một
+/// chuỗi, để test chỉ ra được luật nào đã bắt lỗi.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrimRangeError {
+    /// Không có mốc nào: đây không phải một khoảng, mà là "cả nội dung".
+    NoBound,
+    NotFinite,
+    Negative,
+    /// Kết thúc không nằm sau bắt đầu — bao gồm cả hai mốc bằng nhau, vốn cho
+    /// ra một file rỗng chứ không phải một lỗi rõ ràng.
+    EndNotAfterStart,
+}
+
+impl std::fmt::Display for TrimRangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            TrimRangeError::NoBound => "a trim range needs a start time, an end time, or both",
+            TrimRangeError::NotFinite => "trim times must be real numbers of seconds",
+            TrimRangeError::Negative => "trim times cannot be negative",
+            TrimRangeError::EndNotAfterStart => "the end time must come after the start time",
+        };
+        f.write_str(text)
+    }
+}
+
+impl TrimRange {
+    /// FR-223 ở tầng lệnh. Giao diện kiểm tra trước để báo lỗi ngay tại ô nhập,
+    /// nhưng `create_download_job` gọi trực tiếp được nên phép kiểm tra thật
+    /// phải nằm ở đây; giao diện chỉ là bản sao cho trải nghiệm.
+    ///
+    /// KHÔNG kiểm được ở đây: mốc vượt quá thời lượng nội dung. Thời lượng là
+    /// thuộc tính của nguồn (`MediaSource.duration_seconds`), không nằm trên
+    /// tác vụ, nên đó là phần việc của giao diện — và yt-dlp tự cắt cụt phần
+    /// vượt quá chứ không hỏng.
+    pub fn validate(&self) -> Result<(), TrimRangeError> {
+        let bounds = [self.start_seconds, self.end_seconds];
+        if bounds.iter().all(Option::is_none) {
+            return Err(TrimRangeError::NoBound);
+        }
+        for bound in bounds.into_iter().flatten() {
+            if !bound.is_finite() {
+                return Err(TrimRangeError::NotFinite);
+            }
+            if bound < 0.0 {
+                return Err(TrimRangeError::Negative);
+            }
+        }
+        if let (Some(start), Some(end)) = (self.start_seconds, self.end_seconds) {
+            if end <= start {
+                return Err(TrimRangeError::EndNotAfterStart);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Phần nào của nội dung được tải, và nó ra thành mấy file (FR-222→FR-227).
+///
+/// FR-226 nói tách chương và cắt đoạn loại trừ lẫn nhau. Ở đây điều đó không
+/// phải một câu `if` ai đó phải nhớ viết: hai lựa chọn là hai **biến thể của
+/// cùng một enum**, nên một tác vụ vừa cắt vừa tách chương là thứ *không biểu
+/// diễn được* — không có chỗ nào trên kiểu dữ liệu để đặt cả hai. Cùng một
+/// nước đi với bitrate bên trong [`AudioOutput`] (FR-203).
+///
+/// Nếu để hai trường ngang hàng (`trim: Option<TrimRange>` + `split_chapters:
+/// bool`) thì tổ hợp cấm vẫn dựng được, vẫn lưu xuống JSON được, và việc nó
+/// không lọt tới yt-dlp sẽ chỉ còn phụ thuộc vào một phép kiểm tra lúc chạy —
+/// hoặc tệ hơn, vào giao diện chịu vô hiệu hoá ô kia, thứ mà một lời gọi lệnh
+/// trực tiếp bỏ qua hoàn toàn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum SegmentMode {
+    /// Cả nội dung, một file. Mặc định — đúng hành vi hôm nay.
+    #[default]
+    Whole,
+    /// Chỉ một đoạn (FR-222).
+    Trim(TrimRange),
+    /// Mỗi chương một file (FR-225). Nguồn không có chương thì yt-dlp ghi một
+    /// dòng "Chapter information is unavailable" rồi đi tiếp — không phải lỗi,
+    /// nhưng giao diện vẫn phải chặn trước dựa trên `MediaSource.chapters`.
+    SplitChapters,
+}
+
+impl SegmentMode {
+    pub fn trim(&self) -> Option<&TrimRange> {
+        match self {
+            SegmentMode::Trim(range) => Some(range),
+            _ => None,
+        }
+    }
+
+    pub fn splits_chapters(&self) -> bool {
+        matches!(self, SegmentMode::SplitChapters)
+    }
+}
+
+/// Lựa chọn đầu ra không dùng được. Mang mã lỗi đi kèm để tầng lệnh dịch sang
+/// `AppError` mà không phải tự đoán mã.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputOptionsError {
+    Trim(TrimRangeError),
+    /// Mã ngôn ngữ không phải một thẻ ngôn ngữ.
+    SubtitleLanguage(String),
+}
+
+impl OutputOptionsError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            OutputOptionsError::Trim(_) => "INVALID_TRIM_RANGE",
+            OutputOptionsError::SubtitleLanguage(_) => "INVALID_SUBTITLE_LANGUAGE",
+        }
+    }
+}
+
+impl std::fmt::Display for OutputOptionsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutputOptionsError::Trim(err) => write!(f, "{err}"),
+            OutputOptionsError::SubtitleLanguage(tag) => {
+                write!(f, "not a subtitle language code: {tag}")
+            }
+        }
+    }
+}
+
 /// Toàn bộ lựa chọn đầu ra gắn với một tác vụ (Key Entity "Tuỳ chọn đầu ra").
 ///
 /// Lưu vào đúng MỘT cột JSON `download_jobs.output_options` chứ không phải mỗi
@@ -170,7 +381,7 @@ pub enum CodecPreference {
 /// một bản ghi (hoặc preset) lưu từ phiên bản trước, khi có tuỳ chọn mới được
 /// thêm vào, vẫn đọc được và tuỳ chọn mới nhận giá trị mặc định thay vì làm
 /// hỏng cả bản ghi.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OutputOptions {
     pub audio: AudioOutput,
@@ -182,6 +393,62 @@ pub struct OutputOptions {
     /// FR-209. Bị bỏ qua (có ghi nhật ký) khi container đích không chứa được
     /// ảnh bìa — FR-210 nói rõ đó không phải là lỗi của tác vụ.
     pub embed_thumbnail: bool,
+    /// Mẫu tên file dạng `{field}` (FR-212). Mặc định
+    /// [`filename::DEFAULT_TEMPLATE`] = `"{title}"`, tức đúng cái tên mà hành
+    /// vi cũ (`-o "%(title)s.%(ext)s"`) vẫn cho ra.
+    ///
+    /// Phần mở rộng KHÔNG nằm trong mẫu này: nó do yt-dlp quyết định tại thời
+    /// điểm tải và luôn được nối vào cuối. `{ext}` ở cuối mẫu vì thế bị cắt bỏ
+    /// (nếu không sẽ ra `Bài hát.mp3.mp3`) — xem
+    /// `queue::strip_trailing_ext_field`.
+    pub filename_template: String,
+    pub subtitles: SubtitleOptions,
+    /// Cắt đoạn HOẶC tách chương — không bao giờ cả hai (FR-226).
+    pub segment: SegmentMode,
+}
+
+impl Default for OutputOptions {
+    fn default() -> Self {
+        Self {
+            audio: AudioOutput::default(),
+            video_container: VideoContainer::default(),
+            codec_preference: CodecPreference::default(),
+            embed_metadata: false,
+            embed_thumbnail: false,
+            filename_template: filename::DEFAULT_TEMPLATE.to_string(),
+            subtitles: SubtitleOptions::default(),
+            segment: SegmentMode::default(),
+        }
+    }
+}
+
+impl OutputOptions {
+    /// Mẫu tên file thật sự dùng: một chuỗi rỗng (ô nhập bị xoá sạch) là "chưa
+    /// chọn gì", không phải "muốn tên file rỗng", nên rơi về mẫu mặc định.
+    pub fn effective_filename_template(&self) -> &str {
+        if self.filename_template.trim().is_empty() {
+            filename::DEFAULT_TEMPLATE
+        } else {
+            &self.filename_template
+        }
+    }
+
+    /// Cửa chặn ở tầng lệnh cho những ràng buộc mà kiểu dữ liệu không tự giữ
+    /// được. Loại trừ cắt/tách chương (FR-226) KHÔNG có ở đây — nó đã do
+    /// [`SegmentMode`] đảm bảo, và một phép kiểm tra lúc chạy cho điều đó chỉ
+    /// là thứ để quên.
+    pub fn validate(&self) -> Result<(), OutputOptionsError> {
+        if let Some(range) = self.segment.trim() {
+            range.validate().map_err(OutputOptionsError::Trim)?;
+        }
+        for language in &self.subtitles.languages {
+            let language = language.trim();
+            if !is_valid_language_tag(language) {
+                return Err(OutputOptionsError::SubtitleLanguage(language.to_string()));
+            }
+        }
+        Ok(())
+    }
 }
 
 // `OutputOptions::default()` trả lời câu hỏi "một tác vụ có TRƯỚC tính năng này
@@ -344,6 +611,33 @@ pub struct GalleryItemPreview {
     pub is_audio: bool,
 }
 
+/// Một ngôn ngữ phụ đề mà nguồn **thật sự** có (FR-217).
+///
+/// `auto_generated` là điểm chính: FR-217 đòi phân biệt rõ phụ đề do người tạo
+/// cung cấp với phụ đề máy sinh, và hai thứ đó nằm ở hai bản đồ khác nhau
+/// trong JSON của yt-dlp (`subtitles` và `automatic_captions`) chứ không phải
+/// một cờ nào đó ta tự suy ra.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubtitleTrackPreview {
+    /// Mã ngôn ngữ đúng như yt-dlp gọi (`vi`, `en`, `en-orig`, `zh-Hans`) —
+    /// chính là thứ sẽ đi vào `--sub-langs`.
+    pub language: String,
+    /// Tên đọc được nếu nguồn có cung cấp (`"Vietnamese"`); `None` khi không —
+    /// KHÔNG bịa ra từ mã ngôn ngữ (FR-211), giao diện tự chọn cách hiển thị.
+    pub label: Option<String>,
+    pub auto_generated: bool,
+}
+
+/// Một chương của nội dung (FR-225). `title` là `Option` vì nguồn có thể trả
+/// về chương không tên; bịa "Chapter 3" ở tầng này là điền giá trị suy đoán
+/// (FR-211), nên việc đặt nhãn thay thế thuộc về giao diện.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChapterPreview {
+    pub title: Option<String>,
+    pub start_seconds: Option<f64>,
+    pub end_seconds: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaSource {
     pub source_url: String,
@@ -369,6 +663,22 @@ pub struct MediaSource {
     /// all-or-nothing "entire playlist" fetch, and pick a different
     /// media type/quality per item (`commands::download::PlaylistItemJobInput`).
     pub playlist_entries: Vec<PlaylistEntryPreview>,
+    /// Ngôn ngữ phụ đề nguồn thật sự có (FR-217).
+    ///
+    /// Ba giá trị, ba nghĩa khác nhau — và đó là lý do trường này là `Option`
+    /// chứ không phải một `Vec` phẳng:
+    ///   - `None`: **chưa kiểm tra**. Preview do gallery-dl trả về, hoặc một
+    ///     playlist phẳng (yt-dlp không lấy metadata từng video ở bước này).
+    ///     Giao diện phải nói "không rõ", KHÔNG được hiện một ô chọn rỗng quay
+    ///     mãi như đang tải.
+    ///   - `Some([])`: đã kiểm tra, nguồn **không có** phụ đề nào — phần chọn
+    ///     phụ đề bị ẩn hoặc vô hiệu hoá kèm giải thích (FR-221).
+    ///   - `Some([...])`: danh sách thật, dùng nguyên.
+    pub subtitles: Option<Vec<SubtitleTrackPreview>>,
+    /// Danh sách chương (FR-225). `None`/`Some([])` mang đúng hai nghĩa như
+    /// `subtitles`: "chưa kiểm tra" khác hẳn "không có chương nào", và chỉ cái
+    /// sau mới được phép vô hiệu hoá tuỳ chọn tách chương kèm giải thích.
+    pub chapters: Option<Vec<ChapterPreview>>,
 }
 
 /// One video in a flat-playlist preview. `title`/`duration_seconds`/
@@ -417,4 +727,255 @@ pub struct AppSettings {
     pub max_retry_attempts: u32,
     /// Đóng cửa sổ thì thu về khay hệ thống thay vì thoát (FR-127).
     pub run_in_background: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_trim_range_needs_at_least_one_bound() {
+        assert_eq!(
+            TrimRange::default().validate(),
+            Err(TrimRangeError::NoBound)
+        );
+    }
+
+    #[test]
+    fn one_sided_trim_ranges_are_valid() {
+        // FR-222 nói rõ "bắt đầu VÀ/HOẶC kết thúc": chỉ nhập mốc bắt đầu là
+        // một yêu cầu hợp lệ ("từ phút 12 tới hết"), không phải lỗi.
+        let from_start = TrimRange {
+            start_seconds: Some(750.0),
+            ..TrimRange::default()
+        };
+        assert_eq!(from_start.validate(), Ok(()));
+
+        let until_end = TrimRange {
+            end_seconds: Some(900.0),
+            ..TrimRange::default()
+        };
+        assert_eq!(until_end.validate(), Ok(()));
+    }
+
+    #[test]
+    fn an_end_that_does_not_come_after_the_start_is_rejected() {
+        let backwards = TrimRange {
+            start_seconds: Some(900.0),
+            end_seconds: Some(750.0),
+            ..TrimRange::default()
+        };
+        assert_eq!(backwards.validate(), Err(TrimRangeError::EndNotAfterStart));
+
+        // Hai mốc bằng nhau cho ra một file rỗng chứ không phải một lỗi nhìn
+        // thấy được, nên phải bị chặn ở đây.
+        let empty = TrimRange {
+            start_seconds: Some(750.0),
+            end_seconds: Some(750.0),
+            ..TrimRange::default()
+        };
+        assert_eq!(empty.validate(), Err(TrimRangeError::EndNotAfterStart));
+    }
+
+    #[test]
+    fn negative_and_non_finite_times_are_rejected() {
+        for value in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let range = TrimRange {
+                start_seconds: Some(value),
+                end_seconds: Some(900.0),
+                ..TrimRange::default()
+            };
+            assert!(
+                range.validate().is_err(),
+                "{value} không được coi là mốc hợp lệ"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_reaches_the_trim_range_through_the_output_options() {
+        // `create_download_job` gọi trực tiếp được, nên phép kiểm tra phải nằm
+        // trên chính bộ lựa chọn được lưu cùng tác vụ, chứ không chỉ trên
+        // `TrimRange` mà một người gọi khác có thể không bao giờ chạm tới.
+        let options = OutputOptions {
+            segment: SegmentMode::Trim(TrimRange {
+                start_seconds: Some(900.0),
+                end_seconds: Some(750.0),
+                accurate_cut: false,
+            }),
+            ..OutputOptions::default()
+        };
+        assert_eq!(
+            options.validate(),
+            Err(OutputOptionsError::Trim(TrimRangeError::EndNotAfterStart))
+        );
+        assert_eq!(options.validate().unwrap_err().code(), "INVALID_TRIM_RANGE");
+    }
+
+    #[test]
+    fn splitting_chapters_has_nowhere_to_put_a_trim_range() {
+        // FR-226 ở tầng kiểu dữ liệu. Một payload cố tình mang cả hai (giao
+        // diện lỗi, hoặc một lời gọi lệnh viết tay) không dựng nổi một tác vụ
+        // vừa cắt vừa tách: dữ liệu cắt không có trường nào để rơi vào.
+        let raw = r#"{"mode":"split_chapters","start_seconds":10.0,"end_seconds":20.0}"#;
+        let segment: SegmentMode = serde_json::from_str(raw).expect("vẫn đọc được");
+
+        assert_eq!(segment, SegmentMode::SplitChapters);
+        assert!(
+            segment.trim().is_none(),
+            "không được mang theo khoảng cắt nào"
+        );
+        assert!(segment.splits_chapters());
+    }
+
+    #[test]
+    fn a_trim_range_sits_beside_its_tag_in_json() {
+        // Hình dạng JSON ở đây LÀ hợp đồng với giao diện
+        // (`SegmentMode` trong `src/types/download.ts`): thẻ `mode` nằm cùng
+        // cấp với ba trường của khoảng cắt. Đổi cách gắn thẻ mà không đổi bản
+        // TypeScript thì mọi lần cắt gửi lên sẽ lặng lẽ thành "tải cả video".
+        let json = serde_json::to_value(SegmentMode::Trim(TrimRange {
+            start_seconds: Some(750.0),
+            end_seconds: None,
+            accurate_cut: true,
+        }))
+        .unwrap();
+
+        assert_eq!(json["mode"], "trim");
+        assert_eq!(json["start_seconds"], 750.0);
+        assert_eq!(json["end_seconds"], serde_json::Value::Null);
+        assert_eq!(json["accurate_cut"], true);
+
+        // Và chiều ngược lại: trường nào giao diện không gửi thì nhận mặc định
+        // thay vì làm hỏng cả bản ghi.
+        let parsed: SegmentMode =
+            serde_json::from_str(r#"{"mode":"trim","start_seconds":750.0}"#).unwrap();
+        assert_eq!(
+            parsed,
+            SegmentMode::Trim(TrimRange {
+                start_seconds: Some(750.0),
+                end_seconds: None,
+                accurate_cut: false,
+            })
+        );
+    }
+
+    #[test]
+    fn a_trim_job_is_never_also_a_chapter_split_job() {
+        let segment = SegmentMode::Trim(TrimRange {
+            start_seconds: Some(750.0),
+            end_seconds: Some(900.0),
+            accurate_cut: true,
+        });
+        assert!(!segment.splits_chapters());
+        assert!(segment.trim().is_some());
+    }
+
+    #[test]
+    fn options_stored_before_these_choices_existed_still_load() {
+        // FR-233: một bản ghi (hoặc preset) lưu ở phiên bản trước chỉ có năm
+        // trường cũ. Nó phải đọc được nguyên vẹn, và các lựa chọn mới nhận
+        // đúng giá trị mặc định — tức không phụ đề, không cắt, mẫu tên file
+        // mặc định.
+        let raw = r#"{
+            "audio": {"format":"opus","bitrate_kbps":192},
+            "video_container":"mkv",
+            "codec_preference":"quality",
+            "embed_metadata":true,
+            "embed_thumbnail":true
+        }"#;
+        let options: OutputOptions = serde_json::from_str(raw).expect("bản ghi cũ phải đọc được");
+
+        assert_eq!(
+            options.audio,
+            AudioOutput::Opus {
+                bitrate_kbps: Some(192)
+            }
+        );
+        assert_eq!(options.filename_template, filename::DEFAULT_TEMPLATE);
+        assert_eq!(options.subtitles, SubtitleOptions::default());
+        assert!(options.subtitles.languages.is_empty());
+        assert_eq!(options.segment, SegmentMode::Whole);
+    }
+
+    #[test]
+    fn the_default_filename_template_is_the_one_that_reproduces_todays_names() {
+        assert_eq!(
+            OutputOptions::default().filename_template,
+            filename::DEFAULT_TEMPLATE
+        );
+        assert_eq!(
+            OutputOptions::default().effective_filename_template(),
+            "{title}"
+        );
+    }
+
+    #[test]
+    fn an_emptied_out_template_box_falls_back_instead_of_naming_a_file_nothing() {
+        let options = OutputOptions {
+            filename_template: "   ".to_string(),
+            ..OutputOptions::default()
+        };
+        assert_eq!(
+            options.effective_filename_template(),
+            filename::DEFAULT_TEMPLATE
+        );
+    }
+
+    #[test]
+    fn subtitle_languages_are_deduplicated_but_keep_their_order() {
+        let options = SubtitleOptions {
+            languages: vec![
+                "vi".into(),
+                " en ".into(),
+                "vi".into(),
+                "  ".into(),
+                "en".into(),
+            ],
+            ..SubtitleOptions::default()
+        };
+        assert_eq!(options.normalized_languages(), vec!["vi", "en"]);
+    }
+
+    #[test]
+    fn only_real_looking_language_tags_reach_the_subtitle_flag() {
+        for good in ["vi", "en", "en-US", "zh-Hans", "en-orig", "pt_BR"] {
+            assert!(is_valid_language_tag(good), "{good} phải hợp lệ");
+        }
+        // `--sub-langs` của yt-dlp còn hiểu cả biểu thức chính quy và tiền tố
+        // phủ định, nên một chuỗi tuỳ ý ở đây không phải chuyện vô hại.
+        for bad in [
+            "",
+            "en us",
+            ".*",
+            "-live_chat",
+            "en,vi",
+            "en;rm -rf",
+            &"a".repeat(33),
+        ] {
+            assert!(
+                !is_valid_language_tag(bad),
+                "{bad:?} không được coi là hợp lệ"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bogus_subtitle_language_stops_the_job_instead_of_reaching_ytdlp() {
+        let options = OutputOptions {
+            subtitles: SubtitleOptions {
+                languages: vec!["vi".into(), ".*".into()],
+                ..SubtitleOptions::default()
+            },
+            ..OutputOptions::default()
+        };
+        assert_eq!(
+            options.validate(),
+            Err(OutputOptionsError::SubtitleLanguage(".*".to_string()))
+        );
+        assert_eq!(
+            options.validate().unwrap_err().code(),
+            "INVALID_SUBTITLE_LANGUAGE"
+        );
+    }
 }

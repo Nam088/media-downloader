@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -10,9 +11,11 @@ use crate::db::Db;
 use crate::error::{AppError, CANCELED_ERROR_CODE};
 use crate::logging::log_event;
 use crate::models::{
-    AudioOutput, CodecPreference, DownloadJob, GalleryMode, JobStatus, MediaType, VideoContainer,
+    AudioOutput, CodecPreference, DownloadJob, GalleryMode, JobStatus, MediaType, SegmentMode,
+    SubtitleDelivery, TrimRange, VideoContainer,
 };
 
+use super::filename;
 use super::gallery_dl;
 use super::retry::{decide_outcome, Outcome};
 use super::scheduler::{available_slots, TICK_INTERVAL_MS};
@@ -64,6 +67,15 @@ struct JobStatusChangedEvent {
     /// output path immediately without a separate `list_history` round-trip
     /// (that command is added later, in User Story 3).
     output_file_path: Option<String>,
+    /// FR-227: số file mà lần chạy này tạo ra — file gốc CỘNG một file cho mỗi
+    /// chương khi tác vụ bật tách chương. Chỉ có giá trị cho đúng những tác vụ
+    /// ấy; `None` nghĩa là "một file như mọi khi", không phải "không có file
+    /// nào".
+    ///
+    /// Là một con số trên MỘT sự kiện của MỘT tác vụ, chứ không phải N tác vụ
+    /// mới: FR-227 nói rõ một lần tách chương vẫn phải hiện thành đúng một mục
+    /// trong hàng đợi và lịch sử.
+    produced_file_count: Option<u32>,
 }
 
 /// Một lần chạy cụ thể của một job, kèm tín hiệu huỷ để `pause_job`/
@@ -629,7 +641,8 @@ async fn run_job(
         return run_gallery_job(handles, job, cancel_rx).await;
     }
 
-    let output_template = format!("{}/%(title)s.%(ext)s", job.output_directory);
+    let naming = resolve_output_naming(&job).await;
+    let output_template = naming.main.clone();
     // Đọc lại mỗi lần chạy chứ không cache lúc dựng hàng đợi: người dùng đổi
     // giới hạn tốc độ thì job được khởi chạy sau đó phải dùng giá trị mới.
     let rate_limit_kbps = handles
@@ -648,7 +661,15 @@ async fn run_job(
             format!("Job {} ({}): {note}", job.id, job.source_url),
         );
     }
-    let extra_args = plan.args;
+    let mut extra_args = plan.args;
+    // Mẫu tên riêng cho file chương: nếu không truyền, yt-dlp dùng mẫu mặc
+    // định của nó (`%(title)s - %(section_number)03d %(section_title)s.%(ext)s`)
+    // và mọi công sức làm sạch/chống ghi đè ở trên không áp cho các file kết
+    // quả thật sự của một tác vụ tách chương.
+    if let Some(chapter_template) = &naming.chapter {
+        extra_args.push("-o".into());
+        extra_args.push(chapter_template.clone());
+    }
 
     let mut output_path: Option<String> = None;
     for attempt in 1..=MAX_NO_AUDIO_ATTEMPTS {
@@ -730,6 +751,13 @@ async fn run_job(
     handles
         .db
         .insert_downloaded_file(&job.id, &output_path, &file_format, file_size)?;
+
+    // FR-227. Mỗi file chương được ghi thêm vào `downloaded_files` (bảng đã có
+    // sẵn, không cần đổi lược đồ) nên số file kết quả còn đó sau khi khởi động
+    // lại, trong khi hàng đợi vẫn chỉ có ĐÚNG MỘT dòng `download_jobs` cho cả
+    // tác vụ — không fan-out thành N mục rời rạc.
+    let produced_file_count = record_chapter_files(handles, &job, &naming).await?;
+
     handles.db.set_job_output_file(&job.id, &output_path)?;
     handles
         .db
@@ -743,15 +771,54 @@ async fn run_job(
         job.title.as_deref().unwrap_or(&job.source_url),
         None,
     );
-    emit_status_changed(
-        &handles.app,
-        &job.id,
-        JobStatus::Completed,
-        None,
-        Some(output_path),
-    );
+    emit_completed(&handles.app, &job.id, output_path, produced_file_count);
 
     Ok(())
+}
+
+/// Ghi từng file chương vào `downloaded_files` và trả về tổng số file mà tác
+/// vụ này tạo ra (file gốc + mỗi chương một file), hoặc `None` khi tác vụ
+/// không tách chương — hoặc khi tên file do chính yt-dlp đặt nên ta không nhận
+/// ra file nào là của mình. Một con số đoán mò còn tệ hơn không có số nào.
+async fn record_chapter_files(
+    handles: &QueueHandles,
+    job: &DownloadJob,
+    naming: &OutputNaming,
+) -> Result<Option<u32>, AppError> {
+    let Some(prefix) = naming.chapter_prefix.as_deref() else {
+        return Ok(None);
+    };
+
+    let after = read_file_names(&job.output_directory).await;
+    let mut chapter_names = new_chapter_file_names(&naming.files_before, &after, prefix);
+    chapter_names.sort();
+
+    for name in &chapter_names {
+        let path = Path::new(&job.output_directory).join(name);
+        let size = tokio::fs::metadata(&path)
+            .await
+            .map(|meta| meta.len() as i64)
+            .unwrap_or(0);
+        let format = Path::new(name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_string();
+        handles
+            .db
+            .insert_downloaded_file(&job.id, &path.to_string_lossy(), &format, size)?;
+    }
+
+    log_event(
+        &handles.app,
+        "INFO",
+        format!(
+            "Job {}: chapter split produced {} file(s) beside the original",
+            job.id,
+            chapter_names.len()
+        ),
+    );
+    Ok(Some(chapter_names.len() as u32 + 1))
 }
 
 /// Fallback per-image duration in `GalleryMode::Slideshow`, used only when
@@ -1304,6 +1371,200 @@ async fn recover_missing_audio(
     Ok(video_path.to_string())
 }
 
+// ---- Đặt tên file đầu ra (FR-212→FR-216) -------------------------------
+
+/// Các mẫu `-o` cho một lần chạy yt-dlp, kèm thứ cần để nhận ra file chương
+/// sau khi tải xong.
+///
+/// Điểm cốt lõi: mẫu chính là một **tên hằng** do chính ta dựng, chứ không
+/// phải mẫu `%(title)s` để yt-dlp tự điền. Nếu để yt-dlp điền thì cả FR-214
+/// (làm sạch cho ba hệ điều hành) lẫn FR-215 (không ghi đè) đều không có chỗ
+/// nào chạy — hai lời hứa ấy nằm trong `downloader::filename`, và nó chỉ áp
+/// được lên một cái tên mà ta biết trước.
+#[derive(Debug, PartialEq, Eq)]
+struct OutputNaming {
+    /// Giá trị cho `-o`, luôn kết thúc bằng `.%(ext)s`: phần mở rộng là thứ
+    /// duy nhất vẫn để yt-dlp quyết định, vì nó phụ thuộc vào format thật được
+    /// chọn lúc tải.
+    main: String,
+    /// Giá trị cho `-o chapter:` khi tác vụ tách chương.
+    chapter: Option<String>,
+    /// Tiền tố tên file chương (`"<tên> - "`), dùng để đếm file kết quả.
+    chapter_prefix: Option<String>,
+    /// Tên file đã có trong thư mục đích TRƯỚC khi tải, để phần đếm chương
+    /// không tính nhầm file của lần chạy trước hay của một tác vụ khác.
+    files_before: HashSet<String>,
+}
+
+/// Phần thuần của [`resolve_output_naming`]: dựng mẫu từ một cái tên đã chốt.
+/// Tách ra để kiểm thử được toàn bộ chuỗi ký tự đưa cho yt-dlp mà không cần
+/// đụng tới đĩa.
+///
+/// `stem = None` nghĩa là "để yt-dlp tự đặt tên" — xem [`render_output_stem`].
+fn compose_output_naming(
+    output_directory: &str,
+    stem: Option<&str>,
+    splits_chapters: bool,
+) -> OutputNaming {
+    // Thư mục cũng phải escape: yt-dlp đọc `%` ở bất kỳ đâu trong `-o` là mở
+    // đầu một trường mẫu, nên một thư mục tên `100% Music` sẽ khiến nó ghi ra
+    // chỗ khác hẳn.
+    let dir = filename::escape_for_ytdlp_template(output_directory);
+    let Some(stem) = stem else {
+        return OutputNaming {
+            main: format!("{dir}/%(title)s.%(ext)s"),
+            chapter: None,
+            chapter_prefix: None,
+            files_before: HashSet::new(),
+        };
+    };
+
+    let escaped = filename::escape_for_ytdlp_template(stem);
+    OutputNaming {
+        main: format!("{dir}/{escaped}.%(ext)s"),
+        // `%(section_number)03d` đệm số chương để thứ tự chữ cái trong trình
+        // quản lý file trùng với thứ tự chương. `section_title` do yt-dlp tự
+        // làm sạch trước khi ghép vào đường dẫn.
+        chapter: splits_chapters.then(|| {
+            format!("chapter:{dir}/{escaped} - %(section_number)03d %(section_title)s.%(ext)s")
+        }),
+        chapter_prefix: splits_chapters.then(|| format!("{stem} - ")),
+        files_before: HashSet::new(),
+    }
+}
+
+async fn resolve_output_naming(job: &DownloadJob) -> OutputNaming {
+    let splits_chapters = job.output_options.segment.splits_chapters();
+    let Some(stem) = render_output_stem(job) else {
+        return compose_output_naming(&job.output_directory, None, splits_chapters);
+    };
+
+    let existing = read_file_names(&job.output_directory).await;
+    let stem = unique_stem(&job.output_directory, &stem, &file_stems(&existing));
+    let mut naming = compose_output_naming(&job.output_directory, Some(&stem), splits_chapters);
+    naming.files_before = existing.into_iter().collect();
+    naming
+}
+
+/// Tên file (chưa có phần mở rộng) mà tác vụ này nên ghi ra, hoặc `None` khi
+/// phải để yt-dlp tự đặt tên.
+///
+/// `None` xảy ra ở đúng một tình huống: tác vụ **không mang tiêu đề nào** và
+/// người dùng **không đổi mẫu**. Tự đặt tên ở đó sẽ biến mọi mục fan-out của
+/// một playlist phẳng (nơi backend chỉ liệt kê được URL, không có tiêu đề)
+/// thành `untitled`, `untitled (2)`, `untitled (3)` — tệ hơn hẳn hành vi hôm
+/// nay, nơi yt-dlp điền tiêu đề thật mà nó vừa lấy được. Người dùng có đổi mẫu
+/// thì ta tôn trọng mẫu ấy, kể cả khi vài trường phải rơi về giá trị dự phòng
+/// (FR-216).
+fn render_output_stem(job: &DownloadJob) -> Option<String> {
+    let template = job.output_options.effective_filename_template();
+    if job.title.is_none() && template == filename::DEFAULT_TEMPLATE {
+        return None;
+    }
+
+    // `channel`, `upload_date`, `playlist_index` chưa có trên `DownloadJob`
+    // (không có cột nào mang chúng), nên hiện tại chúng rơi về giá trị dự
+    // phòng của FR-216. Đưa được chúng vào cần thêm dữ liệu nguồn đi kèm tác
+    // vụ — một thay đổi lược đồ, không thuộc lát cắt này.
+    let fields = filename::TemplateFields {
+        title: job.title.clone(),
+        channel: None,
+        playlist_index: None,
+        upload_date: None,
+        resolution: job.video_quality.clone(),
+        ext: expected_extension(job).map(str::to_string),
+    };
+    Some(filename::render_filename(
+        strip_trailing_ext_field(template),
+        &fields,
+    ))
+}
+
+/// Phần mở rộng mà lựa chọn đầu ra đã quyết định, hoặc `None` khi nó chỉ lộ ra
+/// lúc tải ("giữ nguyên định dạng gốc").
+fn expected_extension(job: &DownloadJob) -> Option<&'static str> {
+    match job.media_type {
+        MediaType::Audio => job.output_options.audio.ytdlp_audio_format(),
+        MediaType::Video => job.output_options.video_container.merge_output_format(),
+        MediaType::Gallery => None,
+    }
+}
+
+/// Cắt `{ext}` ở CUỐI mẫu (kèm dấu chấm ngăn cách nếu có).
+///
+/// Phần mở rộng thật luôn được nối vào cuối bởi `.%(ext)s`, nên giữ lại
+/// `{ext}` ở đó sẽ cho ra `Bài hát.mp3.mp3`. `{ext}` nằm giữa mẫu vẫn được
+/// thay bình thường — ở đó người dùng đang cố tình chèn nó vào tên.
+fn strip_trailing_ext_field(template: &str) -> &str {
+    let template = template.trim_end();
+    match template.strip_suffix("{ext}") {
+        Some(head) => {
+            let head = head.trim_end();
+            head.strip_suffix('.').unwrap_or(head)
+        }
+        None => template,
+    }
+}
+
+/// Tên chưa bị chiếm trong thư mục đích (FR-215).
+///
+/// So theo **tên không phần mở rộng**: lúc này ta chưa biết file sẽ là `.mp4`
+/// hay `.webm`, nên "đã có `Bài hát.mp3`" cũng phải tính là đã chiếm — nếu
+/// không, một lần tải MP4 sẽ đặt tên trùng và lần sau lại ghi đè.
+fn unique_stem(output_directory: &str, stem: &str, taken: &HashSet<String>) -> String {
+    let desired = Path::new(output_directory).join(stem);
+    let unique = filename::deduplicate_path(&desired, |candidate| {
+        candidate
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| taken.contains(name))
+    });
+    unique
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(stem)
+        .to_string()
+}
+
+/// Tên file đang có trong thư mục đích. Thư mục chưa tồn tại hoặc không đọc
+/// được thì coi như rỗng: chống ghi đè là nỗ lực tốt nhất có thể, không phải
+/// lý do để một tác vụ thất bại trước khi bắt đầu.
+async fn read_file_names(output_directory: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(output_directory).await else {
+        return names;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Some(name) = entry.file_name().to_str() {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+fn file_stems(names: &[String]) -> HashSet<String> {
+    names
+        .iter()
+        .filter_map(|name| {
+            Path::new(name)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// File chương mà chính lần chạy này vừa tạo ra: khớp tiền tố của mẫu chương
+/// ta đã truyền, VÀ chưa có mặt trước khi tải. Điều kiện thứ hai là thứ giữ
+/// cho một lần chạy lại (hoặc một tác vụ khác cùng thư mục) không bị đếm vào.
+fn new_chapter_file_names(before: &HashSet<String>, after: &[String], prefix: &str) -> Vec<String> {
+    after
+        .iter()
+        .filter(|name| name.starts_with(prefix) && !before.contains(*name))
+        .cloned()
+        .collect()
+}
+
 /// Kết quả của việc dựng tham số cho một lần chạy yt-dlp.
 ///
 /// `skipped` tồn tại vì FR-210: khi định dạng đầu ra không chứa được ảnh bìa,
@@ -1360,6 +1621,123 @@ fn thumbnail_support(job: &DownloadJob) -> ThumbnailSupport {
             "gallery downloads do not go through yt-dlp".to_string(),
         ),
     }
+}
+
+/// Định dạng đầu ra có chứa được track phụ đề hay không (FR-220).
+#[derive(Debug, PartialEq, Eq)]
+enum SubtitleEmbedSupport {
+    Supported,
+    Unsupported(String),
+}
+
+/// Cùng luật với [`thumbnail_support`], khác danh sách: bộ hậu xử lý
+/// `FFmpegEmbedSubtitle` chỉ nhúng được vào mp4/mkv/webm. Một file audio thì
+/// không có chỗ nào để đặt track phụ đề vào cả.
+fn subtitle_embed_support(job: &DownloadJob) -> SubtitleEmbedSupport {
+    match job.media_type {
+        MediaType::Video => match job.output_options.video_container {
+            VideoContainer::Mp4 | VideoContainer::Mkv => SubtitleEmbedSupport::Supported,
+            VideoContainer::Source => SubtitleEmbedSupport::Unsupported(
+                "output keeps the source's own container, which may be one that cannot hold a \
+                 subtitle track — embedding would fail the job instead of degrading, so it is \
+                 skipped"
+                    .to_string(),
+            ),
+        },
+        MediaType::Audio => SubtitleEmbedSupport::Unsupported(
+            "an audio-only output has no subtitle track to embed into".to_string(),
+        ),
+        MediaType::Gallery => SubtitleEmbedSupport::Unsupported(
+            "gallery downloads do not go through yt-dlp".to_string(),
+        ),
+    }
+}
+
+/// FR-217→FR-221. Không có ngôn ngữ nào được chọn thì hàm này không thêm cờ
+/// nào — mặc định giữ nguyên hành vi hôm nay.
+///
+/// Khi người dùng chọn "nhúng" mà định dạng đích không chứa được phụ đề, bước
+/// phụ đề bị **bỏ qua có ghi lý do**, đúng luật FR-210 mà ảnh bìa đang theo.
+/// Cố tình KHÔNG âm thầm hạ xuống thành file rời: người dùng yêu cầu một file
+/// duy nhất có phụ đề bên trong, và đưa họ một thứ khác mà không nói gì là
+/// đánh tráo kết quả — giao diện đã vô hiệu hoá lựa chọn này kèm giải thích
+/// (FR-220), nên đây chỉ là lưới an toàn cho lời gọi lệnh trực tiếp.
+fn apply_subtitle_args(job: &DownloadJob, args: &mut Vec<String>, skipped: &mut Vec<String>) {
+    let subtitles = &job.output_options.subtitles;
+    let languages = subtitles.normalized_languages();
+    if languages.is_empty() {
+        return;
+    }
+
+    if subtitles.delivery == SubtitleDelivery::Embedded {
+        if let SubtitleEmbedSupport::Unsupported(reason) = subtitle_embed_support(job) {
+            skipped.push(format!("skipped the subtitles: {reason}"));
+            return;
+        }
+    }
+
+    // Nhiều ngôn ngữ trong MỘT đối số, ngăn bằng dấu phẩy — đó là cú pháp
+    // `--sub-langs` (FR-218).
+    args.push("--sub-langs".into());
+    args.push(languages.join(","));
+    // Phụ đề máy sinh nằm ở một kho khác của yt-dlp và cần cờ riêng; thiếu nó
+    // thì một video chỉ có phụ đề tự động sẽ về tay không mà không báo gì.
+    if subtitles.include_auto_generated {
+        args.push("--write-auto-subs".into());
+    }
+    match subtitles.delivery {
+        SubtitleDelivery::SeparateFiles => args.push("--write-subs".into()),
+        // `--embed-subs` tự bật phần tải phụ đề rồi xoá file tạm sau khi nhúng,
+        // nên KHÔNG kèm `--write-subs`: kèm vào là giữ lại đúng những file rời
+        // mà người dùng vừa chọn không muốn có.
+        SubtitleDelivery::Embedded => args.push("--embed-subs".into()),
+    }
+}
+
+/// FR-222→FR-227. Cắt đoạn và tách chương là hai nhánh của cùng một `match`
+/// bởi vì [`SegmentMode`] là một enum: không có tổ hợp nào để chúng cùng xuất
+/// hiện, nên cũng không có phép kiểm tra nào để quên.
+fn apply_segment_args(segment: &SegmentMode, args: &mut Vec<String>) {
+    match segment {
+        SegmentMode::Whole => {}
+        SegmentMode::Trim(range) => {
+            args.push("--download-sections".into());
+            args.push(download_sections_arg(range));
+            // FR-224: cắt đúng điểm yêu cầu bắt buộc mã hoá lại quanh chỗ cắt,
+            // nên chậm hơn hẳn — giao diện phải báo trước.
+            if range.accurate_cut {
+                args.push("--force-keyframes-at-cuts".into());
+            }
+        }
+        SegmentMode::SplitChapters => args.push("--split-chapters".into()),
+    }
+}
+
+/// Cú pháp khoảng thời gian của `--download-sections`: `*<bắt đầu>-<kết thúc>`.
+///
+/// Dấu `*` ở đầu là thứ phân biệt "một khoảng thời gian" với "một biểu thức
+/// chính quy khớp tên chương" — thiếu nó, yt-dlp sẽ đem chuỗi này đi khớp với
+/// tên các chương và không tải gì cả. Mốc thiếu được điền bằng `0` (từ đầu) và
+/// `inf` (tới hết), đúng hai giá trị mặc định mà chính yt-dlp dùng.
+fn download_sections_arg(range: &TrimRange) -> String {
+    let start = range
+        .start_seconds
+        .map(format_seconds)
+        .unwrap_or_else(|| "0".to_string());
+    let end = range
+        .end_seconds
+        .map(format_seconds)
+        .unwrap_or_else(|| "inf".to_string());
+    format!("*{start}-{end}")
+}
+
+/// Số giây dưới dạng yt-dlp đọc được: tối đa 3 chữ số thập phân, không đuôi
+/// `.0` thừa, và tuyệt đối không phải ký hiệu khoa học (`1e-7` sẽ bị yt-dlp
+/// hiểu sai hoàn toàn).
+fn format_seconds(value: f64) -> String {
+    let text = format!("{value:.3}");
+    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+    trimmed.to_string()
 }
 
 /// Giá trị cho `--audio-quality`, hoặc `None` khi cờ đó không được phép xuất
@@ -1423,6 +1801,14 @@ fn build_ytdlp_args(job: &DownloadJob, rate_limit_kbps: u32) -> Result<YtdlpPlan
     let mut args = vec!["--no-playlist".to_string()];
     let mut skipped: Vec<String> = Vec::new();
     let options = &job.output_options;
+
+    // FR-223 ở tầng lệnh: một khoảng thời gian vô nghĩa phải dừng tác vụ tại
+    // đây với lý do đọc được, chứ không được lặng lẽ đi tới yt-dlp — nơi nó
+    // hoặc bị bỏ qua (tải nguyên cả video) hoặc làm cả tiến trình chết với một
+    // thông báo của yt-dlp mà người dùng không hiểu.
+    options
+        .validate()
+        .map_err(|err| AppError::new(err.code(), err.to_string()))?;
 
     match job.media_type {
         MediaType::Audio => {
@@ -1529,6 +1915,9 @@ fn build_ytdlp_args(job: &DownloadJob, rate_limit_kbps: u32) -> Result<YtdlpPlan
         }
     }
 
+    apply_subtitle_args(job, &mut args, &mut skipped);
+    apply_segment_args(&options.segment, &mut args);
+
     if rate_limit_kbps > 0 {
         args.push("--limit-rate".into());
         args.push(format!("{rate_limit_kbps}K"));
@@ -1606,6 +1995,29 @@ fn emit_status_changed(
             status: status.as_str().to_string(),
             error_message,
             output_file_path,
+            produced_file_count: None,
+        },
+    );
+}
+
+/// Như [`emit_status_changed`] cho trạng thái `completed`, nhưng kèm được số
+/// file kết quả (FR-227). Là hàm riêng chứ không phải một tham số thứ sáu để
+/// năm chỗ gọi còn lại — nơi khái niệm "số file kết quả" chưa tồn tại — không
+/// phải viết `None` cho một thứ chúng không liên quan.
+fn emit_completed(
+    app: &AppHandle,
+    job_id: &str,
+    output_file_path: String,
+    produced_file_count: Option<u32>,
+) {
+    let _ = app.emit(
+        "job:status_changed",
+        JobStatusChangedEvent {
+            job_id: job_id.to_string(),
+            status: JobStatus::Completed.as_str().to_string(),
+            error_message: None,
+            output_file_path: Some(output_file_path),
+            produced_file_count,
         },
     );
 }
@@ -1613,7 +2025,7 @@ fn emit_status_changed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::OutputOptions;
+    use crate::models::{OutputOptions, SubtitleOptions};
 
     #[test]
     fn parses_a_real_ffmpeg_duration_banner() {
@@ -1953,6 +2365,20 @@ mod tests {
                 "--continue",
             ]
         );
+
+        // Cùng lời hứa ấy cho `-o`, thứ không nằm trong danh sách tham số ở
+        // trên nhưng quyết định tên file người dùng nhận được. Một tác vụ
+        // không nêu lựa chọn nào và không mang tiêu đề — đúng mọi dòng có
+        // trước Phase 2 — vẫn phải để yt-dlp đặt tên y như hôm nay.
+        for job in [&audio, &video] {
+            let naming = compose_output_naming(
+                &job.output_directory,
+                render_output_stem(job).as_deref(),
+                job.output_options.segment.splits_chapters(),
+            );
+            assert_eq!(naming.main, "/tmp/%(title)s.%(ext)s");
+            assert_eq!(naming.chapter, None);
+        }
     }
 
     #[test]
@@ -2136,6 +2562,395 @@ mod tests {
         // yêu cầu chỉ làm nhiễu.
         let plan = build_ytdlp_args(&audio_job_with(AudioOutput::Wav), 0).unwrap();
         assert!(plan.skipped.is_empty());
+    }
+
+    // ---- specs/003-media-output: đặt tên file (FR-212→FR-216) -------------
+
+    /// Job video có tiêu đề thật — điều kiện để phần đặt tên của chúng ta được
+    /// chạy thay vì nhường lại cho yt-dlp.
+    fn titled_job(title: &str) -> DownloadJob {
+        let mut job = sample_job(MediaType::Video, None, Some("1080p"));
+        job.title = Some(title.to_string());
+        job
+    }
+
+    #[test]
+    fn a_job_without_a_title_still_lets_ytdlp_name_the_file_exactly_as_today() {
+        // Mục fan-out từ playlist phẳng không mang tiêu đề nào. Tự đặt tên ở
+        // đó sẽ cho ra `untitled`, `untitled (2)`, `untitled (3)`... trong khi
+        // yt-dlp lúc tải đã có tiêu đề thật trong tay.
+        let job = sample_job(MediaType::Video, None, Some("1080p"));
+        assert!(render_output_stem(&job).is_none());
+
+        let naming = compose_output_naming(&job.output_directory, None, false);
+        assert_eq!(naming.main, "/tmp/%(title)s.%(ext)s");
+        assert_eq!(naming.chapter, None);
+        assert_eq!(naming.chapter_prefix, None);
+    }
+
+    #[test]
+    fn a_titled_job_is_named_by_us_so_sanitising_and_dedup_actually_run() {
+        // FR-214: `/` và `:` trong tiêu đề phải rụng TRƯỚC khi tên tới yt-dlp.
+        // Nếu để `%(title)s` thì yt-dlp mới là bên đặt tên, và cả bước làm sạch
+        // lẫn bước chống ghi đè của chúng ta không có gì để chạy.
+        let job = titled_job("AC/DC: Back in Black?");
+        let stem = render_output_stem(&job).expect("job có tiêu đề thì ta tự đặt tên");
+        assert_eq!(stem, "AC_DC_ Back in Black_");
+
+        let naming = compose_output_naming(&job.output_directory, Some(&stem), false);
+        assert_eq!(naming.main, "/tmp/AC_DC_ Back in Black_.%(ext)s");
+    }
+
+    #[test]
+    fn a_percent_in_the_name_or_the_folder_is_handed_over_as_a_literal() {
+        // yt-dlp đọc `%` là mở đầu một trường mẫu ở BẤT KỲ đâu trong `-o`, nên
+        // một tiêu đề `100% Real` (hoặc một thư mục `100% Music`) sẽ khiến nó
+        // ghi ra một cái tên khác hẳn, hoặc chết vì mẫu không hợp lệ.
+        let job = titled_job("100% Real");
+        let stem = render_output_stem(&job).unwrap();
+        let naming = compose_output_naming("/tmp/100% Music", Some(&stem), false);
+
+        assert_eq!(naming.main, "/tmp/100%% Music/100%% Real.%(ext)s");
+    }
+
+    #[test]
+    fn a_template_field_the_job_can_fill_reaches_the_name() {
+        let mut job = titled_job("Bài hát");
+        job.output_options.filename_template = "{title} [{resolution}]".to_string();
+
+        assert_eq!(render_output_stem(&job).unwrap(), "Bài hát [1080p]");
+    }
+
+    #[test]
+    fn the_extension_is_never_written_twice() {
+        // `.%(ext)s` luôn được nối vào cuối, nên `{ext}` ở cuối mẫu phải biến
+        // mất — nếu không, `{title}.{ext}` cho ra `Bài hát.mp4.mp4`.
+        for template in ["{title}.{ext}", "{title}{ext}", "{title}.{ext}  "] {
+            assert_eq!(strip_trailing_ext_field(template), "{title}", "{template}");
+        }
+        // Ở giữa mẫu thì người dùng đang cố tình chèn nó vào tên, giữ nguyên.
+        assert_eq!(
+            strip_trailing_ext_field("{title}.{ext}.backup"),
+            "{title}.{ext}.backup"
+        );
+
+        let mut job = titled_job("Bài hát");
+        job.output_options.filename_template = "{title}.{ext}".to_string();
+        let naming = compose_output_naming(
+            &job.output_directory,
+            Some(&render_output_stem(&job).unwrap()),
+            false,
+        );
+        assert_eq!(naming.main, "/tmp/Bài hát.%(ext)s");
+    }
+
+    #[test]
+    fn an_existing_file_with_any_extension_pushes_the_new_name_aside() {
+        // FR-215. So theo tên KHÔNG phần mở rộng là điểm mấu chốt: lúc đặt tên
+        // ta chưa biết file sẽ là `.mp4` hay `.webm`, nên `Bài hát.mp3` đã có
+        // sẵn cũng phải tính là đã chiếm chỗ.
+        let taken = file_stems(&["Bài hát.mp3".to_string(), "khác.mp4".to_string()]);
+
+        assert_eq!(unique_stem("/tmp", "Bài hát", &taken), "Bài hát (2)");
+        assert_eq!(unique_stem("/tmp", "Bài hát khác", &taken), "Bài hát khác");
+    }
+
+    // ---- specs/003-media-output: phụ đề (FR-217→FR-221) -------------------
+
+    fn subtitled_video_job(subtitles: SubtitleOptions) -> DownloadJob {
+        video_job_with(OutputOptions {
+            subtitles,
+            ..OutputOptions::default()
+        })
+    }
+
+    #[test]
+    fn several_languages_travel_as_one_comma_separated_argument() {
+        // FR-218. `--sub-langs` nhận MỘT đối số; đẩy mỗi ngôn ngữ thành một cờ
+        // riêng thì yt-dlp chỉ thấy cái cuối cùng.
+        let args = args_of(&subtitled_video_job(SubtitleOptions {
+            languages: vec!["vi".into(), "en".into(), "vi".into()],
+            ..SubtitleOptions::default()
+        }));
+
+        assert_eq!(value_after(&args, "--sub-langs").as_deref(), Some("vi,en"));
+        assert!(args.contains(&"--write-subs".to_string()));
+        assert!(!args.contains(&"--embed-subs".to_string()));
+    }
+
+    #[test]
+    fn embedding_and_separate_files_are_two_different_flags() {
+        // FR-219. `--embed-subs` tự lo phần tải rồi xoá file tạm, nên đi kèm
+        // `--write-subs` sẽ để lại đúng những file rời người dùng vừa từ chối.
+        let args = args_of(&subtitled_video_job(SubtitleOptions {
+            languages: vec!["vi".into()],
+            delivery: SubtitleDelivery::Embedded,
+            ..SubtitleOptions::default()
+        }));
+
+        assert!(args.contains(&"--embed-subs".to_string()));
+        assert!(
+            !args.contains(&"--write-subs".to_string()),
+            "nhúng mà vẫn ghi file rời thì người dùng nhận cả hai: {args:?}"
+        );
+    }
+
+    #[test]
+    fn auto_generated_subtitles_need_a_flag_of_their_own() {
+        // FR-217 scenario 4: video chỉ có phụ đề máy sinh. Chúng nằm ở một kho
+        // khác của yt-dlp (`automatic_captions`), nên thiếu cờ này thì tác vụ
+        // về tay không mà không có lỗi nào.
+        let without = args_of(&subtitled_video_job(SubtitleOptions {
+            languages: vec!["en".into()],
+            ..SubtitleOptions::default()
+        }));
+        assert!(!without.contains(&"--write-auto-subs".to_string()));
+
+        let with = args_of(&subtitled_video_job(SubtitleOptions {
+            languages: vec!["en".into()],
+            include_auto_generated: true,
+            ..SubtitleOptions::default()
+        }));
+        assert!(with.contains(&"--write-auto-subs".to_string()));
+    }
+
+    #[test]
+    fn embedding_into_something_that_cannot_hold_subtitles_is_skipped_with_a_reason() {
+        // FR-220 + FR-210: cùng luật với ảnh bìa. Truyền `--embed-subs` cho một
+        // file MP3 khiến bộ hậu xử lý của yt-dlp ném lỗi và GIẾT tác vụ — người
+        // dùng mất luôn cả bản nhạc vì một lựa chọn phụ không áp dụng được.
+        for (label, job) in [
+            ("audio", {
+                let mut job = audio_job_with(AudioOutput::Mp3 { bitrate_kbps: None });
+                job.output_options.subtitles = SubtitleOptions {
+                    languages: vec!["vi".into()],
+                    delivery: SubtitleDelivery::Embedded,
+                    include_auto_generated: false,
+                };
+                job
+            }),
+            ("giữ nguyên container gốc", {
+                video_job_with(OutputOptions {
+                    video_container: VideoContainer::Source,
+                    subtitles: SubtitleOptions {
+                        languages: vec!["vi".into()],
+                        delivery: SubtitleDelivery::Embedded,
+                        include_auto_generated: false,
+                    },
+                    ..OutputOptions::default()
+                })
+            }),
+        ] {
+            let plan = build_ytdlp_args(&job, 0).expect("{label}: vẫn phải dựng được tham số");
+
+            assert!(
+                !plan.args.iter().any(|a| a == "--embed-subs"),
+                "{label}: không được truyền cờ nhúng phụ đề"
+            );
+            assert!(
+                !plan.args.iter().any(|a| a == "--sub-langs"),
+                "{label}: bỏ qua bước phụ đề thì cũng không tải phụ đề về"
+            );
+            assert_eq!(plan.skipped.len(), 1, "{label}: phải ghi lại đúng một lý do");
+            assert!(
+                plan.skipped[0].contains("subtitles"),
+                "{label}: lý do phải nói rõ thứ bị bỏ qua, nhận được {:?}",
+                plan.skipped[0]
+            );
+        }
+    }
+
+    #[test]
+    fn separate_subtitle_files_still_work_for_an_audio_job() {
+        // Chỉ có bước NHÚNG là bất khả thi với file audio; file `.srt` nằm
+        // cạnh bản nhạc thì hoàn toàn bình thường và không có gì để bỏ qua.
+        let mut job = audio_job_with(AudioOutput::Mp3 { bitrate_kbps: None });
+        job.output_options.subtitles = SubtitleOptions {
+            languages: vec!["vi".into()],
+            ..SubtitleOptions::default()
+        };
+        let plan = build_ytdlp_args(&job, 0).unwrap();
+
+        assert!(plan.args.contains(&"--write-subs".to_string()));
+        assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn no_language_chosen_means_no_subtitle_flag_at_all() {
+        let plan = build_ytdlp_args(&video_job_with(OutputOptions::default()), 0).unwrap();
+        assert!(!plan.args.iter().any(|a| a.starts_with("--sub")));
+        assert!(!plan.args.iter().any(|a| a.contains("subs")));
+    }
+
+    // ---- specs/003-media-output: cắt đoạn & chương (FR-222→FR-227) --------
+
+    fn trimmed_job(range: TrimRange) -> DownloadJob {
+        video_job_with(OutputOptions {
+            segment: SegmentMode::Trim(range),
+            ..OutputOptions::default()
+        })
+    }
+
+    #[test]
+    fn the_download_sections_argument_is_exactly_ytdlps_time_range_syntax() {
+        // Cú pháp này không có đường nào kiểm chứng ngoài việc viết ra chuỗi
+        // mong đợi: thiếu dấu `*` thì yt-dlp đem chuỗi đi khớp TÊN CHƯƠNG và
+        // không tải gì; sai dấu `-` thì nó báo "invalid time range".
+        assert_eq!(
+            download_sections_arg(&TrimRange {
+                start_seconds: Some(750.0),
+                end_seconds: Some(900.0),
+                accurate_cut: false,
+            }),
+            "*750-900"
+        );
+        // Chỉ có mốc bắt đầu: `inf` là chính từ khoá yt-dlp dùng cho "tới hết".
+        assert_eq!(
+            download_sections_arg(&TrimRange {
+                start_seconds: Some(750.5),
+                end_seconds: None,
+                accurate_cut: false,
+            }),
+            "*750.5-inf"
+        );
+        // Chỉ có mốc kết thúc: bắt đầu từ 0 chứ không phải bỏ trống.
+        assert_eq!(
+            download_sections_arg(&TrimRange {
+                start_seconds: None,
+                end_seconds: Some(90.25),
+                accurate_cut: false,
+            }),
+            "*0-90.25"
+        );
+    }
+
+    #[test]
+    fn a_time_never_reaches_ytdlp_in_scientific_notation() {
+        // `format!("{}", 0.0000001)` cho ra `1e-7`, thứ yt-dlp không đọc được
+        // như một số giây.
+        assert_eq!(format_seconds(0.0000001), "0");
+        assert_eq!(format_seconds(12.0), "12");
+        assert_eq!(format_seconds(1000.0), "1000");
+        assert_eq!(format_seconds(12.3456), "12.346");
+    }
+
+    #[test]
+    fn trimming_passes_the_range_and_only_asks_for_slow_cuts_when_told_to() {
+        let plain = args_of(&trimmed_job(TrimRange {
+            start_seconds: Some(750.0),
+            end_seconds: Some(900.0),
+            accurate_cut: false,
+        }));
+        assert_eq!(
+            value_after(&plain, "--download-sections").as_deref(),
+            Some("*750-900")
+        );
+        assert!(
+            !plain.contains(&"--force-keyframes-at-cuts".to_string()),
+            "cắt thường phải nhanh như cũ: {plain:?}"
+        );
+
+        // FR-224: cắt chính xác là một lựa chọn riêng, và là lựa chọn đắt.
+        let accurate = args_of(&trimmed_job(TrimRange {
+            start_seconds: Some(750.0),
+            end_seconds: Some(900.0),
+            accurate_cut: true,
+        }));
+        assert!(accurate.contains(&"--force-keyframes-at-cuts".to_string()));
+    }
+
+    #[test]
+    fn an_impossible_time_range_stops_the_job_here_instead_of_at_ytdlp() {
+        // FR-223. Giao diện chặn trước, nhưng `create_download_job` gọi trực
+        // tiếp được — nên phép kiểm tra thật phải nằm trên đường đi của mọi
+        // lời gọi.
+        let job = trimmed_job(TrimRange {
+            start_seconds: Some(900.0),
+            end_seconds: Some(750.0),
+            accurate_cut: false,
+        });
+        let err = build_ytdlp_args(&job, 0).expect_err("khoảng ngược phải bị từ chối");
+
+        assert_eq!(err.code, "INVALID_TRIM_RANGE");
+        assert!(
+            err.message.contains("end time"),
+            "lỗi phải nói được điều gì sai, nhận được {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn splitting_by_chapter_asks_yt_dlp_for_exactly_that() {
+        let args = args_of(&video_job_with(OutputOptions {
+            segment: SegmentMode::SplitChapters,
+            ..OutputOptions::default()
+        }));
+        assert!(args.contains(&"--split-chapters".to_string()));
+    }
+
+    #[test]
+    fn a_job_can_never_ask_for_both_trimming_and_a_chapter_split() {
+        // FR-226. Không có phép kiểm tra lúc chạy nào ở đây vì không cần: hai
+        // lựa chọn là hai biến thể của cùng một enum, nên tổ hợp cấm không
+        // dựng nổi. Test này canh đúng điều đó ở đầu ra — nếu ai đó sau này
+        // tách chúng thành hai trường ngang hàng, nó sẽ đỏ.
+        let trimmed = args_of(&trimmed_job(TrimRange {
+            start_seconds: Some(10.0),
+            end_seconds: Some(20.0),
+            accurate_cut: false,
+        }));
+        assert!(!trimmed.contains(&"--split-chapters".to_string()));
+
+        let split = args_of(&video_job_with(OutputOptions {
+            segment: SegmentMode::SplitChapters,
+            ..OutputOptions::default()
+        }));
+        assert!(!split.iter().any(|a| a == "--download-sections"));
+        assert!(!split.iter().any(|a| a == "--force-keyframes-at-cuts"));
+    }
+
+    #[test]
+    fn a_chapter_split_names_its_chapter_files_from_the_same_stem() {
+        // Không truyền `-o chapter:` thì yt-dlp rơi về mẫu mặc định của nó cho
+        // file chương, và toàn bộ phần làm sạch/chống ghi đè ở trên không áp
+        // cho chính những file mà tác vụ này sinh ra.
+        let naming = compose_output_naming("/tmp", Some("Podcast tập 3"), true);
+
+        assert_eq!(
+            naming.chapter.as_deref(),
+            Some("chapter:/tmp/Podcast tập 3 - %(section_number)03d %(section_title)s.%(ext)s")
+        );
+        assert_eq!(naming.chapter_prefix.as_deref(), Some("Podcast tập 3 - "));
+
+        // Tác vụ không tách chương thì không có mẫu chương nào, và cũng không
+        // có gì để đếm sau đó.
+        let plain = compose_output_naming("/tmp", Some("Podcast tập 3"), false);
+        assert_eq!(plain.chapter, None);
+        assert_eq!(plain.chapter_prefix, None);
+    }
+
+    #[test]
+    fn only_the_chapter_files_this_run_created_are_counted() {
+        // FR-227: con số phải là số file lần chạy NÀY tạo ra. Một lần chạy
+        // trước (hoặc một tác vụ khác cùng thư mục) đã để lại file trùng tiền
+        // tố, và tính cả chúng vào là báo cho người dùng một con số sai.
+        let before: HashSet<String> = ["Podcast - 001 Cũ.mp4".to_string(), "khác.mp4".to_string()]
+            .into_iter()
+            .collect();
+        let after = vec![
+            "Podcast - 001 Cũ.mp4".to_string(),
+            "Podcast - 002 Mới.mp4".to_string(),
+            "Podcast - 003 Mới nữa.mp4".to_string(),
+            "Podcast.mp4".to_string(),
+            "khác.mp4".to_string(),
+        ];
+
+        let created = new_chapter_file_names(&before, &after, "Podcast - ");
+
+        assert_eq!(created.len(), 2);
+        assert!(created.contains(&"Podcast - 002 Mới.mp4".to_string()));
+        // File gốc không mang tiền tố chương nên không bị tính là một chương.
+        assert!(!created.contains(&"Podcast.mp4".to_string()));
     }
 
     #[test]
