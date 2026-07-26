@@ -22,6 +22,7 @@ import {
   audioQualityValue,
 } from "@/lib/generic-quality-options";
 import { formatDuration, formatFileSize } from "@/lib/format";
+import { extractUrlsFromText } from "@/lib/url-parsing";
 import type {
   AppError,
   AudioFormatOption,
@@ -48,28 +49,6 @@ const PLATFORM_DISPLAY_NAMES: Record<string, string> = {
  * label, it never decides what's allowed. */
 function platformDisplayName(platform: string): string {
   return PLATFORM_DISPLAY_NAMES[platform] ?? platform.charAt(0).toUpperCase() + platform.slice(1);
-}
-
-function isValidUrl(str: string): boolean {
-  try {
-    const parsed = new URL(str);
-    return parsed.protocol === "http:" || parsed.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
-
-function extractUrlsFromText(raw: string): string[] {
-  // Extract all http:// and https:// URLs using URL regex, filtering out trash/junk text
-  const urlRegex = /(https?:\/\/[^\s\r\n]+)/g;
-  const matches = raw.match(urlRegex) || [];
-  return matches
-    .map((u) => u.trim().replace(/[.,;)]+$/, ""))
-    .filter((u) => isValidUrl(u));
-}
-
-function splitUrls(raw: string): string[] {
-  return extractUrlsFromText(raw);
 }
 
 /** One row in the quality picker — mirrors the reference layout: radio +
@@ -233,7 +212,7 @@ export function DownloadForm() {
   // effect, so there's exactly one source of truth for "what's selected".
   const effectiveOutputDirectory = outputDirectory ?? settings?.default_output_directory ?? null;
 
-  const urls = splitUrls(rawInput);
+  const urls = extractUrlsFromText(rawInput);
   const isBatchMode = urls.length > 1;
 
   async function handlePreview() {
