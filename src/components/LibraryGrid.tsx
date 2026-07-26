@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
@@ -190,8 +190,13 @@ const MEDIA_TYPE_ICONS: Record<MediaType, typeof FileAudio> = {
  * phòng. */
 function Thumbnail({ item, className }: { item: LibraryItem; className?: string }) {
   const Icon = MEDIA_TYPE_ICONS[item.media_type];
+  // The asset protocol can refuse a path outside its allowed scope, or the
+  // file on disk can be gone — either way this falls back to the same
+  // placeholder as "no thumbnail" rather than the browser's bare
+  // broken-image glyph (FR-301 acceptance #3: no empty cell).
+  const [failed, setFailed] = useState(false);
 
-  if (item.thumbnail_path === null) {
+  if (item.thumbnail_path === null || failed) {
     return (
       <div
         className={cn(
@@ -214,6 +219,7 @@ function Thumbnail({ item, className }: { item: LibraryItem; className?: string 
       decoding="async"
       className={cn("object-cover", className)}
       data-testid="library-thumbnail-image"
+      onError={() => setFailed(true)}
     />
   );
 }

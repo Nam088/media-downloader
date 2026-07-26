@@ -1,5 +1,5 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -286,6 +286,22 @@ describe("Library — rows with no thumbnail and no duration", () => {
     expect(image).toHaveAttribute("src", expect.stringContaining("asset://localhost/"));
     // FR-310: the browser decides which of 10.000 covers to fetch, not us.
     expect(image).toHaveAttribute("loading", "lazy");
+  });
+
+  // The asset protocol can refuse a path outside its allowed scope, or the
+  // file on disk can simply be gone — either way the grid must not show the
+  // browser's bare broken-image glyph (FR-301 acceptance #3: no empty cell).
+  it("falls back to the media-type placeholder when the thumbnail file fails to load", async () => {
+    backendItems = [makeItem({ id: "a", thumbnail_path: "/covers/a.jpg", media_type: "audio" })];
+    backendStats = statsFor(backendItems);
+    await renderLibrary();
+
+    const image = await screen.findByTestId("library-thumbnail-image");
+    fireEvent.error(image);
+
+    const placeholder = await screen.findByTestId("library-thumbnail-placeholder");
+    expect(placeholder.dataset.mediaType).toBe("audio");
+    expect(screen.queryByTestId("library-thumbnail-image")).not.toBeInTheDocument();
   });
 
   it("leaves the duration out entirely rather than claiming the file is 0:00 long", async () => {
