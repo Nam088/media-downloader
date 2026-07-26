@@ -11,8 +11,8 @@ use crate::db::Db;
 use crate::error::{AppError, CANCELED_ERROR_CODE};
 use crate::logging::log_event;
 use crate::models::{
-    AudioOutput, CodecPreference, DownloadJob, GalleryMode, JobStatus, MediaType, SegmentMode,
-    SubtitleDelivery, TrimRange, VideoContainer,
+    AudioOutput, CodecPreference, DownloadJob, GalleryMode, JobStatus, MediaType, NewLibraryFile,
+    SegmentMode, SubtitleDelivery, TrimRange, VideoContainer,
 };
 
 use super::filename;
@@ -671,6 +671,30 @@ async fn run_job(
         extra_args.push(chapter_template.clone());
     }
 
+    // FR-304: ảnh đại diện phải nằm trên máy để lưới Thư viện hiện được khi
+    // không có mạng. Lấy nó ngay tại lần tải này — yt-dlp vừa mới lấy metadata
+    // của nguồn nên URL ảnh đang nằm sẵn trong tay nó; hỏi lại sau này nghĩa
+    // là một vòng mạng thứ hai cho một link có thể đã hết hạn (CDN của TikTok
+    // ký URL ngắn hạn) hoặc đã bị gỡ.
+    //
+    // Ảnh đi vào thư mục dữ liệu của ứng dụng, KHÔNG vào thư mục tải của người
+    // dùng: đây là dữ liệu nội bộ, và rải file `.webp` cạnh mỗi bài nhạc là
+    // thứ người dùng không hề yêu cầu. Tách thư mục còn giữ cho phép đếm file
+    // chương (`new_chapter_file_names`) không đếm nhầm ảnh vừa ghi ra.
+    let thumbnail_dir = thumbnail_dir(&handles.app);
+    if let Some(dir) = &thumbnail_dir {
+        // `job.id` là UUID nên an toàn tuyệt đối trong một mẫu `-o`; chỉ phần
+        // thư mục mới cần escape (yt-dlp đọc `%` ở bất kỳ đâu là mở đầu một
+        // trường mẫu).
+        extra_args.push("--write-thumbnail".into());
+        extra_args.push("-o".into());
+        extra_args.push(format!(
+            "thumbnail:{}/{}.%(ext)s",
+            filename::escape_for_ytdlp_template(&dir.to_string_lossy()),
+            job.id
+        ));
+    }
+
     let mut output_path: Option<String> = None;
     for attempt in 1..=MAX_NO_AUDIO_ATTEMPTS {
         let job_id_for_progress = job.id.clone();
@@ -740,17 +764,17 @@ async fn run_job(
     }
     let output_path = output_path.expect("loop always returns via `?`/cancel or sets output_path");
 
-    let metadata = tokio::fs::metadata(&output_path).await.ok();
-    let file_size = metadata.map(|m| m.len() as i64).unwrap_or(0);
-    let file_format = std::path::Path::new(&output_path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_string();
-
-    handles
-        .db
-        .insert_downloaded_file(&job.id, &output_path, &file_format, file_size)?;
+    let thumbnail_path = thumbnail_dir
+        .as_deref()
+        .and_then(|dir| written_thumbnail_path(dir, &job.id));
+    index_library_file(
+        handles,
+        &job,
+        &output_path,
+        library_title(&job, &output_path),
+        thumbnail_path,
+    )
+    .await?;
 
     // FR-227. Mỗi file chương được ghi thêm vào `downloaded_files` (bảng đã có
     // sẵn, không cần đổi lược đồ) nên số file kết quả còn đó sau khi khởi động
@@ -795,18 +819,13 @@ async fn record_chapter_files(
 
     for name in &chapter_names {
         let path = Path::new(&job.output_directory).join(name);
-        let size = tokio::fs::metadata(&path)
-            .await
-            .map(|meta| meta.len() as i64)
-            .unwrap_or(0);
-        let format = Path::new(name)
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("")
-            .to_string();
-        handles
-            .db
-            .insert_downloaded_file(&job.id, &path.to_string_lossy(), &format, size)?;
+        // FR-302: mỗi chương là một dòng riêng trong Thư viện, tất cả cùng
+        // `job_id`. Tiêu đề lấy từ tên file chứ KHÔNG dùng `job.title`: mẫu
+        // tên chương đã nhét số thứ tự và tên chương vào đấy, nên tên file là
+        // thứ duy nhất phân biệt được chương 3 với chương 4 — dùng tiêu đề
+        // của tác vụ sẽ cho ra hai mươi ô trùng tên nhau.
+        index_library_file(handles, job, &path.to_string_lossy(), file_stem_title(&path), None)
+            .await?;
     }
 
     log_event(
@@ -821,9 +840,116 @@ async fn record_chapter_files(
     Ok(Some(chapter_names.len() as u32 + 1))
 }
 
+/// Ghi một file kết quả vào chỉ mục Thư viện (FR-301).
+///
+/// Mọi thứ Thư viện cần được chốt **tại đây, ngay lúc tác vụ hoàn tất**, chứ
+/// không hỏi lại sau: đây là thời điểm duy nhất mà file vừa nằm trên đĩa, tác
+/// vụ còn nguyên nền tảng/URL/loại nội dung, và ffmpeg còn đáng bỏ ra một lần
+/// gọi cho một file. Hỏi lại ở thời điểm hiển thị nghĩa là 10.000 lần gọi
+/// ffmpeg khi người dùng mở tab.
+async fn index_library_file(
+    handles: &QueueHandles,
+    job: &DownloadJob,
+    file_path: &str,
+    title: String,
+    thumbnail_path: Option<String>,
+) -> Result<(), AppError> {
+    let file_size_bytes = tokio::fs::metadata(file_path)
+        .await
+        .map(|meta| meta.len() as i64)
+        .unwrap_or(0);
+    // Làm tròn xuống về giây: hợp đồng với giao diện là số nguyên giây, và
+    // phần lẻ của một bản ghi 3 phút không có người xem nào phân biệt được.
+    let duration_seconds = probe_media_duration_secs(file_path)
+        .await
+        .map(|secs| secs as i64);
+
+    handles.db.insert_downloaded_file(&NewLibraryFile {
+        job_id: job.id.clone(),
+        file_path: file_path.to_string(),
+        file_format: crate::db::media_file_extension(file_path),
+        file_size_bytes,
+        title,
+        media_type: job.media_type.clone(),
+        platform: job.platform.clone(),
+        source_url: job.source_url.clone(),
+        duration_seconds,
+        thumbnail_path,
+    })
+}
+
+/// Tiêu đề hiển thị của một file kết quả: tiêu đề của tác vụ nếu có, còn
+/// không thì tên file.
+///
+/// Vế thứ hai không phải cho có: một mục fan-out từ playlist phẳng không hề
+/// mang tiêu đề (backend chỉ liệt kê được URL), nhưng chính yt-dlp đã đặt tên
+/// file từ tiêu đề thật nó lấy được — nên tên file vẫn là tiêu đề, chỉ đi
+/// đường vòng. Bỏ trống ở đó sẽ cho ra một lưới đầy ô không tên.
+fn library_title(job: &DownloadJob, file_path: &str) -> String {
+    job.title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| file_stem_title(Path::new(file_path)))
+}
+
+fn file_stem_title(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Thư mục chứa ảnh đại diện cục bộ (FR-304), nằm trong thư mục dữ liệu ứng
+/// dụng cạnh chính file CSDL.
+///
+/// `None` khi không xác định được thư mục dữ liệu — hiếm, nhưng khi đó tác vụ
+/// vẫn phải tải xong: thiếu ảnh đại diện là một khiếm khuyết hiển thị, không
+/// phải lý do để một lần tải thất bại.
+fn thumbnail_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager;
+    let dir = app.path().app_data_dir().ok()?.join("thumbnails");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Ảnh mà yt-dlp vừa ghi cho tác vụ này, nếu có.
+///
+/// Phần mở rộng do nguồn quyết định (`.jpg`, `.webp`, `.png`…), nên phải dò
+/// theo phần gốc `<job_id>.` thay vì đoán một đuôi cụ thể. `None` là kết quả
+/// hoàn toàn bình thường: nguồn không có ảnh, hoặc lần tải ảnh thất bại —
+/// yt-dlp chỉ cảnh báo chứ không làm hỏng tác vụ, và Thư viện dùng ảnh thay
+/// thế theo loại nội dung.
+fn written_thumbnail_path(dir: &Path, job_id: &str) -> Option<String> {
+    let prefix = format!("{job_id}.");
+    let entries = std::fs::read_dir(dir).ok()?;
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// Phần mở rộng ảnh mà webview hiển thị được trực tiếp — dùng để quyết định
+/// một file kết quả của gallery-dl có tự làm ảnh đại diện cho mình được không.
+const IMAGE_EXTENSIONS: [&str; 6] = ["jpg", "jpeg", "png", "webp", "gif", "avif"];
+
+fn is_image_file(file_path: &str) -> bool {
+    Path::new(file_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .is_some_and(|ext| IMAGE_EXTENSIONS.contains(&ext.as_str()))
+}
+
 /// Fallback per-image duration in `GalleryMode::Slideshow`, used only when
 /// the audio track's actual length can't be probed (see
-/// `probe_audio_duration_secs`) — normally each image's display time is the
+/// `probe_media_duration_secs`) — normally each image's display time is the
 /// audio's total length divided evenly across the image count, clamped to
 /// `[MIN_SLIDESHOW_IMAGE_DURATION_SECS, MAX_SLIDESHOW_IMAGE_DURATION_SECS]`,
 /// so the slideshow's pacing actually matches the music instead of a fixed
@@ -1012,17 +1138,22 @@ async fn run_gallery_job(
         }
     };
 
-    let metadata = tokio::fs::metadata(&output_path).await.ok();
-    let file_size = metadata.map(|m| m.len() as i64).unwrap_or(0);
-    let file_format = std::path::Path::new(&output_path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_string();
-
-    handles
-        .db
-        .insert_downloaded_file(&job.id, &output_path, &file_format, file_size)?;
+    // FR-304 cho nhánh gallery-dl: không có bước `--write-thumbnail` nào ở
+    // đây, nhưng cũng không cần — với `Files`/`ImagesOnly` thì file kết quả
+    // CHÍNH LÀ một tấm ảnh, nên nó tự làm ảnh đại diện cho mình, hoàn toàn
+    // ngoại tuyến và không tốn thêm byte nào. Với `AudioOnly`/`Slideshow`
+    // (kết quả là mp3/mp4) thì không có ảnh nào còn lại để trỏ vào — ảnh
+    // nguồn đã bị xoá sau khi ghép — nên `None`, và lưới dùng ảnh thay thế
+    // theo loại nội dung.
+    let thumbnail_path = is_image_file(&output_path).then(|| output_path.clone());
+    index_library_file(
+        handles,
+        &job,
+        &output_path,
+        library_title(&job, &output_path),
+        thumbnail_path,
+    )
+    .await?;
     handles.db.set_job_output_file(&job.id, &output_path)?;
     handles
         .db
@@ -1075,14 +1206,21 @@ const SLIDESHOW_TRANSITION_SECS: f64 = 0.5;
 /// slideshow posts this targets.
 const SLIDESHOW_CANVAS: (u32, u32) = (1080, 1920);
 
-/// Reads the audio track's real duration via ffmpeg's own stderr banner
+/// Reads a media file's real duration via ffmpeg's own stderr banner
 /// (`  Duration: 00:00:12.34, start: ...`) — no `ffprobe` needed (this
 /// project doesn't bundle it). `ffmpeg -i <file>` always prints this line
 /// once it's parsed the input, even with no output specified, so this just
 /// discards everything ffmpeg would otherwise fail on past that point.
-async fn probe_audio_duration_secs(ffmpeg_path: &std::path::Path, audio_path: &str) -> Option<f64> {
+///
+/// Dùng cho hai việc: canh nhịp slideshow (theo độ dài bản nhạc) và ghi
+/// `duration_seconds` vào chỉ mục Thư viện (FR-301). Dòng banner không phân
+/// biệt audio với video, nên cùng một phép đo đúng cho cả hai.
+async fn probe_media_duration_secs_with(
+    ffmpeg_path: &std::path::Path,
+    media_path: &str,
+) -> Option<f64> {
     let output = tokio::process::Command::new(ffmpeg_path)
-        .args(["-i", audio_path])
+        .args(["-i", media_path])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -1092,7 +1230,16 @@ async fn probe_audio_duration_secs(ffmpeg_path: &std::path::Path, audio_path: &s
     parse_ffmpeg_duration_line(&String::from_utf8_lossy(&output.stderr))
 }
 
-/// Pure parsing half of `probe_audio_duration_secs`, split out so it's
+/// Như trên nhưng tự tìm lấy ffmpeg. `None` khi không đo được vì bất kỳ lý do
+/// gì (không có ffmpeg, file là một tấm ảnh, container lạ) — và `None` ở chỗ
+/// gọi mang đúng nghĩa "không biết thời lượng", một câu trả lời hợp lệ mà
+/// [`crate::models::LibraryItem`] có sẵn chỗ để chứa.
+async fn probe_media_duration_secs(media_path: &str) -> Option<f64> {
+    let ffmpeg_path = ytdlp_binary::resolve_ffmpeg_path().ok()?;
+    probe_media_duration_secs_with(&ffmpeg_path, media_path).await
+}
+
+/// Pure parsing half of `probe_media_duration_secs_with`, split out so it's
 /// testable without actually spawning ffmpeg.
 fn parse_ffmpeg_duration_line(stderr: &str) -> Option<f64> {
     let line = stderr.lines().find(|l| l.trim_start().starts_with("Duration:"))?;
@@ -1191,7 +1338,7 @@ fn compute_tail_extension_secs(
 /// plain dissolve).
 ///
 /// The audio track is never trimmed: each image's display time is the
-/// audio's own real length (probed via `probe_audio_duration_secs`) divided
+/// audio's own real length (probed via `probe_media_duration_secs_with`) divided
 /// evenly across the image count, not a fixed per-image duration, which
 /// would either run past the music (dead air) or, combined with `-shortest`,
 /// silently truncate the audio early to match a shorter slideshow. Because
@@ -1219,7 +1366,7 @@ async fn merge_gallery_slideshow(
     let output_file_name = "slideshow.mp4";
     let ffmpeg_path = ytdlp_binary::resolve_ffmpeg_path()?;
 
-    let probed_audio_secs = probe_audio_duration_secs(&ffmpeg_path, audio_path).await;
+    let probed_audio_secs = probe_media_duration_secs_with(&ffmpeg_path, audio_path).await;
     let image_duration_secs = compute_image_duration_secs(probed_audio_secs, image_paths.len());
     // The transition borrows time from both the clip it leaves and the one
     // it enters, so it must stay well under a single image's own display

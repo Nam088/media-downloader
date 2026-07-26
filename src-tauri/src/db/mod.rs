@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 use crate::models::{
-    AppSettings, DownloadJob, DownloadedFile, GalleryMode, JobStatus, MediaType, OutputOptions,
+    AppSettings, DownloadJob, GalleryMode, JobStatus, LibraryBreakdownEntry, LibraryItem,
+    LibraryQuery, LibraryStats, MediaType, NewLibraryFile, OutputOptions,
 };
 
 fn migrations() -> Migrations<'static> {
@@ -24,6 +25,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/0009_backfill_completed_progress.sql")),
         M::up(include_str!("migrations/0010_job_output_options.sql")),
         M::up(include_str!("migrations/0011_output_presets.sql")),
+        M::up(include_str!("migrations/0012_library_index.sql")),
     ])
 }
 
@@ -38,6 +40,13 @@ fn migrations() -> Migrations<'static> {
 /// legitimately stop partway.
 const COMPLETION_FORCES_FULL_PROGRESS: &str =
     "progress_percent = CASE WHEN ?1 = 'completed' THEN 100.0 ELSE progress_percent END";
+
+/// FR-322: một thao tác ghi lên hệ thống tệp gặp file đã tồn tại phải **thất
+/// bại rõ ràng**, không bao giờ tự đổi tên hay ghi đè. Mã lỗi khai báo một
+/// lần ở đây vì nó đi qua hai tầng: `db::library_write_error` sinh ra nó từ
+/// vi phạm chỉ mục duy nhất trên `file_path`, còn `commands::library` sinh ra
+/// nó từ phép kiểm tra trên đĩa trước khi động vào file.
+pub const FILE_EXISTS_ERROR_CODE: &str = "FILE_EXISTS";
 
 pub struct Db(Mutex<Connection>);
 
@@ -65,7 +74,14 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(AppError::internal)?;
 
-        Ok(Db(Mutex::new(conn)))
+        let db = Db(Mutex::new(conn));
+        // FR-303. Ngay sau migration và trước khi bất kỳ ai đọc thư viện, để
+        // lần mở tab Thư viện đầu tiên đã thấy đủ lịch sử cũ thay vì một
+        // trạng thái rỗng gây hiểu nhầm. Xem `backfill_library_index`: hoàn
+        // toàn không chạm đĩa, nên nó không kéo dài thời gian khởi động theo
+        // số lượng file.
+        db.backfill_library_index()?;
+        Ok(db)
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -448,48 +464,444 @@ impl Db {
         Ok(ids)
     }
 
-    // ---- downloaded_files ---------------------------------------------
+    // ---- downloaded_files / chỉ mục Thư viện ---------------------------
 
-    pub fn insert_downloaded_file(
-        &self,
-        job_id: &str,
-        file_path: &str,
-        file_format: &str,
-        file_size_bytes: i64,
-    ) -> Result<(), AppError> {
+    /// Ghi (hoặc cập nhật) một file kết quả vào chỉ mục Thư viện.
+    ///
+    /// FR-302: một tác vụ có thể gọi hàm này nhiều lần — tách chương ghi thêm
+    /// một dòng cho mỗi chương — và mọi dòng đều mang cùng `job_id`. Không có
+    /// gì ở đây giới hạn "một tác vụ một file".
+    ///
+    /// UPSERT theo `file_path` chứ không phải INSERT thuần: tải lại cùng một
+    /// link ghi đè đúng file cũ trên đĩa, nên hai dòng cùng đường dẫn sẽ là
+    /// hai ô giống hệt nhau trong lưới trỏ vào một file duy nhất (chính là
+    /// thứ migration 0012 vừa dọn: 105 dòng thật của người dùng chỉ ứng với
+    /// 66 file). `duration_seconds`/`thumbnail_path` giữ giá trị cũ khi lần
+    /// ghi mới không có gì tốt hơn — mất một thứ đã đo được vì lần sau đo
+    /// hụt là một bước lùi.
+    pub fn insert_downloaded_file(&self, file: &NewLibraryFile) -> Result<(), AppError> {
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO downloaded_files (id, job_id, file_path, file_format, file_size_bytes, completed_at)
-             VALUES (?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO downloaded_files (
+                id, job_id, file_path, file_format, file_size_bytes, completed_at,
+                title, media_type, platform, source_url, duration_seconds,
+                thumbnail_path, search_text, is_missing
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,0)
+             ON CONFLICT(file_path) DO UPDATE SET
+                job_id = excluded.job_id,
+                file_format = excluded.file_format,
+                file_size_bytes = excluded.file_size_bytes,
+                completed_at = excluded.completed_at,
+                title = excluded.title,
+                media_type = excluded.media_type,
+                platform = excluded.platform,
+                source_url = excluded.source_url,
+                duration_seconds = COALESCE(excluded.duration_seconds, duration_seconds),
+                thumbnail_path = COALESCE(excluded.thumbnail_path, thumbnail_path),
+                search_text = excluded.search_text,
+                is_missing = 0",
             params![
                 uuid::Uuid::new_v4().to_string(),
-                job_id,
-                file_path,
-                file_format,
-                file_size_bytes,
+                file.job_id,
+                file.file_path,
+                file.file_format,
+                file.file_size_bytes,
                 Utc::now().to_rfc3339(),
+                file.title,
+                media_type_str(&file.media_type),
+                file.platform,
+                file.source_url,
+                file.duration_seconds,
+                file.thumbnail_path,
+                search_text_for(&file.title, &file.file_path),
             ],
         )?;
         Ok(())
     }
 
-    /// Not called yet — `list_history` (T035) reads `output_file_path`
-    /// straight off `DownloadJob` instead, which is enough for the current
-    /// UI. Kept for when a richer history view needs `file_size_bytes`/
-    /// `file_format` (data-model.md §3), so that data isn't write-only.
-    #[allow(dead_code)]
-    pub fn get_downloaded_file_for_job(
-        &self,
-        job_id: &str,
-    ) -> Result<Option<DownloadedFile>, AppError> {
+    /// FR-303: nạp vào Thư viện những file đã tải từ trước khi Thư viện tồn
+    /// tại, dựa trên `download_jobs` — thứ dữ liệu lịch sử duy nhất có sẵn.
+    ///
+    /// Chạy trong `Db::open`, sau migration, ở MỌI lần khởi động chứ không
+    /// một lần rồi thôi: cả hai câu lệnh đều tự giới hạn vào phần còn thiếu
+    /// (`media_type = ''` là dấu vết của dòng có trước 0012; `NOT EXISTS` cho
+    /// phần chưa có dòng nào), nên lần thứ hai trở đi là hai lần quét không
+    /// đổi gì. Đổi lại, một cài đặt nào đó ghi thêm dòng qua đường cũ vẫn
+    /// được vá, thay vì hỏng vĩnh viễn vì đã lỡ chuyến migration.
+    ///
+    /// KHÔNG chạm đĩa. Không `stat`, không đọc kích thước thật, không đánh
+    /// dấu thiếu — đó là việc của `reconcile_library` (FR-327): một vòng lặp
+    /// `stat` trên 10.000 file nằm giữa `Db::open` và cửa sổ đầu tiên là đúng
+    /// nghĩa "chặn giao diện". Vì thế `output_file_path` trỏ vào một file
+    /// không còn tồn tại vẫn được nạp bình thường, y như mọi mục khác, và chỉ
+    /// đổi màu sau vòng đối soát kế tiếp.
+    pub fn backfill_library_index(&self) -> Result<LibraryBackfillReport, AppError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+
+        // Bước 1 — bổ sung cột cho các dòng đã có (dòng ghi trước 0012).
+        let stale: Vec<StaleIndexRow> = {
+            let mut stmt = tx.prepare(
+                "SELECT f.id, f.file_path, j.title, j.media_type, j.platform, j.source_url
+                 FROM downloaded_files f
+                 LEFT JOIN download_jobs j ON j.id = f.job_id
+                 WHERE f.media_type = ''",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(StaleIndexRow {
+                    id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    job_title: row.get(2)?,
+                    // `LEFT JOIN` cho ra `NULL` ở một dòng mồ côi (tác vụ đã
+                    // bị xoá khỏi lịch sử) — không phải lỗi, chỉ là không còn
+                    // gì để chép sang.
+                    media_type: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    platform: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    source_url: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let enriched = stale.len();
+        for row in stale {
+            let title = display_title(row.job_title.as_deref(), &row.file_path);
+            tx.execute(
+                "UPDATE downloaded_files
+                 SET title = ?1, media_type = ?2, platform = ?3, source_url = ?4,
+                     search_text = ?5, file_format = ?6
+                 WHERE id = ?7",
+                params![
+                    title,
+                    // Dòng mồ côi rơi về `video` — cùng luật mà `row_to_job`
+                    // vẫn áp cho một giá trị lạ. Vẫn tốt hơn là bỏ hẳn dòng đó
+                    // khỏi thư viện, vì file trên đĩa thì vẫn còn thật.
+                    if row.media_type.is_empty() { "video" } else { row.media_type.as_str() },
+                    row.platform,
+                    row.source_url,
+                    search_text_for(&title, &row.file_path),
+                    // Chuẩn hoá lại luôn: các dòng cũ mang định dạng do bản
+                    // `insert_downloaded_file` trước 0012 rút ra bằng
+                    // `Path::extension` thô, nên một thư mục kết quả của tác
+                    // vụ gallery đã kịp để lại chuỗi
+                    // `co k1lltheguard46 (28f98824)` trong bộ lọc định dạng.
+                    media_file_extension(&row.file_path),
+                    row.id,
+                ],
+            )?;
+        }
+
+        // Bước 2 — những tác vụ hoàn tất chưa hề có dòng nào trong chỉ mục.
+        // Trên CSDL thật thì mọi tác vụ hoàn tất đều đã có dòng, nhưng bản
+        // ghi `downloaded_files` chỉ tồn tại từ khi tính năng ghi nó tồn tại;
+        // `output_file_path` mới là thứ đi cùng tác vụ từ đầu, nên nó là
+        // nguồn dự phòng đúng đắn cho FR-303.
+        let unindexed_jobs: Vec<UnindexedJobRow> = {
+            let mut stmt = tx.prepare(
+                "SELECT j.id, j.output_file_path, j.title, j.media_type, j.platform,
+                        j.source_url, j.updated_at
+                 FROM download_jobs j
+                 WHERE j.status = 'completed'
+                   AND j.output_file_path IS NOT NULL
+                   AND j.output_file_path <> ''
+                   AND NOT EXISTS (
+                       SELECT 1 FROM downloaded_files f WHERE f.file_path = j.output_file_path
+                   )",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(UnindexedJobRow {
+                    job_id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    job_title: row.get(2)?,
+                    media_type: row.get(3)?,
+                    platform: row.get(4)?,
+                    source_url: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut inserted = 0usize;
+        for row in unindexed_jobs {
+            let title = display_title(row.job_title.as_deref(), &row.file_path);
+            // `INSERT OR IGNORE`: hai tác vụ hoàn tất có thể cùng trỏ vào một
+            // đường dẫn (tải lại đè lên file cũ). Dòng đầu thắng, dòng sau bị
+            // bỏ qua — cùng luật gộp mà 0012 vừa áp cho dữ liệu cũ.
+            //
+            // `file_size_bytes = 0`: kích thước thật chỉ đọc được bằng cách
+            // chạm đĩa, việc mà vòng đối soát (`reconcile_library`) làm ở nền
+            // và cập nhật lại — xem chú thích của hàm này.
+            let changed = tx.execute(
+                "INSERT OR IGNORE INTO downloaded_files (
+                    id, job_id, file_path, file_format, file_size_bytes, completed_at,
+                    title, media_type, platform, source_url, search_text, is_missing
+                 ) VALUES (?1,?2,?3,?4,0,?5,?6,?7,?8,?9,?10,0)",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    row.job_id,
+                    row.file_path,
+                    media_file_extension(&row.file_path),
+                    row.updated_at,
+                    title,
+                    row.media_type,
+                    row.platform,
+                    row.source_url,
+                    search_text_for(&title, &row.file_path),
+                ],
+            )?;
+            inserted += changed;
+        }
+
+        tx.commit()?;
+        Ok(LibraryBackfillReport { enriched, inserted })
+    }
+
+    /// FR-307 → FR-310. Toàn bộ việc lọc/sắp/phân trang nằm trong SQL: trả cả
+    /// 10.000 dòng qua cầu IPC rồi để giao diện lọc là cách chắc chắn nhất để
+    /// phá SC-302.
+    pub fn list_library(&self, query: &LibraryQuery) -> Result<Vec<LibraryItem>, AppError> {
+        let conn = self.conn();
+        let filter = LibraryFilterSql::build(query);
+        let sql = format!(
+            "SELECT * FROM downloaded_files {} ORDER BY {} {}",
+            filter.where_clause,
+            query.sort.order_by(query.direction),
+            limit_clause(query),
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(filter.params.iter()),
+            row_to_library_item,
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(AppError::from)
+    }
+
+    /// FR-328. Tính trên CÙNG bộ lọc mà `list_library` vừa dùng, nên tổng số
+    /// luôn khớp với thứ đang hiện trên màn hình (SC-307). Phân trang cố ý
+    /// KHÔNG được áp: thống kê nói về cả tập kết quả, không về trang hiện tại.
+    pub fn library_stats(&self, query: &LibraryQuery) -> Result<LibraryStats, AppError> {
+        let conn = self.conn();
+        let filter = LibraryFilterSql::build(query);
+
+        let (total_items, total_size_bytes, missing_items) = conn.query_row(
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(file_size_bytes), 0),
+                        COALESCE(SUM(is_missing), 0)
+                 FROM downloaded_files {}",
+                filter.where_clause
+            ),
+            rusqlite::params_from_iter(filter.params.iter()),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+
+        let breakdown = |column: &str| -> Result<Vec<LibraryBreakdownEntry>, AppError> {
+            let sql = format!(
+                "SELECT {column}, COUNT(*), COALESCE(SUM(file_size_bytes), 0)
+                 FROM downloaded_files {}
+                 GROUP BY {column} ORDER BY COUNT(*) DESC, {column} ASC",
+                filter.where_clause
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(filter.params.iter()), |row| {
+                Ok(LibraryBreakdownEntry {
+                    key: row.get(0)?,
+                    item_count: row.get(1)?,
+                    total_size_bytes: row.get(2)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(AppError::from)
+        };
+
+        let formats = {
+            // `file_format <> ''` chứ không phải mọi giá trị: một thư mục kết
+            // quả của tác vụ gallery không có định dạng nào, và một ô lọc rỗng
+            // không phải là một lựa chọn người dùng bấm được. Mục đó vẫn nằm
+            // trong thư viện và vẫn được đếm vào tổng — nó chỉ không góp mặt
+            // trong danh sách định dạng.
+            let separator = if filter.where_clause.is_empty() { "WHERE" } else { "AND" };
+            let sql = format!(
+                "SELECT DISTINCT file_format FROM downloaded_files {} {separator} file_format <> ''
+                 ORDER BY file_format ASC",
+                filter.where_clause
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(filter.params.iter()), |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        Ok(LibraryStats {
+            total_items,
+            total_size_bytes,
+            missing_items,
+            by_platform: breakdown("platform")?,
+            by_media_type: breakdown("media_type")?,
+            formats,
+        })
+    }
+
+    pub fn library_item(&self, item_id: &str) -> Result<Option<LibraryItem>, AppError> {
         let conn = self.conn();
         conn.query_row(
-            "SELECT * FROM downloaded_files WHERE job_id = ?1 ORDER BY completed_at DESC LIMIT 1",
-            params![job_id],
-            row_to_downloaded_file,
+            "SELECT * FROM downloaded_files WHERE id = ?1",
+            params![item_id],
+            row_to_library_item,
         )
         .optional()
         .map_err(AppError::from)
+    }
+
+    /// Lấy nhiều mục **theo đúng thứ tự người gọi đưa vào** — FR-330 nói rõ
+    /// danh sách phát phải giữ thứ tự đang hiển thị, mà thứ tự ấy chỉ tồn tại
+    /// ở phía người gọi (nó là thứ tự sắp xếp + lựa chọn hiện hành). Một câu
+    /// `WHERE id IN (...)` trả về theo thứ tự của CSDL, nên việc sắp lại phải
+    /// làm ở đây chứ không phải hy vọng chúng trùng nhau.
+    ///
+    /// Id không còn tồn tại thì bị bỏ qua, không phải lỗi: mục có thể vừa bị
+    /// một thao tác khác dọn đi giữa lúc người dùng đang chọn.
+    pub fn library_items(&self, item_ids: &[String]) -> Result<Vec<LibraryItem>, AppError> {
+        if item_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn();
+        let placeholders = item_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT * FROM downloaded_files WHERE id IN ({placeholders})"
+        ))?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(item_ids.iter()),
+            row_to_library_item,
+        )?;
+        let mut by_id: std::collections::HashMap<String, LibraryItem> = rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|item| (item.id.clone(), item))
+            .collect();
+        Ok(item_ids
+            .iter()
+            .filter_map(|id| by_id.remove(id))
+            .collect())
+    }
+
+    /// FR-302: mọi file mà một tác vụ tạo ra, kể cả khi tách chương sinh ra
+    /// hàng chục file cho đúng một dòng hàng đợi.
+    pub fn library_items_for_job(&self, job_id: &str) -> Result<Vec<LibraryItem>, AppError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM downloaded_files WHERE job_id = ?1 ORDER BY completed_at ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![job_id], row_to_library_item)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(AppError::from)
+    }
+
+    /// Một trang của vòng đối soát (FR-323/FR-327). Chỉ trả về đúng những cột
+    /// mà phép `stat` cần so sánh, để một vòng quét 10.000 mục không kéo theo
+    /// 10.000 bản ghi đầy đủ vào bộ nhớ.
+    pub fn library_reconcile_page(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<LibraryFileState>, AppError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, file_path, is_missing, file_size_bytes FROM downloaded_files
+             ORDER BY rowid ASC LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(params![limit, offset], |row| {
+            Ok(LibraryFileState {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                is_missing: row.get::<_, i64>(2)? != 0,
+                file_size_bytes: row.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(AppError::from)
+    }
+
+    /// Ghi lại kết quả `stat` của một lô và trả về **những id thật sự đổi
+    /// trạng thái thiếu/còn**. Giao diện chỉ cần vẽ lại chừng ấy ô, nên một
+    /// vòng đối soát trên thư viện không đổi gì sẽ không phát sinh lần render
+    /// nào (FR-327).
+    pub fn apply_library_file_states(
+        &self,
+        states: &[LibraryFileState],
+    ) -> Result<Vec<String>, AppError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut changed = Vec::new();
+        for state in states {
+            let updated = tx.execute(
+                "UPDATE downloaded_files SET is_missing = ?1, file_size_bytes = ?2
+                 WHERE id = ?3 AND (is_missing <> ?1 OR file_size_bytes <> ?2)",
+                params![state.is_missing as i64, state.file_size_bytes, state.id],
+            )?;
+            if updated > 0 {
+                changed.push(state.id.clone());
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Trỏ một mục sang đường dẫn khác: đổi tên (FR-317), di chuyển (FR-319)
+    /// và tìm lại file (FR-325) đều là đúng phép này ở tầng dữ liệu.
+    ///
+    /// `is_missing` về 0 vì người gọi vừa xác nhận file có mặt ở đó — đó là
+    /// điều kiện tiên quyết của cả ba thao tác.
+    pub fn set_library_item_path(
+        &self,
+        item_id: &str,
+        new_path: &str,
+        file_size_bytes: i64,
+    ) -> Result<LibraryItem, AppError> {
+        {
+            let conn = self.conn();
+            let title: String = conn
+                .query_row(
+                    "SELECT title FROM downloaded_files WHERE id = ?1",
+                    params![item_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| AppError::not_found("Library item"))?;
+            conn.execute(
+                "UPDATE downloaded_files
+                 SET file_path = ?1, file_format = ?2, file_size_bytes = ?3,
+                     search_text = ?4, is_missing = 0
+                 WHERE id = ?5",
+                params![
+                    new_path,
+                    media_file_extension(new_path),
+                    file_size_bytes,
+                    search_text_for(&title, new_path),
+                    item_id,
+                ],
+            )
+            .map_err(library_write_error)?;
+        }
+        self.library_item(item_id)?
+            .ok_or_else(|| AppError::not_found("Library item"))
+    }
+
+    /// FR-324: gỡ mục khỏi chỉ mục mà KHÔNG đụng tới đĩa. Dùng cho hai việc
+    /// khác nhau về ý định nhưng giống hệt nhau ở tầng này: dọn các mục thiếu,
+    /// và bước ghi sổ sau khi file đã được đưa vào thùng rác (FR-318).
+    pub fn remove_library_items(&self, item_ids: &[String]) -> Result<usize, AppError> {
+        if item_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut removed = 0usize;
+        for id in item_ids {
+            removed += tx.execute("DELETE FROM downloaded_files WHERE id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(removed)
     }
 
     // ---- app_settings (generic key-value — new settings need no migration) --
@@ -942,21 +1354,250 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<DownloadJob> {
     })
 }
 
-fn row_to_downloaded_file(row: &rusqlite::Row) -> rusqlite::Result<DownloadedFile> {
-    Ok(DownloadedFile {
+fn row_to_library_item(row: &rusqlite::Row) -> rusqlite::Result<LibraryItem> {
+    let media_type_raw: String = row.get("media_type")?;
+    Ok(LibraryItem {
         id: row.get("id")?,
-        job_id: row.get("job_id")?,
         file_path: row.get("file_path")?,
+        title: row.get("title")?,
+        // Cùng luật rơi về `Video` như `row_to_job`: một giá trị lạ (hoặc `''`
+        // của một dòng mồ côi chưa nạp được) không được phép làm hỏng cả danh
+        // sách, và "video" là mặc định vô hại nhất cho phần hiển thị.
+        media_type: match media_type_raw.as_str() {
+            "audio" => MediaType::Audio,
+            "gallery" => MediaType::Gallery,
+            _ => MediaType::Video,
+        },
         file_format: row.get("file_format")?,
         file_size_bytes: row.get("file_size_bytes")?,
-        completed_at: row.get("completed_at")?,
+        duration_seconds: row.get("duration_seconds")?,
+        platform: row.get("platform")?,
+        source_url: row.get("source_url")?,
+        thumbnail_path: row.get("thumbnail_path")?,
+        downloaded_at: row.get("completed_at")?,
+        is_missing: row.get::<_, i64>("is_missing")? != 0,
+        job_id: row.get("job_id")?,
     })
+}
+
+/// Một dòng `downloaded_files` ghi TRƯỚC migration 0012, cùng dữ liệu của tác
+/// vụ sinh ra nó — đầu vào của bước làm giàu trong `backfill_library_index`.
+struct StaleIndexRow {
+    id: String,
+    file_path: String,
+    job_title: Option<String>,
+    media_type: String,
+    platform: String,
+    source_url: String,
+}
+
+/// Một tác vụ đã hoàn tất mà chỉ mục chưa có dòng nào cho file của nó.
+struct UnindexedJobRow {
+    job_id: String,
+    file_path: String,
+    job_title: Option<String>,
+    media_type: String,
+    platform: String,
+    source_url: String,
+    updated_at: String,
+}
+
+/// Kết quả một lần nạp lại lịch sử (FR-303) — hai con số cho hai đường vào
+/// khác nhau, để nhật ký khởi động nói được đã vá cái gì thay vì chỉ "xong".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LibraryBackfillReport {
+    /// Dòng đã có sẵn trong `downloaded_files` nhưng thiếu các cột của 0012.
+    pub enriched: usize,
+    /// Tác vụ hoàn tất chưa hề có dòng nào, dựng lại từ `output_file_path`.
+    pub inserted: usize,
+}
+
+/// Trạng thái trên đĩa của một mục, đi qua lại giữa vòng `stat` chạy nền và
+/// CSDL (FR-323).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryFileState {
+    pub id: String,
+    pub file_path: String,
+    pub is_missing: bool,
+    pub file_size_bytes: i64,
+}
+
+/// Mệnh đề `WHERE` cùng tham số của nó, dựng từ [`LibraryQuery`].
+///
+/// Mọi giá trị đều đi qua tham số bind (`?`), kể cả những chỗ trông như hằng —
+/// chuỗi duy nhất được ghép vào câu lệnh là số lượng dấu `?` và tên cột, cả
+/// hai đều do mã này chọn chứ không do người dùng. Từ khoá tìm kiếm chứa `%`
+/// hay `_` vì thế cũng không phá được câu lệnh, chỉ là một `LIKE` rộng hơn
+/// mong đợi (xem `escape_like`).
+struct LibraryFilterSql {
+    where_clause: String,
+    params: Vec<Box<dyn rusqlite::ToSql>>,
+}
+
+impl LibraryFilterSql {
+    fn build(query: &LibraryQuery) -> Self {
+        let mut clauses: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        // FR-307: một từ khoá khớp tiêu đề HOẶC tên file. `search_text` đã
+        // gộp sẵn cả hai và đã hạ hoa theo Unicode lúc ghi, nên ở đây chỉ cần
+        // hạ hoa từ khoá cho cân xứng.
+        if let Some(search) = query.search.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            clauses.push("search_text LIKE ? ESCAPE '\\'".to_string());
+            params.push(Box::new(format!("%{}%", escape_like(&search.to_lowercase()))));
+        }
+
+        // Mỗi bộ lọc là một mệnh đề AND riêng (FR-308); nhiều giá trị trong
+        // cùng một bộ lọc là OR, thể hiện bằng `IN (...)`.
+        if !query.media_types.is_empty() {
+            let placeholders = vec!["?"; query.media_types.len()].join(",");
+            clauses.push(format!("media_type IN ({placeholders})"));
+            for media_type in &query.media_types {
+                params.push(Box::new(media_type_str(media_type).to_string()));
+            }
+        }
+        if !query.platforms.is_empty() {
+            let placeholders = vec!["?"; query.platforms.len()].join(",");
+            clauses.push(format!("platform IN ({placeholders})"));
+            for platform in &query.platforms {
+                params.push(Box::new(platform.clone()));
+            }
+        }
+        if !query.formats.is_empty() {
+            let placeholders = vec!["?"; query.formats.len()].join(",");
+            clauses.push(format!("file_format IN ({placeholders})"));
+            for format in &query.formats {
+                params.push(Box::new(format.clone()));
+            }
+        }
+        if let Some(from) = &query.downloaded_from {
+            clauses.push("completed_at >= ?".to_string());
+            params.push(Box::new(from.clone()));
+        }
+        if let Some(to) = &query.downloaded_to {
+            clauses.push("completed_at <= ?".to_string());
+            params.push(Box::new(to.clone()));
+        }
+        if let Some(is_missing) = query.is_missing {
+            clauses.push("is_missing = ?".to_string());
+            params.push(Box::new(is_missing as i64));
+        }
+
+        let where_clause = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
+        LibraryFilterSql {
+            where_clause,
+            params,
+        }
+    }
+}
+
+/// `%` và `_` trong từ khoá người dùng gõ phải là ký tự thường, không phải ký
+/// tự đại diện — một tiêu đề có thật như `"100% Music"` mà biến thành "khớp
+/// mọi thứ" là một kết quả tìm kiếm sai, chỉ có điều sai theo hướng im lặng.
+fn escape_like(raw: &str) -> String {
+    raw.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// `LIMIT`/`OFFSET` ghép thẳng vào câu lệnh vì cả hai đã là `i64` do serde
+/// phân giải — không có đường nào để một chuỗi tuỳ ý đi tới đây. `OFFSET`
+/// không có nghĩa nếu thiếu `LIMIT`, nên SQLite đòi một `LIMIT` đứng trước và
+/// `-1` là cách chính tắc để nói "không giới hạn".
+fn limit_clause(query: &LibraryQuery) -> String {
+    match (query.limit, query.offset) {
+        (None, None) => String::new(),
+        (limit, offset) => format!(
+            "LIMIT {} OFFSET {}",
+            limit.unwrap_or(-1),
+            offset.unwrap_or(0)
+        ),
+    }
+}
+
+/// Nội dung cột `search_text`: tiêu đề và đường dẫn, hạ hoa bằng bảng Unicode
+/// của Rust. Xem chú thích trong migration 0012 — `LIKE` và `lower()` của
+/// SQLite chỉ biết A-Z, nên nếu không có bước này thì tìm `"đừng"` sẽ không ra
+/// `"ĐỪNG VỀ TRỄ NHA"`, vốn là một tiêu đề có thật trong thư viện người dùng.
+fn search_text_for(title: &str, file_path: &str) -> String {
+    format!("{title}\n{file_path}").to_lowercase()
+}
+
+/// Tiêu đề để hiện cho một mục nạp lại từ lịch sử (FR-303).
+///
+/// 81 trong 105 tác vụ hoàn tất của người dùng KHÔNG có `title` — cột ấy chỉ
+/// tồn tại từ migration 0007. Tên file là câu trả lời đúng cho chúng chứ
+/// không phải chuỗi rỗng hay `"untitled"`: chính yt-dlp đã đặt tên file ấy từ
+/// tiêu đề thật của nguồn, nên nó vẫn là tiêu đề, chỉ đi đường vòng.
+fn display_title(job_title: Option<&str>, file_path: &str) -> String {
+    if let Some(title) = job_title.map(str::trim).filter(|t| !t.is_empty()) {
+        return title.to_string();
+    }
+    let stem = Path::new(file_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("")
+        .trim();
+    if stem.is_empty() {
+        file_path.to_string()
+    } else {
+        stem.to_string()
+    }
+}
+
+/// Định dạng file của một đường dẫn, theo nghĩa mà bộ lọc FR-308 dùng được.
+///
+/// Không phải mọi thứ đứng sau dấu chấm cuối cùng đều là một phần mở rộng.
+/// Một tác vụ gallery nhiều ảnh lưu cả **thư mục** làm đường dẫn kết quả, và
+/// tên thư mục ấy là caption của bài đăng — trong CSDL thật của người dùng có
+/// một thư mục tên `https   vgen.co k1lltheguard46 (28f98824)`, mà
+/// `Path::extension` đọc thành định dạng `co k1lltheguard46 (28f98824)`. Thả
+/// nguyên chuỗi đó vào danh sách định dạng sẽ cho người dùng một ô lọc vô
+/// nghĩa mà chỉ đúng một mục khớp.
+///
+/// Luật: tối đa 5 ký tự và toàn chữ/số — đủ cho mọi định dạng media thật
+/// (`mp3`, `webm`, `flac`, `jpeg`, `opus`), và loại thẳng những chuỗi có
+/// khoảng trắng hay dấu ngoặc. Không nhận ra được thì trả `""`, nghĩa là
+/// "không có định dạng", một câu trả lời đúng cho một thư mục.
+pub(crate) fn media_file_extension(file_path: &str) -> String {
+    Path::new(file_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .filter(|ext| {
+            !ext.is_empty()
+                && ext.chars().count() <= 5
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// Vi phạm chỉ mục duy nhất trên `file_path` nghĩa là đúng một chuyện: đã có
+/// một mục khác trỏ vào đường dẫn đó. FR-322 đòi thất bại rõ ràng thay vì ghi
+/// đè, nên nó được dịch thành mã lỗi riêng chứ không lẫn vào `INTERNAL`.
+fn library_write_error(err: rusqlite::Error) -> AppError {
+    if let rusqlite::Error::SqliteFailure(inner, _) = &err {
+        if inner.code == rusqlite::ErrorCode::ConstraintViolation {
+            return AppError::new(
+                FILE_EXISTS_ERROR_CODE,
+                "Another library item already points at that path",
+            );
+        }
+    }
+    AppError::from(err)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{AudioOutput, CodecPreference, JobStatus, MediaType, VideoContainer};
+    use crate::models::{
+        AudioOutput, CodecPreference, JobStatus, LibrarySort, MediaType, SortDirection,
+        VideoContainer,
+    };
 
     /// Mỗi test dùng một file DB riêng trong thư mục tạm của hệ điều hành để
     /// migration chạy thật (in-memory không kiểm chứng được `to_latest`).
@@ -1053,6 +1694,15 @@ mod tests {
     /// rebuild `download_jobs` bằng DROP + RENAME trong khi
     /// `downloaded_files.job_id` vẫn trỏ vào nó (xem chú thích ở `Db::open`).
     fn raw_conn_at_version(version: usize) -> Connection {
+        raw_conn_at_version_with_path(version).0
+    }
+
+    /// Như trên nhưng trả kèm đường dẫn file, để một test có thể đóng kết nối
+    /// thô rồi mở lại CHÍNH file đó bằng `Db::open` — cách duy nhất kiểm
+    /// chứng được `backfill_library_index`, vốn chỉ chạy trên đường
+    /// `Db::open` và chỉ có việc làm khi trong CSDL đã có sẵn dữ liệu của một
+    /// phiên bản cũ.
+    fn raw_conn_at_version_with_path(version: usize) -> (Connection, std::path::PathBuf) {
         let path =
             std::env::temp_dir().join(format!("media-downloader-test-{}.db", uuid::Uuid::new_v4()));
         let mut conn = Connection::open(&path).expect("db opens");
@@ -1061,7 +1711,7 @@ mod tests {
             .to_version(&mut conn, version)
             .expect("migrates to the requested version");
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        conn
+        (conn, path)
     }
 
     #[test]
@@ -2083,4 +2733,939 @@ mod tests {
         let broken_row = listed.iter().find(|preset| preset.id == broken.id).unwrap();
         assert_eq!(broken_row.output_options, OutputOptions::default());
     }
+
+    // ---- Thư viện (specs/004-library) ---------------------------------
+
+    /// Chèn một dòng vào `downloaded_files` bằng SQL THÔ ở lược đồ *trước*
+    /// 0012, tức đúng sáu cột mà bảng có từ 0001. Không dùng
+    /// `insert_downloaded_file`: nó ghi cả tám cột mới, nên sẽ chẳng còn dòng
+    /// nào "có trước migration" để backfill phải xử lý.
+    fn insert_legacy_file_row(conn: &Connection, id: &str, job_id: &str, file_path: &str) {
+        conn.execute(
+            "INSERT INTO downloaded_files (id, job_id, file_path, file_format, file_size_bytes, completed_at)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                id,
+                job_id,
+                file_path,
+                Path::new(file_path)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or(""),
+                4_221_741i64,
+                "2026-07-25T13:15:29Z",
+            ],
+        )
+        .expect("raw insert works against the pre-0012 schema");
+    }
+
+    /// Chèn một tác vụ hoàn tất bằng SQL thô ở lược đồ trước 0012.
+    fn insert_legacy_completed_job(
+        conn: &Connection,
+        id: &str,
+        title: Option<&str>,
+        media_type: &str,
+        platform: &str,
+        output_file_path: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO download_jobs (
+                id, source_url, platform, media_type, status, progress_percent,
+                output_directory, output_file_path, title, created_at, updated_at
+             ) VALUES (?1,?2,?3,?4,'completed',100.0,'/tmp',?5,?6,
+                       '2026-07-25T13:00:00Z','2026-07-25T13:15:29Z')",
+            params![
+                id,
+                format!("https://example.com/{id}"),
+                platform,
+                media_type,
+                output_file_path,
+                title,
+            ],
+        )
+        .expect("raw insert works against the pre-0012 schema");
+    }
+
+    fn column_names(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>("name"))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn migration_0012_is_registered_and_is_what_adds_the_library_columns() {
+        // Đăng ký migration là bước âm thầm nhất trong cả tính năng: quên dòng
+        // `M::up` thì file .sql vẫn nằm nguyên trong thư mục, `cargo build`
+        // vẫn xanh, và lỗi chỉ lộ ra ở lần chạy thật đầu tiên dưới dạng
+        // "no such column: title".
+        //
+        // Phải kiểm bằng `raw_conn_at_version(11)` chứ không phải `temp_db()`:
+        // chỉ ở phiên bản 11 mới khẳng định được các cột CHƯA có, tức chính
+        // 0012 là thứ tạo ra chúng chứ không phải một migration nào khác.
+        let (mut conn, _path) = raw_conn_at_version_with_path(11);
+        let before = column_names(&conn, "downloaded_files");
+        for column in ["title", "media_type", "platform", "source_url"] {
+            assert!(
+                !before.contains(&column.to_string()),
+                "cột {column} không được tồn tại trước 0012 — nếu có, test này không kiểm chứng gì cả"
+            );
+        }
+
+        migrations().to_latest(&mut conn).expect("0012 applies");
+
+        let after = column_names(&conn, "downloaded_files");
+        for column in [
+            "title",
+            "media_type",
+            "platform",
+            "source_url",
+            "duration_seconds",
+            "thumbnail_path",
+            "is_missing",
+            "search_text",
+        ] {
+            assert!(
+                after.contains(&column.to_string()),
+                "0012 phải được đăng ký trong `migrations()`, không chỉ nằm trong thư mục — thiếu cột {column}"
+            );
+        }
+    }
+
+    #[test]
+    fn backfill_indexes_a_download_made_before_the_library_existed() {
+        // FR-303 + SC-303. Dòng được dựng ở lược đồ v11 bằng SQL thô, nên mọi
+        // giá trị mà test khẳng định bên dưới (tiêu đề, nền tảng, URL, loại
+        // nội dung) KHÔNG hề được ghi vào `downloaded_files` — chúng chỉ tồn
+        // tại trên `download_jobs`, và việc chúng xuất hiện trong thư viện là
+        // toàn bộ công việc của backfill.
+        let (conn, path) = raw_conn_at_version_with_path(11);
+        insert_legacy_completed_job(
+            &conn,
+            "job-legacy",
+            Some("Đừng Về Trễ Nha"),
+            "audio",
+            "soundcloud",
+            Some("/tmp/dung-ve-tre-nha.mp3"),
+        );
+        insert_legacy_file_row(&conn, "file-legacy", "job-legacy", "/tmp/dung-ve-tre-nha.mp3");
+        drop(conn);
+
+        let db = Db::open(&path).expect("migration + backfill run on open");
+        let items = db.list_library(&LibraryQuery::default()).unwrap();
+
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.title, "Đừng Về Trễ Nha");
+        assert_eq!(item.media_type, MediaType::Audio);
+        assert_eq!(item.platform, "soundcloud");
+        assert_eq!(item.source_url, "https://example.com/job-legacy");
+        assert_eq!(item.job_id, "job-legacy");
+        assert_eq!(item.file_path, "/tmp/dung-ve-tre-nha.mp3");
+        assert_eq!(item.file_format, "mp3");
+        assert_eq!(item.file_size_bytes, 4_221_741);
+        // Thời lượng và ảnh đại diện KHÔNG bịa ra được từ lịch sử: cả hai đòi
+        // mở chính file đó, việc mà FR-327 cấm làm lúc khởi động.
+        assert_eq!(item.duration_seconds, None);
+        assert_eq!(item.thumbnail_path, None);
+    }
+
+    #[test]
+    fn backfill_falls_back_to_the_filename_when_the_job_never_had_a_title() {
+        // 81 trong 105 tác vụ hoàn tất của người dùng không có `title` (cột ấy
+        // chỉ tồn tại từ 0007). Bỏ trống ở đó sẽ cho ra một lưới đầy ô không
+        // tên — mà chính yt-dlp đã đặt tên file từ tiêu đề thật của nguồn.
+        let (conn, path) = raw_conn_at_version_with_path(11);
+        insert_legacy_completed_job(&conn, "job-untitled", None, "video", "tiktok", Some("/tmp/a.mp4"));
+        insert_legacy_file_row(
+            &conn,
+            "file-untitled",
+            "job-untitled",
+            "/tmp/BƯỚC QUA MÙA CÔ ĐƠN ⧸ Vũ. (Official MV).mp4",
+        );
+        drop(conn);
+
+        let db = Db::open(&path).expect("migration + backfill run on open");
+        let items = db.list_library(&LibraryQuery::default()).unwrap();
+
+        let backfilled = items
+            .iter()
+            .find(|item| item.job_id == "job-untitled" && item.file_path.contains("BƯỚC QUA"))
+            .expect("dòng cũ vẫn phải có mặt trong thư viện");
+        assert_eq!(backfilled.title, "BƯỚC QUA MÙA CÔ ĐƠN ⧸ Vũ. (Official MV)");
+    }
+
+    #[test]
+    fn backfill_keeps_going_past_a_file_that_no_longer_exists() {
+        // `output_file_path` trỏ vào một file đã bị xoá từ lâu là chuyện bình
+        // thường sau ba tháng. Nó KHÔNG được làm hỏng cả lượt nạp — và mục
+        // vẫn phải vào thư viện (đánh dấu thiếu là việc của vòng đối soát),
+        // vì gỡ nó đi sẽ tước mất của người dùng chính nút "tải lại" của
+        // FR-326.
+        let (conn, path) = raw_conn_at_version_with_path(11);
+        let gone = "/tmp/khong-bao-gio-ton-tai-c0ffee/gone.mp3";
+        assert!(!Path::new(gone).exists(), "test phải thật sự trỏ vào một file không có");
+        insert_legacy_completed_job(&conn, "job-gone", Some("Đã mất"), "audio", "youtube", Some(gone));
+        insert_legacy_file_row(&conn, "file-gone", "job-gone", gone);
+        insert_legacy_completed_job(
+            &conn,
+            "job-here",
+            Some("Còn đây"),
+            "audio",
+            "youtube",
+            Some("/tmp/here.mp3"),
+        );
+        insert_legacy_file_row(&conn, "file-here", "job-here", "/tmp/here.mp3");
+        drop(conn);
+
+        let db = Db::open(&path).expect("một file đã biến mất không được làm hỏng backfill");
+        let items = db.list_library(&LibraryQuery::default()).unwrap();
+
+        assert_eq!(items.len(), 2, "cả hai mục phải được nạp, kể cả mục trỏ vào file đã mất");
+        let missing_one = items.iter().find(|item| item.file_path == gone).unwrap();
+        assert_eq!(missing_one.title, "Đã mất");
+    }
+
+    #[test]
+    fn backfill_rebuilds_an_index_row_for_a_completed_job_that_never_had_one() {
+        // `downloaded_files` chỉ được ghi từ khi tính năng ghi nó tồn tại;
+        // `output_file_path` thì đi cùng tác vụ từ migration đầu tiên. Một
+        // tác vụ hoàn tất mà không có dòng nào trong chỉ mục vẫn phải xuất
+        // hiện trong thư viện (SC-303: 100%).
+        let (conn, path) = raw_conn_at_version_with_path(11);
+        insert_legacy_completed_job(
+            &conn,
+            "job-no-row",
+            Some("Chỉ có trong lịch sử"),
+            "video",
+            "bilibili",
+            Some("/tmp/only-in-history.mp4"),
+        );
+        drop(conn);
+
+        let db = Db::open(&path).expect("migration + backfill run on open");
+        let items = db.list_library(&LibraryQuery::default()).unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Chỉ có trong lịch sử");
+        assert_eq!(items[0].job_id, "job-no-row");
+        assert_eq!(items[0].file_format, "mp4");
+        assert_eq!(items[0].media_type, MediaType::Video);
+    }
+
+    #[test]
+    fn backfill_is_idempotent_across_restarts() {
+        // Backfill chạy ở MỌI lần `Db::open`. Lần thứ hai không được nhân đôi
+        // gì cả, nếu không thì mỗi lần khởi động lại sẽ làm thư viện phình ra.
+        let (conn, path) = raw_conn_at_version_with_path(11);
+        insert_legacy_completed_job(&conn, "job-x", Some("X"), "audio", "youtube", Some("/tmp/x.mp3"));
+        insert_legacy_file_row(&conn, "file-x", "job-x", "/tmp/x.mp3");
+        drop(conn);
+
+        let first = Db::open(&path).unwrap();
+        let after_first = first.list_library(&LibraryQuery::default()).unwrap();
+        drop(first);
+        let second = Db::open(&path).unwrap();
+        let after_second = second.list_library(&LibraryQuery::default()).unwrap();
+
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(after_second, after_first);
+    }
+
+    #[test]
+    fn migration_0012_merges_rows_that_point_at_the_same_file() {
+        // Edge case của spec: tải lại cùng một link ghi đè đúng file cũ trên
+        // đĩa nhưng lại thêm một dòng mới mỗi lần. CSDL thật của người dùng có
+        // 105 dòng cho 66 file. Ba ô giống hệt nhau trong lưới, cùng trỏ vào
+        // một file duy nhất, là một lỗi hiển thị mà không bộ lọc nào chữa
+        // được.
+        let (mut conn, _path) = raw_conn_at_version_with_path(11);
+        insert_legacy_completed_job(&conn, "job-1", Some("Bản cũ"), "audio", "youtube", Some("/tmp/same.mp3"));
+        insert_legacy_completed_job(&conn, "job-2", Some("Bản mới"), "audio", "youtube", Some("/tmp/same.mp3"));
+        conn.execute(
+            "INSERT INTO downloaded_files (id, job_id, file_path, file_format, file_size_bytes, completed_at)
+             VALUES ('old','job-1','/tmp/same.mp3','mp3',100,'2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO downloaded_files (id, job_id, file_path, file_format, file_size_bytes, completed_at)
+             VALUES ('new','job-2','/tmp/same.mp3','mp3',200,'2026-07-20T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        migrations().to_latest(&mut conn).expect("0012 applies");
+
+        let survivors: Vec<String> = conn
+            .prepare("SELECT id FROM downloaded_files")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            survivors,
+            vec!["new".to_string()],
+            "dòng còn lại phải là dòng mới nhất — nó mô tả nội dung đang thật sự nằm trên đĩa"
+        );
+    }
+
+    /// Chèn một mục thư viện qua đúng đường mà ứng dụng dùng, rồi ép
+    /// `completed_at` về một mốc xác định (hàm ghi luôn dùng `now()`, vốn
+    /// không kiểm soát được trong test lọc theo khoảng thời gian).
+    #[allow(clippy::too_many_arguments)]
+    fn add_item(
+        db: &Db,
+        job_id: &str,
+        file_path: &str,
+        title: &str,
+        media_type: MediaType,
+        platform: &str,
+        file_size_bytes: i64,
+        duration_seconds: Option<i64>,
+        completed_at: &str,
+    ) -> String {
+        let job = DownloadJob {
+            media_type: media_type.clone(),
+            platform: platform.to_string(),
+            ..sample_job(job_id)
+        };
+        if db.get_job(job_id).unwrap().is_none() {
+            db.insert_job(&job).unwrap();
+        }
+        db.insert_downloaded_file(&NewLibraryFile {
+            job_id: job_id.to_string(),
+            file_path: file_path.to_string(),
+            file_format: media_file_extension(file_path),
+            file_size_bytes,
+            title: title.to_string(),
+            media_type,
+            platform: platform.to_string(),
+            source_url: format!("https://example.com/{job_id}"),
+            duration_seconds,
+            thumbnail_path: None,
+        })
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE downloaded_files SET completed_at = ?1 WHERE file_path = ?2",
+                params![completed_at, file_path],
+            )
+            .unwrap();
+        db.conn()
+            .query_row(
+                "SELECT id FROM downloaded_files WHERE file_path = ?1",
+                params![file_path],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Một thư viện nhỏ nhưng đủ đa dạng để mọi bộ lọc và mọi tiêu chí sắp
+    /// xếp đều có ít nhất một dòng bị loại và một dòng được giữ.
+    fn library_fixture(db: &Db) {
+        add_item(db, "j1", "/tmp/alpha.mp3", "Alpha Song", MediaType::Audio, "youtube", 300, Some(180), "2026-01-10T00:00:00Z");
+        add_item(db, "j2", "/tmp/beta.mp4", "Beta Video", MediaType::Video, "youtube", 100, Some(60), "2026-03-10T00:00:00Z");
+        add_item(db, "j3", "/tmp/gamma.mp3", "Gamma Track", MediaType::Audio, "soundcloud", 200, None, "2026-05-10T00:00:00Z");
+        add_item(db, "j4", "/tmp/delta.jpg", "Delta Post", MediaType::Gallery, "tiktok", 50, None, "2026-07-10T00:00:00Z");
+    }
+
+    fn titles(items: &[LibraryItem]) -> Vec<&str> {
+        items.iter().map(|item| item.title.as_str()).collect()
+    }
+
+    #[test]
+    fn search_matches_the_title() {
+        let db = temp_db();
+        library_fixture(&db);
+        let found = db
+            .list_library(&LibraryQuery {
+                search: Some("gamma tr".to_string()),
+                ..LibraryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(titles(&found), vec!["Gamma Track"]);
+    }
+
+    #[test]
+    fn search_matches_the_filename_too() {
+        // FR-307 nói rõ "tiêu đề VÀ tên file" — người dùng nhớ tên file mà
+        // không nhớ tiêu đề là một nửa số lần tìm.
+        let db = temp_db();
+        library_fixture(&db);
+        let found = db
+            .list_library(&LibraryQuery {
+                search: Some("delta.jpg".to_string()),
+                ..LibraryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(titles(&found), vec!["Delta Post"]);
+    }
+
+    #[test]
+    fn search_ignores_case_even_for_vietnamese_titles() {
+        // `LIKE` của SQLite chỉ không phân biệt hoa thường với A-Z, và
+        // `lower()` dựng sẵn của nó cũng vậy: `'ĐỪNG' LIKE '%đừng%'` là FALSE.
+        // Với một thư viện mà phần lớn tiêu đề là tiếng Việt, đó là khác biệt
+        // giữa "tìm được" và "không bao giờ tìm được". Đây là lý do tồn tại
+        // của cột `search_text` (hạ hoa bằng Rust) — bỏ nó đi và test này đỏ.
+        let db = temp_db();
+        add_item(db_ref(&db), "j-vi", "/tmp/vi.mp3", "ĐỪNG VỀ TRỄ NHA", MediaType::Audio, "soundcloud", 10, None, "2026-07-01T00:00:00Z");
+
+        let found = db
+            .list_library(&LibraryQuery {
+                search: Some("đừng về".to_string()),
+                ..LibraryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(titles(&found), vec!["ĐỪNG VỀ TRỄ NHA"]);
+
+        let found_upper = db
+            .list_library(&LibraryQuery {
+                search: Some("TRỄ".to_string()),
+                ..LibraryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(titles(&found_upper), vec!["ĐỪNG VỀ TRỄ NHA"]);
+    }
+
+    fn db_ref(db: &Db) -> &Db {
+        db
+    }
+
+    #[test]
+    fn a_percent_sign_in_the_search_term_is_a_literal_not_a_wildcard() {
+        let db = temp_db();
+        library_fixture(&db);
+        add_item(db_ref(&db), "j5", "/tmp/hundred.mp3", "100% Music", MediaType::Audio, "youtube", 10, None, "2026-06-01T00:00:00Z");
+
+        let found = db
+            .list_library(&LibraryQuery {
+                search: Some("100%".to_string()),
+                ..LibraryQuery::default()
+            })
+            .unwrap();
+
+        assert_eq!(
+            titles(&found),
+            vec!["100% Music"],
+            "`%` phải là ký tự thường; nếu là ký tự đại diện thì mọi mục đều khớp"
+        );
+    }
+
+    #[test]
+    fn filters_by_media_type() {
+        let db = temp_db();
+        library_fixture(&db);
+        let found = db
+            .list_library(&LibraryQuery {
+                media_types: vec![MediaType::Audio],
+                sort: LibrarySort::Title,
+                direction: SortDirection::Asc,
+                ..LibraryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(titles(&found), vec!["Alpha Song", "Gamma Track"]);
+    }
+
+    #[test]
+    fn filters_by_platform() {
+        let db = temp_db();
+        library_fixture(&db);
+        let found = db
+            .list_library(&LibraryQuery {
+                platforms: vec!["soundcloud".to_string()],
+                ..LibraryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(titles(&found), vec!["Gamma Track"]);
+    }
+
+    #[test]
+    fn filters_by_format() {
+        let db = temp_db();
+        library_fixture(&db);
+        let found = db
+            .list_library(&LibraryQuery {
+                formats: vec!["mp4".to_string()],
+                ..LibraryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(titles(&found), vec!["Beta Video"]);
+    }
+
+    #[test]
+    fn filters_by_date_range_inclusive_at_both_ends() {
+        let db = temp_db();
+        library_fixture(&db);
+        let found = db
+            .list_library(&LibraryQuery {
+                downloaded_from: Some("2026-03-10T00:00:00Z".to_string()),
+                downloaded_to: Some("2026-05-10T00:00:00Z".to_string()),
+                sort: LibrarySort::DownloadedAt,
+                direction: SortDirection::Asc,
+                ..LibraryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(titles(&found), vec!["Beta Video", "Gamma Track"]);
+    }
+
+    #[test]
+    fn several_filters_combine_with_and_not_or() {
+        // FR-308. Nếu các bộ lọc gộp bằng HOẶC thì câu truy vấn này sẽ trả về
+        // cả bốn mục — nên con số 1 ở đây mới là thứ phân biệt hai hành vi.
+        let db = temp_db();
+        library_fixture(&db);
+        let found = db
+            .list_library(&LibraryQuery {
+                search: Some("a".to_string()),
+                media_types: vec![MediaType::Audio],
+                platforms: vec!["youtube".to_string()],
+                formats: vec!["mp3".to_string()],
+                downloaded_from: Some("2026-01-01T00:00:00Z".to_string()),
+                downloaded_to: Some("2026-02-01T00:00:00Z".to_string()),
+                ..LibraryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(titles(&found), vec!["Alpha Song"]);
+    }
+
+    #[test]
+    fn several_values_inside_one_filter_combine_with_or() {
+        let db = temp_db();
+        library_fixture(&db);
+        let found = db
+            .list_library(&LibraryQuery {
+                platforms: vec!["soundcloud".to_string(), "tiktok".to_string()],
+                sort: LibrarySort::Title,
+                direction: SortDirection::Asc,
+                ..LibraryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(titles(&found), vec!["Delta Post", "Gamma Track"]);
+    }
+
+    #[test]
+    fn sorts_by_every_criterion_in_both_directions() {
+        let db = temp_db();
+        library_fixture(&db);
+        let sorted = |sort, direction| {
+            let items = db
+                .list_library(&LibraryQuery {
+                    sort,
+                    direction,
+                    ..LibraryQuery::default()
+                })
+                .unwrap();
+            items
+                .iter()
+                .map(|item| item.title.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            sorted(LibrarySort::DownloadedAt, SortDirection::Desc),
+            vec!["Delta Post", "Gamma Track", "Beta Video", "Alpha Song"]
+        );
+        assert_eq!(
+            sorted(LibrarySort::DownloadedAt, SortDirection::Asc),
+            vec!["Alpha Song", "Beta Video", "Gamma Track", "Delta Post"]
+        );
+        assert_eq!(
+            sorted(LibrarySort::Title, SortDirection::Asc),
+            vec!["Alpha Song", "Beta Video", "Delta Post", "Gamma Track"]
+        );
+        assert_eq!(
+            sorted(LibrarySort::Title, SortDirection::Desc),
+            vec!["Gamma Track", "Delta Post", "Beta Video", "Alpha Song"]
+        );
+        assert_eq!(
+            sorted(LibrarySort::FileSize, SortDirection::Desc),
+            vec!["Alpha Song", "Gamma Track", "Beta Video", "Delta Post"]
+        );
+        assert_eq!(
+            sorted(LibrarySort::FileSize, SortDirection::Asc),
+            vec!["Delta Post", "Beta Video", "Gamma Track", "Alpha Song"]
+        );
+    }
+
+    #[test]
+    fn items_with_no_known_duration_sort_last_in_both_directions() {
+        // "Không biết" không phải là "ngắn nhất". Mọi mục nạp lại từ lịch sử
+        // cũ đều mang `NULL`, nên nếu chúng dồn lên đầu ở chiều tăng dần thì
+        // toàn bộ 105 mục ngày đầu của người dùng sẽ chặn mất phần thư viện
+        // có thời lượng thật.
+        let db = temp_db();
+        library_fixture(&db);
+        let asc = db
+            .list_library(&LibraryQuery {
+                sort: LibrarySort::Duration,
+                direction: SortDirection::Asc,
+                ..LibraryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(titles(&asc)[..2], ["Beta Video", "Alpha Song"]);
+        assert!(asc[2].duration_seconds.is_none() && asc[3].duration_seconds.is_none());
+
+        let desc = db
+            .list_library(&LibraryQuery {
+                sort: LibrarySort::Duration,
+                direction: SortDirection::Desc,
+                ..LibraryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(titles(&desc)[..2], ["Alpha Song", "Beta Video"]);
+        assert!(desc[2].duration_seconds.is_none() && desc[3].duration_seconds.is_none());
+    }
+
+    #[test]
+    fn paging_returns_disjoint_windows() {
+        let db = temp_db();
+        library_fixture(&db);
+        let page = |offset| {
+            db.list_library(&LibraryQuery {
+                sort: LibrarySort::Title,
+                direction: SortDirection::Asc,
+                limit: Some(2),
+                offset: Some(offset),
+                ..LibraryQuery::default()
+            })
+            .unwrap()
+        };
+        assert_eq!(titles(&page(0)), vec!["Alpha Song", "Beta Video"]);
+        assert_eq!(titles(&page(2)), vec!["Delta Post", "Gamma Track"]);
+    }
+
+    #[test]
+    fn every_sort_option_is_served_by_an_index() {
+        // FR-310 ở quy mô 10.000 mục là một câu hỏi về chỉ mục, không về mã
+        // Rust: thiếu chỉ mục thì mỗi lần mở trang SQLite phải đọc toàn bộ
+        // bảng vào một b-tree tạm rồi mới trả được 60 dòng đầu. `EXPLAIN QUERY
+        // PLAN` là cách duy nhất khẳng định điều đó mà không phải đo thời gian
+        // (một phép đo sẽ chập chờn theo máy chạy test).
+        let db = temp_db();
+        library_fixture(&db);
+        let conn = db.conn();
+        for sort in [
+            LibrarySort::DownloadedAt,
+            LibrarySort::Title,
+            LibrarySort::FileSize,
+            LibrarySort::Duration,
+        ] {
+            for direction in [SortDirection::Asc, SortDirection::Desc] {
+                let sql = format!(
+                    "EXPLAIN QUERY PLAN SELECT * FROM downloaded_files ORDER BY {} LIMIT 60",
+                    sort.order_by(direction)
+                );
+                let plan: Vec<String> = conn
+                    .prepare(&sql)
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, String>("detail"))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                let plan = plan.join(" | ");
+                assert!(
+                    plan.contains("USING INDEX"),
+                    "{sort:?}/{direction:?} phải đọc theo chỉ mục, nhận được: {plan}"
+                );
+                assert!(
+                    !plan.contains("TEMP B-TREE"),
+                    "{sort:?}/{direction:?} không được sắp lại cả bảng trong bộ nhớ, nhận được: {plan}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn filtering_by_media_type_still_reads_through_an_index() {
+        let db = temp_db();
+        library_fixture(&db);
+        let conn = db.conn();
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT * FROM downloaded_files
+                 WHERE media_type IN ('audio') ORDER BY completed_at DESC, rowid ASC LIMIT 60",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>("detail"))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let plan = plan.join(" | ");
+        assert!(plan.contains("USING INDEX"), "nhận được: {plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "nhận được: {plan}");
+    }
+
+    #[test]
+    fn one_job_can_own_several_library_items() {
+        // FR-302: tách chương sinh ra nhiều file cho ĐÚNG MỘT dòng hàng đợi,
+        // và cả ba phải nằm trong thư viện, cùng trỏ về tác vụ gốc.
+        let db = temp_db();
+        add_item(db_ref(&db), "j-ch", "/tmp/full.m4a", "Toàn bộ", MediaType::Audio, "youtube", 900, Some(900), "2026-07-01T00:00:00Z");
+        add_item(db_ref(&db), "j-ch", "/tmp/full - 001 Mở đầu.m4a", "Toàn bộ - 001 Mở đầu", MediaType::Audio, "youtube", 300, Some(300), "2026-07-01T00:00:01Z");
+        add_item(db_ref(&db), "j-ch", "/tmp/full - 002 Kết.m4a", "Toàn bộ - 002 Kết", MediaType::Audio, "youtube", 600, Some(600), "2026-07-01T00:00:02Z");
+
+        let items = db.library_items_for_job("j-ch").unwrap();
+
+        assert_eq!(items.len(), 3);
+        assert!(items.iter().all(|item| item.job_id == "j-ch"));
+    }
+
+    #[test]
+    fn a_repeat_download_updates_the_row_instead_of_adding_a_twin() {
+        let db = temp_db();
+        add_item(db_ref(&db), "j-a", "/tmp/same.mp3", "Lần đầu", MediaType::Audio, "youtube", 100, Some(10), "2026-07-01T00:00:00Z");
+        add_item(db_ref(&db), "j-b", "/tmp/same.mp3", "Lần sau", MediaType::Audio, "youtube", 250, None, "2026-07-02T00:00:00Z");
+
+        let items = db.list_library(&LibraryQuery::default()).unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Lần sau");
+        assert_eq!(items[0].file_size_bytes, 250);
+        assert_eq!(items[0].job_id, "j-b");
+        // Thời lượng đã đo được một lần thì không bị lần ghi sau (đo hụt) xoá đi.
+        assert_eq!(items[0].duration_seconds, Some(10));
+    }
+
+    #[test]
+    fn a_file_that_disappeared_is_marked_missing_and_can_come_back() {
+        // FR-323/SC-304, và cả trường hợp "ổ đĩa ngoài đã tháo": mục bị đánh
+        // dấu thiếu, KHÔNG bị xoá, và tự sáng lại ở vòng đối soát sau.
+        let db = temp_db();
+        let id = add_item(db_ref(&db), "j1", "/tmp/vanished.mp3", "Biến mất", MediaType::Audio, "youtube", 100, None, "2026-07-01T00:00:00Z");
+
+        let page = db.library_reconcile_page(0, 10).unwrap();
+        assert_eq!(page.len(), 1);
+        assert!(!page[0].is_missing);
+
+        let changed = db
+            .apply_library_file_states(&[LibraryFileState {
+                is_missing: true,
+                ..page[0].clone()
+            }])
+            .unwrap();
+        assert_eq!(changed, vec![id.clone()]);
+        assert!(db.library_item(&id).unwrap().unwrap().is_missing);
+
+        // Không đổi gì thì không báo đổi gì — giao diện không phải vẽ lại.
+        let unchanged = db
+            .apply_library_file_states(&[LibraryFileState {
+                is_missing: true,
+                ..page[0].clone()
+            }])
+            .unwrap();
+        assert!(unchanged.is_empty());
+
+        let back = db
+            .apply_library_file_states(&[LibraryFileState {
+                is_missing: false,
+                ..page[0].clone()
+            }])
+            .unwrap();
+        assert_eq!(back, vec![id.clone()]);
+        assert!(!db.library_item(&id).unwrap().unwrap().is_missing);
+    }
+
+    #[test]
+    fn only_missing_items_come_back_when_asked_for_them() {
+        let db = temp_db();
+        library_fixture(&db);
+        let page = db.library_reconcile_page(0, 10).unwrap();
+        let target = page.iter().find(|state| state.file_path == "/tmp/beta.mp4").unwrap();
+        db.apply_library_file_states(&[LibraryFileState {
+            is_missing: true,
+            ..target.clone()
+        }])
+        .unwrap();
+
+        let missing = db
+            .list_library(&LibraryQuery {
+                is_missing: Some(true),
+                ..LibraryQuery::default()
+            })
+            .unwrap();
+
+        assert_eq!(titles(&missing), vec!["Beta Video"]);
+    }
+
+    #[test]
+    fn relinking_points_the_item_at_the_new_path_and_clears_missing() {
+        // FR-325: trỏ lại thay vì phải tải lại. Đường dẫn, định dạng và cả
+        // `search_text` phải theo kịp — nếu không, tìm theo tên file mới sẽ
+        // không ra gì.
+        let db = temp_db();
+        let id = add_item(db_ref(&db), "j1", "/tmp/old.mp3", "Bài hát", MediaType::Audio, "youtube", 100, None, "2026-07-01T00:00:00Z");
+        let state = db.library_reconcile_page(0, 10).unwrap().remove(0);
+        db.apply_library_file_states(&[LibraryFileState { is_missing: true, ..state }])
+            .unwrap();
+
+        let relinked = db
+            .set_library_item_path(&id, "/tmp/moved/new-name.flac", 4242)
+            .unwrap();
+
+        assert_eq!(relinked.file_path, "/tmp/moved/new-name.flac");
+        assert_eq!(relinked.file_format, "flac");
+        assert_eq!(relinked.file_size_bytes, 4242);
+        assert!(!relinked.is_missing);
+        let by_new_name = db
+            .list_library(&LibraryQuery {
+                search: Some("new-name".to_string()),
+                ..LibraryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(by_new_name.len(), 1);
+    }
+
+    #[test]
+    fn the_index_refuses_to_point_two_items_at_one_file() {
+        // FR-322 ở tầng CSDL: kể cả khi một lỗi ở tầng trên bỏ sót phép kiểm
+        // tra trên đĩa, chỉ mục vẫn không thể ghi được trạng thái "hai mục
+        // cùng một file".
+        let db = temp_db();
+        library_fixture(&db);
+        let id = db
+            .list_library(&LibraryQuery {
+                search: Some("alpha".to_string()),
+                ..LibraryQuery::default()
+            })
+            .unwrap()[0]
+            .id
+            .clone();
+
+        let err = db
+            .set_library_item_path(&id, "/tmp/beta.mp4", 10)
+            .unwrap_err();
+
+        assert_eq!(err.code, FILE_EXISTS_ERROR_CODE);
+        let untouched = db.library_item(&id).unwrap().unwrap();
+        assert_eq!(untouched.file_path, "/tmp/alpha.mp3");
+    }
+
+    #[test]
+    fn library_items_come_back_in_the_order_the_caller_asked_for() {
+        // FR-330: thứ tự trong danh sách phát phải khớp thứ tự đang hiển thị,
+        // mà thứ tự ấy chỉ tồn tại ở phía người gọi.
+        let db = temp_db();
+        library_fixture(&db);
+        let by_title = db
+            .list_library(&LibraryQuery {
+                sort: LibrarySort::Title,
+                direction: SortDirection::Asc,
+                ..LibraryQuery::default()
+            })
+            .unwrap();
+        let reversed: Vec<String> = by_title.iter().rev().map(|item| item.id.clone()).collect();
+
+        let fetched = db.library_items(&reversed).unwrap();
+
+        assert_eq!(
+            titles(&fetched),
+            vec!["Gamma Track", "Delta Post", "Beta Video", "Alpha Song"]
+        );
+    }
+
+    #[test]
+    fn library_items_skips_ids_that_no_longer_exist() {
+        let db = temp_db();
+        library_fixture(&db);
+        let existing = db.list_library(&LibraryQuery::default()).unwrap()[0].id.clone();
+
+        let fetched = db
+            .library_items(&[existing.clone(), "khong-ton-tai".to_string()])
+            .unwrap();
+
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].id, existing);
+    }
+
+    #[test]
+    fn stats_match_the_filter_they_were_given() {
+        // SC-307: sai số bằng không so với thứ đang hiển thị.
+        let db = temp_db();
+        library_fixture(&db);
+
+        let all = db.library_stats(&LibraryQuery::default()).unwrap();
+        assert_eq!(all.total_items, 4);
+        assert_eq!(all.total_size_bytes, 650);
+        assert_eq!(all.missing_items, 0);
+        assert_eq!(
+            all.by_platform,
+            vec![
+                LibraryBreakdownEntry { key: "youtube".to_string(), item_count: 2, total_size_bytes: 400 },
+                LibraryBreakdownEntry { key: "soundcloud".to_string(), item_count: 1, total_size_bytes: 200 },
+                LibraryBreakdownEntry { key: "tiktok".to_string(), item_count: 1, total_size_bytes: 50 },
+            ]
+        );
+        assert_eq!(all.formats, vec!["jpg", "mp3", "mp4"]);
+
+        let audio_only = db
+            .library_stats(&LibraryQuery {
+                media_types: vec![MediaType::Audio],
+                ..LibraryQuery::default()
+            })
+            .unwrap();
+        assert_eq!(audio_only.total_items, 2);
+        assert_eq!(audio_only.total_size_bytes, 500);
+        assert_eq!(audio_only.by_media_type.len(), 1);
+    }
+
+    #[test]
+    fn removing_items_touches_only_the_index() {
+        let db = temp_db();
+        library_fixture(&db);
+        let ids: Vec<String> = db
+            .list_library(&LibraryQuery::default())
+            .unwrap()
+            .into_iter()
+            .take(2)
+            .map(|item| item.id)
+            .collect();
+
+        let removed = db.remove_library_items(&ids).unwrap();
+
+        assert_eq!(removed, 2);
+        assert_eq!(db.list_library(&LibraryQuery::default()).unwrap().len(), 2);
+        // Tác vụ gốc vẫn còn: dọn một mục khỏi thư viện không phải là xoá
+        // lịch sử tải.
+        assert!(db.get_job("j1").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_caption_shaped_folder_name_is_not_mistaken_for_a_file_format() {
+        // Đúng một đường dẫn trong CSDL thật của người dùng: tác vụ gallery
+        // nhiều ảnh lưu cả thư mục làm kết quả, và caption của bài đăng có
+        // dấu chấm trong đó. `Path::extension` đọc nó thành một "định dạng"
+        // dài 27 ký tự, và bộ lọc định dạng của FR-308 sẽ chào nó như một
+        // lựa chọn.
+        assert_eq!(
+            media_file_extension("/Users/x/Downloads/https   vgen.co k1lltheguard46 (28f98824)"),
+            ""
+        );
+        assert_eq!(media_file_extension("/tmp/#xuhuong #story #fyp (e21678a4)"), "");
+        // Định dạng thật vẫn phải qua, kể cả khi nguồn viết hoa.
+        assert_eq!(media_file_extension("/tmp/a.MP3"), "mp3");
+        assert_eq!(media_file_extension("/tmp/a.webm"), "webm");
+        assert_eq!(media_file_extension("/tmp/a.jpeg"), "jpeg");
+    }
+
+    #[test]
+    fn the_format_filter_is_not_offered_an_empty_option() {
+        // Mục không có định dạng (thư mục kết quả của gallery) vẫn nằm trong
+        // thư viện và vẫn được đếm vào tổng — nó chỉ không được xuất hiện
+        // như một ô lọc rỗng mà người dùng không hiểu để làm gì.
+        let db = temp_db();
+        library_fixture(&db);
+        add_item(db_ref(&db), "j-dir", "/tmp/#caption (abc123)", "Bài đăng nhiều ảnh", MediaType::Gallery, "tiktok", 128, None, "2026-07-20T00:00:00Z");
+
+        let stats = db.library_stats(&LibraryQuery::default()).unwrap();
+
+        assert_eq!(stats.total_items, 5);
+        assert_eq!(stats.formats, vec!["jpg", "mp3", "mp4"]);
+    }
+
 }
