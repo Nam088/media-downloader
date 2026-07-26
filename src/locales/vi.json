@@ -126,6 +126,7 @@
   },
   "errors": {
     "UNSUPPORTED_PLATFORM": "Liên kết này không thuộc nền tảng được hỗ trợ.",
+    "UNSUPPORTED_ALL_ENGINES": "Không engine nào đọc được link này. Có thể đây không phải trang media, hoặc trang nguồn đã thay đổi.",
     "ACCESS_DENIED": "Nội dung này riêng tư, yêu cầu đăng nhập, hoặc có bảo vệ DRM nên không thể tải.",
     "INVALID_QUALITY_OPTION": "Mức chất lượng đã chọn không còn khả dụng cho liên kết này. Vui lòng xem trước lại.",
     "PREVIEW_REQUIRED": "Vui lòng xem trước liên kết trước khi tải.",

@@ -127,6 +127,7 @@
   },
   "errors": {
     "UNSUPPORTED_PLATFORM": "This link is not from a supported platform.",
+    "UNSUPPORTED_ALL_ENGINES": "No download engine could read this link. It may not be a media page, or the site may have changed.",
     "ACCESS_DENIED": "This content is private, requires login, or is DRM-protected, so it can't be downloaded.",
     "INVALID_QUALITY_OPTION": "The selected quality is no longer available for this link. Please preview it again.",
     "PREVIEW_REQUIRED": "Please preview the link before downloading.",
