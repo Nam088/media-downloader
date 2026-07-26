@@ -5,6 +5,22 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* Indeterminate progress bar (QueueList). A download whose source reports no
+   total size — audio-only formats, HLS — has no percentage at all, so its bar
+   slides instead of filling. Nothing in tw-animate-css loops like this. */
+@theme {
+    --animate-progress-indeterminate: progress-indeterminate 1.4s ease-in-out infinite;
+
+    @keyframes progress-indeterminate {
+        0% {
+            transform: translateX(-100%);
+        }
+        100% {
+            transform: translateX(300%);
+        }
+    }
+}
+
 @theme inline {
     --font-heading: var(--font-sans);
     --font-sans: 'Geist Variable', sans-serif;

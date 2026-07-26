@@ -1,0 +1,27 @@
+-- Sửa dữ liệu cũ của lỗi "thanh tiến độ đứng yên ở 0%".
+--
+-- `downloader::ytdlp::parse_progress` trước đây quy đổi "yt-dlp không báo tổng
+-- dung lượng" thành `0.0` rồi ghi thẳng vào `progress_percent` ở MỌI nhịp tiến
+-- độ. Với luồng chỉ-âm-thanh và HLS thì yt-dlp gần như không bao giờ báo tổng
+-- (đã kiểm chứng trực tiếp: `"total_bytes": null` ở mọi dòng), nên các job đó
+-- chạy xong vẫn nằm nguyên ở 0%. Trong CSDL thật của người dùng: 37 job
+-- `completed` mang `progress_percent = 0`, trong đó 30 là audio.
+--
+-- Phép sửa dưới đây đúng theo nghĩa chứ không phải phỏng đoán: một job đã ở
+-- trạng thái `completed` thì theo định nghĩa là đã tải xong: 100%. Từ nay bất
+-- biến này được `Db::update_job_status` giữ ngay lúc ghi trạng thái
+-- (`COMPLETION_FORCES_FULL_PROGRESS`), nên đây là lần chỉnh dữ liệu cũ duy
+-- nhất cần tới.
+--
+-- CỐ Ý không đụng tới `failed` và `canceled`: một job hỏng hoặc bị huỷ thật sự
+-- đã dừng giữa chừng, nên phần trăm dở dang của nó là thông tin đúng (dữ liệu
+-- thật có 19 dòng failed ở 0%, 4 ở 100%, 2 ở 50% — không có gì để "sửa" ở đó).
+-- Cũng không đụng tới `paused`/`queued`: chúng còn chạy tiếp.
+--
+-- LƯU Ý cho người sửa sau: `rusqlite_migration` theo dõi tiến độ bằng SỐ LƯỢNG
+-- migration, không phải nội dung — xem đầu file 0005 để biết sự cố có thật đã
+-- xảy ra vì một file đã phát hành bị sửa nội dung. File này một khi đã phát
+-- hành thì không được sửa nữa; muốn đổi gì thì thêm file mới. Và thêm file
+-- .sql thôi chưa đủ: phải thêm dòng `M::up(include_str!(...))` tương ứng vào
+-- `migrations()` trong `db/mod.rs`, nếu không nó bị bỏ qua trong im lặng.
+UPDATE download_jobs SET progress_percent = 100 WHERE status = 'completed';

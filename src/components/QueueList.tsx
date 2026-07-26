@@ -6,7 +6,7 @@ import { Progress } from "@/components/ui/progress";
 import { Button } from "@/components/ui/button";
 import { QueueToolbar } from "@/components/QueueToolbar";
 import { ensureQueueListeners, useQueueStore } from "@/stores/queue-store";
-import { formatSpeed } from "@/lib/format";
+import { formatFileSize, formatSpeed } from "@/lib/format";
 import type { DownloadJob } from "@/types/download";
 
 const ACTIVE_STATUSES = new Set(["queued", "fetching_metadata", "downloading", "paused"]);
@@ -109,12 +109,40 @@ function useRetryCountdown(job: DownloadJob): number | null {
   return remaining > 0 ? remaining : null;
 }
 
+/** Progress bar for a job whose percentage is genuinely unknown: yt-dlp
+ * reported no total size, so there is no fraction to fill. A sliding bar says
+ * "working, amount unknown" — which is the truth — where a 0%-wide bar said
+ * "nothing has happened yet" for the whole download.
+ *
+ * Deliberately not `<Progress>`: Radix's progress bar is built to express a
+ * value out of a maximum, and this state has neither. It also carries no
+ * `aria-valuenow`, so assistive tech reads it as indeterminate rather than as
+ * some specific number. */
+function IndeterminateProgress({ label }: { label: string }) {
+  return (
+    <div
+      role="progressbar"
+      aria-label={label}
+      aria-valuetext={label}
+      className="mt-3 h-2 w-full overflow-hidden rounded-full bg-muted"
+    >
+      <div className="h-full w-1/3 rounded-full bg-primary animate-progress-indeterminate" />
+    </div>
+  );
+}
+
 /** One job's row, shared by standalone jobs and playlist-group children.
  * `title` falls back to `source_url` for jobs created before that field
  * existed, or paths where the backend never had a title to begin with. */
 function JobRow({ job }: { job: DownloadJob }) {
   const { t } = useTranslation();
   const retryCountdown = useRetryCountdown(job);
+  // Present only while this job is actually running. `progress_percent: null`
+  // in it means the source never reported a total size (audio-only formats,
+  // HLS) — a state the persisted row cannot express, since its column is
+  // `REAL NOT NULL` and holds the last percentage that *was* known.
+  const live = useQueueStore((state) => state.liveProgress[job.id]);
+  const percentUnknown = live !== undefined && live.progress_percent === null;
   return (
     <div className="rounded-md border border-border/80 bg-card p-3 shadow-2xs transition-all">
       <div className="flex items-center justify-between gap-3">
@@ -132,10 +160,21 @@ function JobRow({ job }: { job: DownloadJob }) {
           <JobControls job={job} />
         </div>
       </div>
-      <Progress value={job.progress_percent} className="mt-3 h-2 rounded-full bg-muted" />
+      {percentUnknown ? (
+        <IndeterminateProgress label={t("queue.progress_unknown")} />
+      ) : (
+        <Progress value={job.progress_percent} className="mt-3 h-2 rounded-full bg-muted" />
+      )}
       <div className="mt-2 flex justify-between text-xs font-mono text-muted-foreground">
         <span>{formatSpeed(job.speed_bytes_per_sec)}</span>
-        <span className="font-semibold text-foreground/80">{Math.round(job.progress_percent)}%</span>
+        {/* With no percentage to show, show what is actually known instead of
+            a "0%" that is simply false — the bytes fetched so far come in the
+            same payload as the missing total. */}
+        <span className="font-semibold text-foreground/80">
+          {percentUnknown
+            ? t("queue.downloaded_so_far", { size: formatFileSize(live.downloaded_bytes) })
+            : `${Math.round(job.progress_percent)}%`}
+        </span>
       </div>
     </div>
   );

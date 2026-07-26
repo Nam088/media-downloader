@@ -155,9 +155,32 @@ export interface CreatePlaylistJobsInput {
 
 export interface JobProgressEvent {
   job_id: string;
-  progress_percent: number;
+  /** `null` means the percentage is **unknown**, not zero: yt-dlp reports no
+   * total size for audio-only formats and HLS, so there is nothing to compute
+   * a percentage from. Treating that as 0% is what pinned the progress bar at
+   * 0% for entire downloads. Render an indeterminate bar plus
+   * `downloaded_bytes`/`speed_bytes_per_sec` instead — those are true. */
+  progress_percent: number | null;
+  /** Bytes fetched so far. Reported by yt-dlp even when the total isn't, and
+   * live-only: `DownloadJob` has no such field because the database has no
+   * column for it. */
+  downloaded_bytes: number | null;
   speed_bytes_per_sec: number | null;
   eta_seconds: number | null;
+}
+
+/** The parts of a `job:progress` event that only make sense for a run that is
+ * currently in flight, kept beside the persisted `DownloadJob` rather than on
+ * it.
+ *
+ * `DownloadJob.progress_percent` mirrors a `REAL NOT NULL` column and is
+ * always a number — the last percentage that was actually known. "We don't
+ * know the percentage *right now*" is a property of the live run, so it lives
+ * here, and disappears when the run does. */
+export interface LiveProgress {
+  /** `null` when the current run has no computable percentage. */
+  progress_percent: number | null;
+  downloaded_bytes: number | null;
 }
 
 export interface JobStatusChangedEvent {

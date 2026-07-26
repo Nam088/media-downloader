@@ -81,6 +81,8 @@
     "clear_finished": "Clear finished",
     "retry_countdown": "Retrying in {{seconds}}s (attempt {{attempt}})",
     "reorder_failed": "Could not reorder the queue.",
+    "progress_unknown": "Progress unknown — this source does not report a total size",
+    "downloaded_so_far": "{{size}} downloaded",
     "status": {
       "queued": "Queued",
       "fetching_metadata": "Fetching info…",

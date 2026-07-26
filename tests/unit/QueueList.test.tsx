@@ -117,7 +117,7 @@ async function dragRow(
 
 describe("QueueList", () => {
   beforeEach(() => {
-    useQueueStore.setState({ jobs: {} });
+    useQueueStore.setState({ jobs: {}, liveProgress: {} });
     vi.mocked(invoke).mockReset();
     vi.mocked(invoke).mockImplementation(() => Promise.resolve(undefined));
   });
@@ -132,6 +132,45 @@ describe("QueueList", () => {
     render(<QueueList />);
     expect(screen.getByText("https://youtube.com/watch?v=abc")).toBeInTheDocument();
     expect(screen.getByText("42%")).toBeInTheDocument();
+  });
+
+  it("shows bytes and speed instead of a false 0% when the percentage is unknown", () => {
+    // The user-visible bug. yt-dlp reports no total size for audio-only
+    // formats and HLS, so there is no percentage to show — but there IS a
+    // byte count and a speed in the very same payload. The row must say
+    // "511.0 KB downloaded · 359.2 KB/s", never "0%".
+    useQueueStore.setState({
+      // The stored row still reads 0 — the column is REAL NOT NULL and no
+      // tick ever carried a percentage to put there. What must not happen is
+      // that number reaching the screen as if it meant "0% done".
+      jobs: { "job-1": makeJob({ progress_percent: 0, speed_bytes_per_sec: 367_853 }) },
+      liveProgress: { "job-1": { progress_percent: null, downloaded_bytes: 523_264 } },
+    });
+    render(<QueueList />);
+
+    expect(screen.queryByText("0%")).not.toBeInTheDocument();
+    expect(screen.getByText("511.0 KB downloaded")).toBeInTheDocument();
+    expect(screen.getByText("359.2 KB/s")).toBeInTheDocument();
+    // ...and the bar itself has to say "unknown" rather than sit at a value.
+    const bar = screen.getByRole("progressbar", { name: /progress unknown/i });
+    expect(bar).not.toHaveAttribute("aria-valuenow");
+  });
+
+  it("shows an ordinary percentage bar as soon as a live tick carries one", () => {
+    // The other half: a job whose source does report a total must keep the
+    // plain determinate bar. A component that rendered the indeterminate
+    // branch unconditionally would pass the test above on its own.
+    useQueueStore.setState({
+      jobs: { "job-1": makeJob({ progress_percent: 42, speed_bytes_per_sec: 1_500_000 }) },
+      liveProgress: { "job-1": { progress_percent: 42, downloaded_bytes: 4_200_000 } },
+    });
+    render(<QueueList />);
+
+    expect(screen.getByText("42%")).toBeInTheDocument();
+    expect(screen.queryByText(/downloaded$/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("progressbar", { name: /progress unknown/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("does not list completed jobs among active downloads", () => {

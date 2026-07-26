@@ -18,8 +18,21 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/0006_gallery_selected_urls.sql")),
         M::up(include_str!("migrations/0007_job_titles.sql")),
         M::up(include_str!("migrations/0008_queue_scheduling.sql")),
+        M::up(include_str!("migrations/0009_backfill_completed_progress.sql")),
     ])
 }
+
+/// SQL fragment shared by every statement in this module that writes
+/// `download_jobs.status`, binding the new status as `?1`.
+///
+/// A row whose status is `completed` must also read 100%: the job is finished
+/// by definition, so a lower stored percentage contradicts its own status.
+/// Keeping this next to the status write — rather than in a separate helper
+/// call sites have to remember — is what makes that invariant structural.
+/// Every other status is left untouched, including `failed`/`canceled`, which
+/// legitimately stop partway.
+const COMPLETION_FORCES_FULL_PROGRESS: &str =
+    "progress_percent = CASE WHEN ?1 = 'completed' THEN 100.0 ELSE progress_percent END";
 
 pub struct Db(Mutex<Connection>);
 
@@ -116,17 +129,31 @@ impl Db {
         .map_err(AppError::from)
     }
 
+    /// `progress_percent = None` means the source reported no total size, so
+    /// there is no percentage to record for this tick (see
+    /// `ytdlp::ProgressUpdate::percent`).
+    ///
+    /// The column stays `REAL NOT NULL` and keeps its **last known** value in
+    /// that case — `COALESCE(?1, progress_percent)` — rather than becoming
+    /// nullable. Making it nullable would mean rebuilding the whole table
+    /// (SQLite can't drop NOT NULL via ALTER) to store a distinction that
+    /// only ever matters while a run is in flight: "unknown" is a property of
+    /// the live tick, and it travels on the `job:progress` event, which is
+    /// what the UI actually renders from. What a *stored* row needs to answer
+    /// is "how far did this get", and the last known value answers that
+    /// better than NULL does — including after a restart, where the event is
+    /// long gone and only the row remains.
     pub fn update_job_progress(
         &self,
         job_id: &str,
-        progress_percent: f64,
+        progress_percent: Option<f64>,
         speed_bytes_per_sec: Option<i64>,
         eta_seconds: Option<i64>,
     ) -> Result<(), AppError> {
         let conn = self.conn();
         conn.execute(
-            "UPDATE download_jobs SET progress_percent = ?1, speed_bytes_per_sec = ?2,
-             eta_seconds = ?3, updated_at = ?4 WHERE id = ?5",
+            "UPDATE download_jobs SET progress_percent = COALESCE(?1, progress_percent),
+             speed_bytes_per_sec = ?2, eta_seconds = ?3, updated_at = ?4 WHERE id = ?5",
             params![
                 progress_percent,
                 speed_bytes_per_sec,
@@ -138,6 +165,20 @@ impl Db {
         Ok(())
     }
 
+    /// Moving a job to `Completed` also forces `progress_percent` to 100.
+    ///
+    /// A completed job is by definition finished, so a stored percentage that
+    /// says otherwise is wrong no matter what the external tool last
+    /// reported — and yt-dlp routinely reports nothing usable at all for
+    /// audio-only streams and HLS, which is how 37 completed jobs in the
+    /// user's own database ended up frozen at 0%.
+    ///
+    /// This lives here, in the statement that writes the status, and not in a
+    /// sibling `complete_job` helper, precisely so status and progress can
+    /// never disagree: there are at least two completion paths (`run_job` for
+    /// yt-dlp, `run_gallery_job` for gallery-dl) and a separate helper would
+    /// be one more thing every future one has to remember. See
+    /// `COMPLETION_FORCES_FULL_PROGRESS`.
     pub fn update_job_status(
         &self,
         job_id: &str,
@@ -146,7 +187,10 @@ impl Db {
     ) -> Result<(), AppError> {
         let conn = self.conn();
         conn.execute(
-            "UPDATE download_jobs SET status = ?1, error_message = ?2, updated_at = ?3 WHERE id = ?4",
+            &format!(
+                "UPDATE download_jobs SET status = ?1, error_message = ?2, updated_at = ?3,
+                 {COMPLETION_FORCES_FULL_PROGRESS} WHERE id = ?4"
+            ),
             params![status.as_str(), error_message, Utc::now().to_rfc3339(), job_id],
         )?;
         Ok(())
@@ -376,8 +420,15 @@ impl Db {
         };
 
         for id in &ids {
+            // `bulk_plan` only ever targets paused/queued/canceled, so the
+            // completion clause is inert here today. It is included anyway so
+            // the invariant belongs to *writing the status* rather than to
+            // one particular function that happens to remember it.
             tx.execute(
-                "UPDATE download_jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                &format!(
+                    "UPDATE download_jobs SET status = ?1, updated_at = ?2,
+                     {COMPLETION_FORCES_FULL_PROGRESS} WHERE id = ?3"
+                ),
                 params![to_status.as_str(), Utc::now().to_rfc3339(), id],
             )?;
         }
@@ -817,6 +868,155 @@ mod tests {
             positions.iter().all(|position| *position > 0.0),
             "không dòng cũ nào được phép giữ mặc định 0, nhận được {positions:?}"
         );
+    }
+
+    /// Chèn một dòng bằng SQL thô ở lược đồ *trước* 0009, với đúng cặp
+    /// (status, progress_percent) mà lỗi cũ để lại. Không dùng `insert_job`:
+    /// nó đi qua `Db`, mà `Db::open` luôn chạy `to_latest`, nên sẽ không còn
+    /// dòng nào "có trước migration" để backfill kiểm chứng.
+    fn insert_raw_job(conn: &Connection, id: &str, status: &str, progress_percent: f64) {
+        conn.execute(
+            "INSERT INTO download_jobs (
+                id, source_url, platform, media_type, status, progress_percent,
+                output_directory, created_at, updated_at
+            ) VALUES (?1,?2,'youtube','audio',?3,?4,'/tmp','2026-07-20T00:00:00Z','2026-07-20T00:00:00Z')",
+            params![id, format!("https://example.com/{id}"), status, progress_percent],
+        )
+        .expect("raw insert works against the pre-0009 schema");
+    }
+
+    fn raw_progress_of(conn: &Connection, id: &str) -> f64 {
+        conn.query_row(
+            "SELECT progress_percent FROM download_jobs WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .expect("job row exists")
+    }
+
+    #[test]
+    fn migration_0009_backfills_completed_jobs_stuck_at_a_wrong_percentage() {
+        // Những dòng này là hình ảnh thu nhỏ của CSDL thật: 37 job `completed`
+        // nằm ở 0% vì `parse_progress` từng quy "không biết tổng dung lượng"
+        // thành 0.0 và ghi đè ở mọi nhịp. Phải dựng chúng ở lược đồ TRƯỚC
+        // 0009 thì mới có thứ cho backfill sửa — nếu tạo qua `Db` thì
+        // `update_job_status` mới đã ép sẵn 100 và test sẽ chỉ kiểm chứng
+        // đúng cái nó vừa tự tay ghi.
+        let mut conn = raw_conn_at_version(8);
+        insert_raw_job(&conn, "audio-stuck-at-zero", "completed", 0.0);
+        insert_raw_job(&conn, "video-stuck-partway", "completed", 43.5);
+        insert_raw_job(&conn, "already-full", "completed", 100.0);
+
+        migrations().to_latest(&mut conn).expect("0009 applies");
+
+        assert_eq!(raw_progress_of(&conn, "audio-stuck-at-zero"), 100.0);
+        assert_eq!(
+            raw_progress_of(&conn, "video-stuck-partway"),
+            100.0,
+            "đã completed thì 43.5% là con số mâu thuẫn với chính trạng thái của nó"
+        );
+        assert_eq!(raw_progress_of(&conn, "already-full"), 100.0);
+    }
+
+    #[test]
+    fn migration_0009_leaves_every_unfinished_or_stopped_job_alone() {
+        // Nửa còn lại của hợp đồng, và là nửa dễ hỏng hơn: một câu UPDATE
+        // thiếu mệnh đề WHERE cũng làm test trên xanh. 3 job `paused` trong
+        // CSDL thật đang ở 0% và phải giữ nguyên 0% — chúng chưa tải xong.
+        // `failed`/`canceled` thì đã dừng thật ở đâu đó, nên phần trăm dở
+        // dang là thông tin đúng chứ không phải rác cần dọn.
+        let mut conn = raw_conn_at_version(8);
+        insert_raw_job(&conn, "paused", "paused", 0.0);
+        insert_raw_job(&conn, "queued", "queued", 0.0);
+        insert_raw_job(&conn, "downloading", "downloading", 12.5);
+        insert_raw_job(&conn, "failed-halfway", "failed", 50.0);
+        insert_raw_job(&conn, "failed-at-zero", "failed", 0.0);
+        insert_raw_job(&conn, "canceled", "canceled", 0.0);
+
+        migrations().to_latest(&mut conn).expect("0009 applies");
+
+        assert_eq!(raw_progress_of(&conn, "paused"), 0.0);
+        assert_eq!(raw_progress_of(&conn, "queued"), 0.0);
+        assert_eq!(raw_progress_of(&conn, "downloading"), 12.5);
+        assert_eq!(raw_progress_of(&conn, "failed-halfway"), 50.0);
+        assert_eq!(raw_progress_of(&conn, "failed-at-zero"), 0.0);
+        assert_eq!(raw_progress_of(&conn, "canceled"), 0.0);
+    }
+
+    #[test]
+    fn completing_a_job_forces_full_progress_even_from_a_lower_value() {
+        // Bất biến cấu trúc: một dòng nói `completed` mà lại nói 12% thì tự
+        // mâu thuẫn. Đặt sẵn 12% qua đường tiến độ bình thường rồi mới hoàn
+        // tất — đúng trình tự mà một job audio thật đi qua khi yt-dlp chỉ báo
+        // được vài nhịp có tổng dung lượng rồi thôi.
+        let db = temp_db();
+        db.insert_job(&sample_job("job-1")).unwrap();
+        db.update_job_progress("job-1", Some(12.0), Some(1_000), Some(5))
+            .unwrap();
+
+        db.update_job_status("job-1", JobStatus::Completed, None)
+            .unwrap();
+
+        assert_eq!(db.get_job("job-1").unwrap().unwrap().progress_percent, 100.0);
+    }
+
+    #[test]
+    fn completing_a_job_that_never_reported_any_progress_still_reads_full() {
+        // Ca thật sự gây ra 37 dòng hỏng: yt-dlp không báo tổng dung lượng lần
+        // nào, nên không có nhịp tiến độ nào ghi được số, và job xong ở 0%.
+        let db = temp_db();
+        db.insert_job(&sample_job("job-1")).unwrap();
+        db.update_job_progress("job-1", None, Some(2_000), None).unwrap();
+
+        db.update_job_status("job-1", JobStatus::Completed, None)
+            .unwrap();
+
+        assert_eq!(db.get_job("job-1").unwrap().unwrap().progress_percent, 100.0);
+    }
+
+    #[test]
+    fn failing_or_canceling_a_job_keeps_the_progress_it_really_reached() {
+        // Mặt còn lại: chỉ `completed` mới được ép 100. Một job hỏng ở 43% đã
+        // thật sự tải được 43%, và ghi đè con số đó là làm mất thông tin —
+        // nhất là khi người dùng đang cân nhắc thử lại.
+        let db = temp_db();
+        for id in ["failed", "canceled", "paused"] {
+            db.insert_job(&sample_job(id)).unwrap();
+            db.update_job_progress(id, Some(43.0), None, None).unwrap();
+        }
+
+        db.update_job_status("failed", JobStatus::Failed, Some("network timeout"))
+            .unwrap();
+        db.update_job_status("canceled", JobStatus::Canceled, None)
+            .unwrap();
+        db.update_job_status("paused", JobStatus::Paused, None).unwrap();
+
+        for id in ["failed", "canceled", "paused"] {
+            assert_eq!(
+                db.get_job(id).unwrap().unwrap().progress_percent,
+                43.0,
+                "{id} phải giữ nguyên phần trăm dở dang có thật của nó"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_percentage_keeps_the_last_known_one_instead_of_resetting_to_zero() {
+        // `None` nghĩa là "nhịp này không biết phần trăm", không phải "0%".
+        // Cột vẫn là REAL NOT NULL nên nó giữ giá trị biết được gần nhất; ghi
+        // 0.0 vào đây sẽ tái tạo đúng lỗi cũ ở tầng dưới. Tốc độ thì ngược
+        // lại: nó là số đo của chính nhịp này nên vẫn được cập nhật.
+        let db = temp_db();
+        db.insert_job(&sample_job("job-1")).unwrap();
+        db.update_job_progress("job-1", Some(37.5), Some(1_000), Some(9))
+            .unwrap();
+
+        db.update_job_progress("job-1", None, Some(2_500), None).unwrap();
+
+        let loaded = db.get_job("job-1").unwrap().unwrap();
+        assert_eq!(loaded.progress_percent, 37.5);
+        assert_eq!(loaded.speed_bytes_per_sec, Some(2_500));
+        assert_eq!(loaded.eta_seconds, None);
     }
 
     #[test]

@@ -25,7 +25,22 @@ pub type YtDlpChild = Arc<Mutex<Child>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct ProgressUpdate {
-    pub percent: f64,
+    /// `None` means the percentage is genuinely **unknown**, not zero: yt-dlp
+    /// reported no usable total size for this stream, which is the normal
+    /// case for audio-only formats and HLS (confirmed live — a chunked
+    /// response with no `Content-Length` makes yt-dlp emit
+    /// `"total_bytes": null` on every single tick).
+    ///
+    /// This used to be a plain `f64` that fell back to `0.0`, which pinned
+    /// the progress bar at 0% for the whole download and left it there after
+    /// the job finished. "Unknown" and "0% done" are different states and the
+    /// UI has to be able to tell them apart, so the distinction lives in the
+    /// type rather than in a sentinel value.
+    pub percent: Option<f64>,
+    /// Always reported by yt-dlp even when the total isn't, so the UI has
+    /// something true to show ("12.3 MB · 1.2 MB/s") in place of a
+    /// percentage it doesn't have.
+    pub downloaded_bytes: Option<i64>,
     pub speed_bytes_per_sec: Option<i64>,
     pub eta_seconds: Option<i64>,
 }
@@ -212,20 +227,40 @@ fn was_killed(status: &std::process::ExitStatus) -> bool {
     !status.success() && status.code() == Some(1)
 }
 
+/// Reads a numeric progress field as a whole number.
+///
+/// `as_i64()` alone is not enough: yt-dlp writes these fields as JSON
+/// *numbers*, but not all of them as integers. `speed` is a float
+/// (`"speed": 248724.07319898077`, verified against the bundled binary), and
+/// `serde_json::Value::as_i64` returns `None` for any number with a
+/// fractional part — so the old `.as_i64()` silently dropped the download
+/// speed on every tick and the queue showed "--" for it forever. Missing
+/// fields and JSON `null` (yt-dlp writes `"eta": null` when there's no total
+/// to compute one from) still come back as `None`, which is the truth.
+fn number_as_i64(value: Option<&serde_json::Value>) -> Option<i64> {
+    value
+        .and_then(|v| v.as_f64())
+        .filter(|number| number.is_finite())
+        .map(|number| number.round() as i64)
+}
+
 fn parse_progress(value: &serde_json::Value) -> ProgressUpdate {
     let downloaded = value.get("downloaded_bytes").and_then(|v| v.as_f64());
     let total = value
         .get("total_bytes")
         .and_then(|v| v.as_f64())
         .or_else(|| value.get("total_bytes_estimate").and_then(|v| v.as_f64()));
+    // No total (or a nonsensical one) means there is no percentage to
+    // compute — say so, rather than claiming 0%.
     let percent = match (downloaded, total) {
-        (Some(d), Some(t)) if t > 0.0 => (d / t) * 100.0,
-        _ => 0.0,
+        (Some(d), Some(t)) if t > 0.0 && d.is_finite() => Some((d / t) * 100.0),
+        _ => None,
     };
     ProgressUpdate {
         percent,
-        speed_bytes_per_sec: value.get("speed").and_then(|v| v.as_i64()),
-        eta_seconds: value.get("eta").and_then(|v| v.as_i64()),
+        downloaded_bytes: number_as_i64(value.get("downloaded_bytes")),
+        speed_bytes_per_sec: number_as_i64(value.get("speed")),
+        eta_seconds: number_as_i64(value.get("eta")),
     }
 }
 
@@ -277,7 +312,8 @@ mod tests {
             "eta": 15,
         });
         let update = parse_progress(&progress);
-        assert!((update.percent - 25.0).abs() < f64::EPSILON);
+        assert_eq!(update.percent, Some(25.0));
+        assert_eq!(update.downloaded_bytes, Some(2_500_000));
         assert_eq!(update.speed_bytes_per_sec, Some(512_000));
         assert_eq!(update.eta_seconds, Some(15));
     }
@@ -289,14 +325,84 @@ mod tests {
             "total_bytes_estimate": 4_000_000,
         });
         let update = parse_progress(&progress);
-        assert!((update.percent - 25.0).abs() < f64::EPSILON);
+        assert_eq!(update.percent, Some(25.0));
     }
 
     #[test]
-    fn missing_fields_default_to_zero_percent_instead_of_panicking() {
+    fn a_missing_zero_or_non_numeric_total_means_unknown_not_zero_percent() {
+        // THE bug this whole change exists for. yt-dlp reports no total size
+        // for audio-only formats and HLS — the payload below is a verbatim
+        // (trimmed) tick from the bundled yt-dlp binary against a chunked
+        // response with no Content-Length. Reporting `0.0` here pinned the
+        // progress bar at 0% for the entire download and left it at 0% after
+        // the job completed; 30 of the user's 42 completed audio jobs are
+        // stored that way.
+        let no_total = json!({
+            "status": "downloading",
+            "downloaded_bytes": 523_264,
+            "total_bytes": serde_json::Value::Null,
+            "eta": serde_json::Value::Null,
+            "speed": 367853.0524615014_f64,
+        });
+        assert_eq!(
+            parse_progress(&no_total).percent,
+            None,
+            "no total size means the percentage is unknown, not 0%"
+        );
+
+        // A zero total would make the division meaningless (0/0, or +inf).
+        let zero_total = json!({"downloaded_bytes": 1_000, "total_bytes": 0});
+        assert_eq!(parse_progress(&zero_total).percent, None);
+
+        // Not a number at all — yt-dlp has changed field shapes before.
+        let junk_total = json!({"downloaded_bytes": 1_000, "total_bytes": "N/A"});
+        assert_eq!(parse_progress(&junk_total).percent, None);
+
+        // ...and the field simply absent.
+        assert_eq!(parse_progress(&json!({"status": "starting"})).percent, None);
+    }
+
+    #[test]
+    fn the_numbers_that_are_known_survive_a_missing_total() {
+        // The point of distinguishing "unknown" from 0%: there is still
+        // something true to show. Both fields come from the same payload as
+        // the missing total, so the UI can render "511.0 KB · 359.2 KB/s"
+        // instead of a percentage that would simply be false.
+        let update = parse_progress(&json!({
+            "status": "downloading",
+            "downloaded_bytes": 523_264,
+            "total_bytes": serde_json::Value::Null,
+            "speed": 367853.0524615014_f64,
+        }));
+        assert_eq!(update.percent, None);
+        assert_eq!(update.downloaded_bytes, Some(523_264));
+        assert_eq!(update.speed_bytes_per_sec, Some(367_853));
+    }
+
+    #[test]
+    fn a_fractional_speed_is_kept_rather_than_dropped() {
+        // Regression test: yt-dlp emits `speed` as a float on every tick
+        // (verified against the bundled binary), and `Value::as_i64` returns
+        // None for any number with a fractional part — so the previous
+        // `.as_i64()` parse dropped the speed on *every* download and the
+        // queue rendered "--" for it, including in the very case where the
+        // percentage is unknown and the speed is the only honest number left.
+        let update = parse_progress(&json!({
+            "downloaded_bytes": 1_024,
+            "speed": 248724.07319898077_f64,
+            "eta": 12,
+        }));
+        assert_eq!(update.speed_bytes_per_sec, Some(248_724));
+        assert_eq!(update.eta_seconds, Some(12));
+    }
+
+    #[test]
+    fn missing_fields_are_reported_as_missing_instead_of_panicking() {
         let update = parse_progress(&json!({"status": "starting"}));
-        assert_eq!(update.percent, 0.0);
+        assert_eq!(update.percent, None);
+        assert_eq!(update.downloaded_bytes, None);
         assert_eq!(update.speed_bytes_per_sec, None);
+        assert_eq!(update.eta_seconds, None);
     }
 
     #[test]
