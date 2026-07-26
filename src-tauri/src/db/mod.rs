@@ -460,6 +460,23 @@ impl Db {
             language: Self::get_setting_or_default(&conn, "language", "system")?,
             default_output_directory: Self::get_setting_or_default(&conn, "default_output_directory", "")?,
             show_logs_tab: Self::get_setting_or_default(&conn, "show_logs_tab", "0")? != "0",
+            // `unwrap_or` ở đây là chủ ý: một giá trị rác trong DB (do người
+            // dùng sửa tay hoặc một lần ghi hỏng) phải rơi về mặc định chứ
+            // không được làm hỏng cả màn hình cài đặt.
+            max_concurrent_downloads: Self::get_setting_or_default(
+                &conn,
+                "max_concurrent_downloads",
+                "3",
+            )?
+            .parse()
+            .unwrap_or(3),
+            rate_limit_kbps: Self::get_setting_or_default(&conn, "rate_limit_kbps", "0")?
+                .parse()
+                .unwrap_or(0),
+            max_retry_attempts: Self::get_setting_or_default(&conn, "max_retry_attempts", "3")?
+                .parse()
+                .unwrap_or(3),
+            run_in_background: Self::get_setting_or_default(&conn, "run_in_background", "0")? == "1",
         })
     }
 
@@ -469,6 +486,22 @@ impl Db {
         Self::set_setting(&conn, "language", &settings.language)?;
         Self::set_setting(&conn, "default_output_directory", &settings.default_output_directory)?;
         Self::set_setting(&conn, "show_logs_tab", if settings.show_logs_tab { "1" } else { "0" })?;
+        Self::set_setting(
+            &conn,
+            "max_concurrent_downloads",
+            &settings.max_concurrent_downloads.to_string(),
+        )?;
+        Self::set_setting(&conn, "rate_limit_kbps", &settings.rate_limit_kbps.to_string())?;
+        Self::set_setting(
+            &conn,
+            "max_retry_attempts",
+            &settings.max_retry_attempts.to_string(),
+        )?;
+        Self::set_setting(
+            &conn,
+            "run_in_background",
+            if settings.run_in_background { "1" } else { "0" },
+        )?;
         Ok(())
     }
 }
@@ -1070,5 +1103,52 @@ mod tests {
             db.get_job("queued").unwrap().unwrap().status,
             JobStatus::Paused
         );
+    }
+
+    #[test]
+    fn new_settings_have_sensible_defaults() {
+        let db = temp_db();
+        let settings = db.get_settings().unwrap();
+
+        assert_eq!(settings.max_concurrent_downloads, 3, "giữ nguyên hành vi cũ");
+        assert_eq!(settings.rate_limit_kbps, 0, "0 nghĩa là không giới hạn");
+        assert_eq!(settings.max_retry_attempts, 3);
+        assert!(!settings.run_in_background, "chạy nền phải mặc định tắt");
+    }
+
+    #[test]
+    fn settings_round_trip_through_the_database() {
+        let db = temp_db();
+        let mut settings = db.get_settings().unwrap();
+        settings.max_concurrent_downloads = 6;
+        settings.rate_limit_kbps = 2048;
+        settings.max_retry_attempts = 0;
+        settings.run_in_background = true;
+        db.update_settings(&settings).unwrap();
+
+        let reloaded = db.get_settings().unwrap();
+        assert_eq!(reloaded.max_concurrent_downloads, 6);
+        assert_eq!(reloaded.rate_limit_kbps, 2048);
+        assert_eq!(reloaded.max_retry_attempts, 0);
+        assert!(reloaded.run_in_background);
+    }
+
+    /// Giá trị rác trong DB (sửa tay, hoặc một lần ghi hỏng) phải rơi về mặc
+    /// định chứ không được làm hỏng cả màn hình cài đặt.
+    #[test]
+    fn garbage_numeric_settings_fall_back_to_defaults() {
+        let db = temp_db();
+        {
+            let conn = db.conn();
+            Db::set_setting(&conn, "max_concurrent_downloads", "not-a-number").unwrap();
+            Db::set_setting(&conn, "rate_limit_kbps", "-1").unwrap();
+            Db::set_setting(&conn, "max_retry_attempts", "").unwrap();
+        }
+
+        let settings = db.get_settings().unwrap();
+
+        assert_eq!(settings.max_concurrent_downloads, 3);
+        assert_eq!(settings.rate_limit_kbps, 0);
+        assert_eq!(settings.max_retry_attempts, 3);
     }
 }

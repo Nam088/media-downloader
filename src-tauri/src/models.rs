@@ -236,4 +236,15 @@ pub struct AppSettings {
     /// decisions) is a debugging aid, not something most users need to see
     /// day to day.
     pub show_logs_tab: bool,
+    /// Số tác vụ được chạy đồng thời (FR-112). Bộ điều phối đọc lại giá trị
+    /// này mỗi vòng nên đổi lúc đang chạy có hiệu lực ngay.
+    pub max_concurrent_downloads: u32,
+    /// Giới hạn tốc độ cho **mỗi** tiến trình tải, tính bằng KB/s. 0 = không
+    /// giới hạn. Là giới hạn theo tiến trình chứ không phải tổng băng thông —
+    /// giao diện phải nói rõ điều này (xem phần Assumptions của spec).
+    pub rate_limit_kbps: u32,
+    /// Số lần tự thử lại tối đa cho lỗi tạm thời. 0 = tắt hẳn tự thử lại.
+    pub max_retry_attempts: u32,
+    /// Đóng cửa sổ thì thu về khay hệ thống thay vì thoát (FR-127).
+    pub run_in_background: bool,
 }
