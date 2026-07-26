@@ -106,6 +106,15 @@ jobs:
             patchelf \
             build-essential \
             file
+          # AppImage bundling runs linuxdeploy, which is itself an AppImage,
+          # and a type-2 AppImage mounts itself through FUSE 2. ubuntu-latest
+          # is now 24.04, which ships only libfuse3 — so linuxdeploy failed to
+          # execute at all and Tauri reported a bare `failed to run
+          # linuxdeploy` with no output from the tool, because there was none.
+          # 24.04 renamed the package during the 64-bit time_t transition, and
+          # that rename is exactly the kind of thing that breaks again on the
+          # next LTS, hence the fallback.
+          sudo apt-get install -y libfuse2t64 || sudo apt-get install -y libfuse2
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -230,6 +239,15 @@ jobs:
           fi
 
       - name: Build installer
+        # Belt and braces with libfuse2 above, deliberately: the package name
+        # already changed once across Ubuntu releases, while this variable is
+        # honoured by the AppImage runtime itself and so does not depend on any
+        # distro packaging at all. One failed AppImage bundle costs a ~20
+        # minute round trip to discover, which is worth more than the tidiness
+        # of picking only one of the two. No effect on Windows/macOS, which
+        # never build an AppImage.
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
         run: pnpm tauri build --target ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
