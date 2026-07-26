@@ -20,6 +20,13 @@ pub struct AppError {
 /// test nào bắt được.
 pub const NETWORK_ERROR_CODE: &str = "NETWORK_ERROR";
 
+/// Mã lỗi cho "người dùng chủ động dừng". Không phải một thất bại: khi
+/// `run_job` trả về mã này, `pause`/`cancel` đã đặt trạng thái cuối cùng rồi,
+/// nên bộ điều phối phải bỏ qua kết quả thay vì đánh dấu thất bại hay thử lại.
+/// Khai báo một lần ở đây vì nó đi qua cả nơi sinh ra (mọi nhánh huỷ trong
+/// `queue`) lẫn nơi đọc (`retry::decide_outcome`).
+pub const CANCELED_ERROR_CODE: &str = "CANCELED";
+
 impl AppError {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {

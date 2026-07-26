@@ -11,7 +11,7 @@
 -- không có tranh chấp đó (FR-117, FR-119).
 --
 -- Khe hở giữa hai vị trí bị chia đôi mỗi lần chèn vào cùng một chỗ; khi nó nhỏ
--- hơn ngưỡng an toàn, `renormalize_queue_positions` đánh số lại 1.0, 2.0, 3.0…
+-- hơn ngưỡng an toàn, `renormalize_positions_within` đánh số lại 1.0, 2.0, 3.0…
 -- Xem `db::position_between` và `db::needs_renormalize`.
 --
 -- `retry_count` / `next_retry_at`: một job đang chờ thử lại là job có

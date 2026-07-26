@@ -184,6 +184,9 @@ fn new_job(args: NewJobArgs) -> DownloadJob {
         updated_at: now,
         title: args.title,
         playlist_title: args.playlist_title,
+        // Chỗ giữ chỗ: `DownloadQueue::enqueue` ghi đè bằng vị trí cuối hàng
+        // đợi thật sự (`next_queue_position`). Để nguyên 0.0 ở đây thì mọi job
+        // mới đều hoà nhau và đứng trước toàn bộ hàng đợi hiện có.
         queue_position: 0.0,
         retry_count: 0,
         next_retry_at: None,
@@ -222,7 +225,7 @@ pub async fn create_download_job(
             let platform = detect_platform(&entry_url)
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| preview.platform.clone());
-            let job = new_job(NewJobArgs {
+            let mut job = new_job(NewJobArgs {
                 source_url: entry_url,
                 platform,
                 media_type: input.media_type,
@@ -247,7 +250,7 @@ pub async fn create_download_job(
                 title: None,
                 playlist_title: Some(preview.title.clone()),
             });
-            queue.enqueue(job.clone()).await?;
+            queue.enqueue(&mut job).await?;
             jobs.push(job);
         }
         return Ok(jobs);
@@ -259,7 +262,7 @@ pub async fn create_download_job(
     // the restrictive `detect_platform` would wrongly reject every link
     // outside that shortlist even though the preview above just proved
     // yt-dlp can handle it.
-    let job = new_job(NewJobArgs {
+    let mut job = new_job(NewJobArgs {
         source_url: input.source_url,
         platform: preview.platform.clone(),
         media_type: input.media_type,
@@ -273,7 +276,7 @@ pub async fn create_download_job(
         title: input.title,
         playlist_title: None,
     });
-    queue.enqueue(job.clone()).await?;
+    queue.enqueue(&mut job).await?;
     Ok(vec![job])
 }
 
@@ -328,7 +331,7 @@ pub async fn create_playlist_download_jobs(
         let platform = detect_platform(&item.source_url)
             .map(|p| p.to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        let job = new_job(NewJobArgs {
+        let mut job = new_job(NewJobArgs {
             source_url: item.source_url,
             platform,
             media_type: item.media_type,
@@ -342,7 +345,7 @@ pub async fn create_playlist_download_jobs(
             title: item.title,
             playlist_title: input.playlist_title.clone(),
         });
-        queue.enqueue(job.clone()).await?;
+        queue.enqueue(&mut job).await?;
         jobs.push(job);
     }
     Ok(jobs)
