@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { useTranslation } from "react-i18next";
 import { ChevronDown, ChevronRight, Pause, Play, X, RotateCcw } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
@@ -134,14 +135,18 @@ function PlaylistGroup({
 
 export function QueueList() {
   const { t } = useTranslation();
-  const jobs = useQueueStore((state) => state.jobs);
+  // Display order comes from the store so that it always equals run order.
+  // `useShallow` is load-bearing: `orderedJobs()` builds a fresh array on every
+  // call, and an unwrapped selector would hand `useSyncExternalStore` a new
+  // reference each time and re-render forever.
+  const allJobs = useQueueStore(useShallow((state) => state.orderedJobs()));
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     ensureQueueListeners();
+    // The queue outlives the window: reload whatever the database still holds.
+    void useQueueStore.getState().hydrate();
   }, []);
-
-  const allJobs = Object.values(jobs);
 
   const groupsMap = new Map<string, DownloadJob[]>();
   for (const job of allJobs) {
