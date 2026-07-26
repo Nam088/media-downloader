@@ -102,7 +102,7 @@
     "download_video_button": "Tải video",
     "download_gallery_button": "Tải xuống",
     "added_to_queue": "Đã thêm vào hàng đợi tải",
-    "gallery_item_count": "Tìm thấy {{count}} tệp",
+    "gallery_item_count_other": "Tìm thấy {{count}} tệp",
     "gallery_selected_count": "Đã chọn {{selected}}/{{total}} ảnh",
     "gallery_select_all": "Chọn tất cả",
     "gallery_select_none": "Bỏ chọn hết",
