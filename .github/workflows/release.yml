@@ -15,9 +15,21 @@ name: Release
 # run. gallery-dl additionally has no official standalone build for macOS at
 # all, so its onedir build is compiled ourselves in CI for every platform
 # (scripts/build-gallery-dl-onedir.sh) rather than downloaded.
+# `main` and `develop` build on every push so a broken build is caught on the
+# branch that caused it. Any other branch can still be built on demand from the
+# Actions tab — `workflow_dispatch` lets you pick the ref — but is not built
+# automatically, because a matrix of three OS runners per push on every feature
+# branch costs far more than it catches.
+#
+# Publishing is a separate job and happens only for a `v*` tag whose commit is
+# on `main`. The tag alone is not enough: a tag can point at any commit on any
+# branch, so the release job verifies ancestry rather than trusting the name.
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
+      - develop
     tags:
       - "v*"
 
@@ -81,6 +93,13 @@ jobs:
         shell: bash
         run: bash scripts/build-gallery-dl-onedir.sh
 
+      # spotiflac-worker is always self-built: it is this project's own thin
+      # protocol wrapper (scripts/spotiflac_worker.py) around the SpotiFLAC
+      # pip module — see scripts/build-spotiflac-onedir.sh.
+      - name: Build spotiflac-worker onedir resource (${{ matrix.platform }})
+        shell: bash
+        run: bash scripts/build-spotiflac-onedir.sh
+
       # ---- ffmpeg sidecar ---------------------------------------------
       # Linux/Windows: BtbN/FFmpeg-Builds "gpl" static builds — no shared
       # library dependencies, safe to redistribute inside the installer.
@@ -126,3 +145,43 @@ jobs:
           name: media-downloader-${{ matrix.target }}
           path: |
             src-tauri/target/${{ matrix.target }}/release/bundle/**
+
+  # Publishing is deliberately a second job rather than a step in the matrix:
+  # a release must contain all three platforms or none, and a step inside the
+  # matrix would publish whichever runner finished first, then race the others
+  # into the same release.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the ancestry check below needs `main` and the tagged
+          # commit in the same clone, and the default shallow fetch has neither.
+          fetch-depth: 0
+
+      # A tag can be created on any commit on any branch, so "only main can
+      # release" cannot be expressed in the `on:` trigger — it has to be
+      # checked. Ancestry rather than equality, so a tag placed a few commits
+      # back on main still counts.
+      - name: Refuse to publish a tag that is not on main
+        run: |
+          git fetch origin main --depth=0
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag $GITHUB_REF_NAME points at a commit that is not on main. Merge to main first, then tag."
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish the installers
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
