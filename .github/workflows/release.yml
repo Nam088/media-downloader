@@ -79,6 +79,34 @@ jobs:
           node-version: 22
       - run: corepack enable
 
+      # macOS and Windows ship a system webview, so Tauri needs nothing extra
+      # there. Linux does not: without these the build dies in glib-sys's build
+      # script with "The system library `glib-2.0` ... was not found", long
+      # before any of this project's own code is compiled.
+      #
+      # libayatana-appindicator3-dev is required specifically because
+      # Cargo.toml enables tauri's `tray-icon` feature — the system tray added
+      # for FR-127's background mode. Drop the tray and this one becomes
+      # unnecessary; keep the tray and omitting it fails the link, not the
+      # configure step, which is a much more confusing error.
+      #
+      # webkit2gtk 4.1 (not 4.0) is the Tauri v2 line, and is what
+      # ubuntu-latest carries.
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            build-essential \
+            file
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
