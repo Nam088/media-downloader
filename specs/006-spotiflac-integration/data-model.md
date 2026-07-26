@@ -24,10 +24,10 @@ JobStatus = Queued | FetchingMetadata | Downloading | WaitingInput | Paused
 Downloading ──(cloudflare_challenge)──▶ WaitingInput
 WaitingInput ──(submit_cloudflare_grant OK)──▶ Downloading
 WaitingInput ──(cancel)──▶ Canceled
-WaitingInput ──(challenge timeout / grant sai quá N lần)──▶ Failed
+WaitingInput ──(timeout 15 phút / grant sai quá 3 lần)──▶ Failed
 ```
 
-- Job đang `WaitingInput` chiếm 1 slot concurrency (worker process còn sống chờ stdin). `reset_interrupted_jobs` khi khởi động app coi `waiting_input` như `downloading` → reset về `queued`.
+- Job đang `WaitingInput` chiếm 1 slot concurrency (worker process còn sống chờ stdin). Để tránh treo slot vô thời hạn: **timeout tuyệt đối 15 phút** kể từ khi vào `WaitingInput` mà không nhận grant hợp lệ → Rust kill worker, job `Failed` với code `SPOTIFLAC_CHALLENGE_TIMEOUT` (nhả slot; người dùng Retry thủ công được). `reset_interrupted_jobs` khi khởi động app coi `waiting_input` như `downloading` → reset về `queued`.
 - DB: nằm trong cùng rebuild của migration 0013 (CHECK constraint status).
 
 ## 3. Entity: SpotiFLAC Download Job (tái dùng `DownloadJob`)
@@ -82,7 +82,7 @@ Nằm trong `RunningJob` (queue state) khi job `media_type=music`:
 CloudflareChallenge {
   job_id: String,
   challenge_url: String,     // từ worker event cloudflare_challenge
-  requested_at: Instant,
+  requested_at: Instant,     // mốc tính timeout tuyệt đối 15 phút (§2)
   attempts: u8,              // số lần nhập grant sai, giới hạn 3
 }
 ```

@@ -34,6 +34,15 @@ export interface LibraryItem {
    * chắc đã mất hẳn — một ổ đĩa ngoài đã tháo cũng cho ra `true`. */
   is_missing: boolean;
   job_id: string;
+  /** Nguồn phát **thật sự đã giao file** khi engine SpotiFLAC tải một mục
+   * `media_type = "music"`: `"tidal" | "qobuz" | "deezer" | "amazon"` hoặc
+   * `"ext:<tên extension>"`. `null` cho mọi file của engine khác.
+   *
+   * Optional vì cột `downloaded_files.source_provider` đã có trong CSDL nhưng
+   * struct Rust `models::LibraryItem` CHƯA expose trường này — cho tới khi
+   * backend thêm nó vào `LibraryItem` + `row_to_library_item`, mọi payload đều
+   * vắng field và giao diện phải coi đó là "không có badge", không được crash. */
+  source_provider?: string | null;
 }
 
 /** FR-309. */

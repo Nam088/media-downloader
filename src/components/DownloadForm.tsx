@@ -48,9 +48,17 @@ import type {
   GalleryMode,
   MediaSource,
   MediaType,
+  MusicQualityTier,
   OutputOptions,
   VideoQualityOption,
 } from "@/types/download";
+
+/** A SpotiFLAC-backed preview: the tier list is the whole signal (see
+ * `MediaSource.available_music_tiers`), the same way `is_gallery` marks a
+ * gallery-dl result. */
+function isMusicSource(source: MediaSource): boolean {
+  return (source.available_music_tiers?.length ?? 0) > 0;
+}
 
 /** One row in the quality picker — mirrors the reference layout: radio +
  * bold quality label + codec detail + right-aligned estimated size. Options
@@ -115,6 +123,54 @@ function QualityOptionsList({
             <span className="flex-1 text-xs text-muted-foreground">{row.detail}</span>
             <span className="shrink-0 text-xs font-mono font-medium text-muted-foreground">
               {row.size}
+            </span>
+          </label>
+        ))}
+      </RadioGroup>
+    </div>
+  );
+}
+
+/** Shown instead of `QualityOptionsList` when the preview is a SpotiFLAC
+ * music source: the three lossless-music tiers replace the bitrate/resolution
+ * lists, since a music job has no yt-dlp format list to pick from. Rows come
+ * from the preview's own `available_music_tiers` — never a list invented
+ * here (the labels are fixed, the *availability* is the source's call). */
+function MusicTierPicker({
+  tiers,
+  value,
+  onChange,
+}: {
+  tiers: MusicQualityTier[];
+  value: MusicQualityTier | undefined;
+  onChange: (value: MusicQualityTier) => void;
+}) {
+  const { t } = useTranslation();
+
+  return (
+    <div className="flex flex-col gap-2">
+      <Label className="text-xs font-semibold tracking-tight text-foreground/80">
+        {t("downloadForm.musicTier.label")}
+      </Label>
+      <RadioGroup
+        value={value}
+        onValueChange={(v) => onChange(v as MusicQualityTier)}
+        className="gap-1.5"
+      >
+        {tiers.map((tier) => (
+          <label
+            key={tier}
+            htmlFor={`music-tier-${tier}`}
+            className={`flex cursor-pointer items-center gap-3 rounded-md border border-border/80 bg-card px-3.5 py-2.5 text-sm shadow-2xs transition-all hover:border-primary/40 hover:bg-accent/40 ${
+              value === tier ? "border-primary bg-primary/5 ring-1 ring-primary/30" : ""
+            }`}
+          >
+            <RadioGroupItem value={tier} id={`music-tier-${tier}`} />
+            <span className="w-40 shrink-0 font-semibold text-foreground">
+              {t(`downloadForm.musicTier.${tier}`)}
+            </span>
+            <span className="flex-1 text-xs text-muted-foreground">
+              {t(`downloadForm.musicTier.${tier}Hint`)}
             </span>
           </label>
         ))}
@@ -202,6 +258,7 @@ export function DownloadForm() {
   const [audioQuality, setAudioQuality] = useState<string | undefined>(undefined);
   const [videoQuality, setVideoQuality] = useState<string | undefined>(undefined);
   const [galleryMode, setGalleryMode] = useState<GalleryMode>("files");
+  const [musicTier, setMusicTier] = useState<MusicQualityTier | undefined>(undefined);
   // Indices into `preview.gallery_items` (not URLs — TikTok's per-item CDN
   // URLs are short-lived and signed per-request, so the backend correlates
   // a selection against a fresh re-crawl by ordinal position instead; see
@@ -281,6 +338,7 @@ export function DownloadForm() {
     setPreview(null);
     setAudioQuality(undefined);
     setVideoQuality(undefined);
+    setMusicTier(undefined);
     try {
       const result = await invoke<MediaSource>("preview_media", { sourceUrl: url });
       setPreview(result);
@@ -297,10 +355,17 @@ export function DownloadForm() {
             }, []),
           ),
         );
+      } else if (isMusicSource(result)) {
+        setMediaType("music");
+        // The persisted default tier (Settings), unless this source doesn't
+        // offer it; "flac16" is the contract-wide fallback either way.
+        const tiers = result.available_music_tiers ?? [];
+        const preferred = settings?.spotiflac_quality;
+        setMusicTier(preferred && tiers.includes(preferred) ? preferred : "flac16");
       } else {
-        // Leftover "gallery" selection from a previous preview on this same
-        // form wouldn't make sense against a regular video/audio result.
-        setMediaType((prev) => (prev === "gallery" ? "video" : prev));
+        // Leftover "gallery"/"music" selection from a previous preview on this
+        // same form wouldn't make sense against a regular video/audio result.
+        setMediaType((prev) => (prev === "gallery" || prev === "music" ? "video" : prev));
         if (result.available_audio_formats.length > 0) {
           setAudioQuality(audioQualityValue(result.available_audio_formats[0].bitrate_kbps));
         }
@@ -343,13 +408,15 @@ export function DownloadForm() {
     setPreview(null);
     setAudioQuality(undefined);
     setVideoQuality(undefined);
+    setMusicTier(undefined);
     batch.reset();
   }
 
   async function submitSingleJob(scope?: "single_item" | "entire_playlist") {
     if (!preview || !effectiveOutputDirectory) return;
     if (mediaType !== "gallery") {
-      const quality = mediaType === "audio" ? audioQuality : videoQuality;
+      const quality =
+        mediaType === "audio" ? audioQuality : mediaType === "music" ? musicTier : videoQuality;
       if (!preview.is_playlist && !quality) return;
     }
 
@@ -365,6 +432,7 @@ export function DownloadForm() {
         galleryMode,
         selectedGalleryIndices: Array.from(selectedGalleryIndices),
         playlistScope: scope,
+        musicTier,
         outputOptions,
       });
       const createdJobs = await invoke<DownloadJob[]>("create_download_job", { input });
@@ -416,7 +484,8 @@ export function DownloadForm() {
     mediaType === "audio"
       ? (preview?.available_audio_formats.length ?? 0) > 0
       : (preview?.available_video_qualities.length ?? 0) > 0;
-  const selectedQuality = mediaType === "audio" ? audioQuality : videoQuality;
+  const selectedQuality =
+    mediaType === "audio" ? audioQuality : mediaType === "music" ? musicTier : videoQuality;
   // Files/ImagesOnly/Slideshow all need at least one selected image;
   // AudioOnly ignores the image selection entirely (it discards images
   // regardless), so it's the one gallery mode that's fine with zero picked.
@@ -609,6 +678,17 @@ export function DownloadForm() {
                   onChange={setGalleryMode}
                 />
               </div>
+            ) : isMusicSource(preview) ? (
+              // A music source has exactly one choice to make — the quality
+              // tier. No video/audio toggle, no format lists: none of those
+              // exist for the SpotiFLAC engine.
+              <div className="flex flex-col gap-6 px-6 pt-2 pb-2">
+                <MusicTierPicker
+                  tiers={preview.available_music_tiers ?? []}
+                  value={musicTier}
+                  onChange={setMusicTier}
+                />
+              </div>
             ) : (
               <div className="flex flex-col gap-6 px-6 pt-2 pb-2">
                 {/* Modern Separate Pill Toggle Buttons with Generous Spacing & Animations */}
@@ -673,9 +753,11 @@ export function DownloadForm() {
             {/* FR-201→FR-211. Rendered for gallery previews too: the picker
                 itself decides that none of it applies there (FR-234), so the
                 rule lives with the component rather than being re-derived by
-                every caller. Skipped only for the inline playlist panel,
-                which submits through its own per-item path. */}
-            {!(preview.is_playlist && preview.playlist_entries.length > 0) && (
+                every caller. Skipped for the inline playlist panel, which
+                submits through its own per-item path — and for music sources,
+                whose engine reads none of these options (the backend rejects
+                them outright for a music job). */}
+            {!isMusicSource(preview) && !(preview.is_playlist && preview.playlist_entries.length > 0) && (
               <div className="px-6 pt-3 pb-1">
                 <OutputOptionsPicker
                   mediaType={mediaType}
@@ -757,11 +839,13 @@ export function DownloadForm() {
                   <>
                     <Download className="h-4.5 w-4.5" />
                     <span>
+                      {/* Music shares the audio label: the output is an audio
+                          file either way. */}
                       {mediaType === "gallery"
                         ? t("downloadForm.download_gallery_button")
-                        : mediaType === "audio"
-                          ? t("downloadForm.download_audio_button")
-                          : t("downloadForm.download_video_button")}
+                        : mediaType === "video"
+                          ? t("downloadForm.download_video_button")
+                          : t("downloadForm.download_audio_button")}
                     </span>
                   </>
                 )}

@@ -2,6 +2,7 @@ pub mod download;
 pub mod history;
 pub mod library;
 pub mod media;
+pub mod music;
 pub mod presets;
 pub mod queue_control;
 pub mod settings;

@@ -1,15 +1,24 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { ChevronDown, ChevronUp, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { useAppSettings } from "@/hooks/use-app-settings";
-import type { AppError } from "@/types/download";
+import { formatPlatformLabel } from "@/lib/format";
+import { MUSIC_QUALITY_TIERS, type AppError, type MusicQualityTier } from "@/types/download";
 import type { AppSettings } from "@/types/settings";
 
 /** Same range the `update_settings` command clamps to. Enforced here as well
@@ -18,6 +27,11 @@ import type { AppSettings } from "@/types/settings";
  * the dispatcher never starting a job. */
 const MIN_CONCURRENT_DOWNLOADS = 1;
 const MAX_CONCURRENT_DOWNLOADS = 8;
+
+/** The four providers `update_settings` accepts, in their default order. Used
+ * only to backfill a CSV that somehow arrived short, so the list on screen is
+ * never missing a provider the user has no way to add back. */
+const SPOTIFLAC_PROVIDERS = ["tidal", "qobuz", "deezer", "amazon"] as const;
 
 /**
  * Reads a whole-number field.
@@ -54,8 +68,32 @@ export function Settings() {
   const [concurrencyDraft, setConcurrencyDraft] = useState<string | null>(null);
   const [rateLimitDraft, setRateLimitDraft] = useState<string | null>(null);
 
+  // The two Telegram boxes follow the same draft-then-commit-on-blur shape, so
+  // half a pasted token is never persisted keystroke by keystroke.
+  const [botTokenDraft, setBotTokenDraft] = useState<string | null>(null);
+  const [chatIdDraft, setChatIdDraft] = useState<string | null>(null);
+
   const concurrencyValue = concurrencyDraft ?? savedConcurrency?.toString() ?? "";
   const rateLimitValue = rateLimitDraft ?? savedRateLimit?.toString() ?? "";
+  const botTokenValue = botTokenDraft ?? settings?.tg_bot_token ?? "";
+  const chatIdValue = chatIdDraft ?? settings?.tg_chat_id ?? "";
+
+  // The CSV is owned by the backend (validated as a subset/permutation of the
+  // four providers); the page only reorders whatever it was given. Providers
+  // the CSV happens to omit are appended in default order, so a row can never
+  // vanish from a list that has no way of adding one back.
+  const serviceOrder = settings
+    ? (() => {
+        const listed = settings.spotiflac_service_order
+          .split(",")
+          .map((provider) => provider.trim())
+          .filter(
+            (provider): provider is (typeof SPOTIFLAC_PROVIDERS)[number] =>
+              (SPOTIFLAC_PROVIDERS as readonly string[]).includes(provider),
+          );
+        return [...listed, ...SPOTIFLAC_PROVIDERS.filter((known) => !listed.includes(known))];
+      })()
+    : [];
 
   async function persist(patch: Partial<AppSettings>): Promise<boolean> {
     try {
@@ -107,6 +145,45 @@ export function Settings() {
 
   async function handleToggleRunInBackground(checked: boolean) {
     await persist({ run_in_background: checked });
+  }
+
+  async function handleMoveProvider(index: number, direction: -1 | 1) {
+    const target = index + direction;
+    if (target < 0 || target >= serviceOrder.length) return;
+    const next = [...serviceOrder];
+    [next[index], next[target]] = [next[target], next[index]];
+    await persist({ spotiflac_service_order: next.join(",") });
+  }
+
+  async function handleChangeQuality(tier: MusicQualityTier) {
+    if (tier !== settings?.spotiflac_quality) {
+      await persist({ spotiflac_quality: tier });
+    }
+  }
+
+  async function handleToggleExtensionsFallback(checked: boolean) {
+    await persist({ spotiflac_extensions_fallback: checked });
+  }
+
+  async function handleCommitBotToken() {
+    if (botTokenDraft === null || settings === null) return;
+    const trimmed = botTokenDraft.trim();
+    if (trimmed !== settings.tg_bot_token) {
+      await persist({ tg_bot_token: trimmed });
+    }
+    setBotTokenDraft(null);
+  }
+
+  async function handleCommitChatId() {
+    if (chatIdDraft === null || settings === null) return;
+    // The backend rejects anything but digits-or-empty; committing only a
+    // valid value means the box snaps back instead of surfacing a Rust error
+    // for a stray letter.
+    const trimmed = chatIdDraft.trim();
+    if (/^\d*$/.test(trimmed) && trimmed !== settings.tg_chat_id) {
+      await persist({ tg_chat_id: trimmed });
+    }
+    setChatIdDraft(null);
   }
 
   return (
@@ -241,6 +318,161 @@ export function Settings() {
           <Switch
             checked={settings?.show_logs_tab ?? false}
             onCheckedChange={handleToggleShowLogsTab}
+          />
+        </div>
+      </div>
+
+      <h3 className="text-sm font-bold tracking-tight">{t("settings.spotiflac.section")}</h3>
+
+      <div className="flex flex-col gap-4 rounded-lg border border-border/80 bg-card p-5 shadow-2xs">
+        <div className="flex flex-col gap-3 py-1">
+          <div className="flex flex-col gap-0.5">
+            <Label className="text-sm font-medium">{t("settings.spotiflac.serviceOrder")}</Label>
+            <span className="text-xs text-muted-foreground">
+              {t("settings.spotiflac.serviceOrderHint")}
+            </span>
+          </div>
+          <ol className="flex flex-col gap-1.5">
+            {serviceOrder.map((provider, index) => (
+              <li
+                key={provider}
+                className="flex items-center gap-3 rounded-md border border-border/80 bg-muted/30 px-3 py-1.5"
+              >
+                <span className="w-5 shrink-0 text-center font-mono text-xs text-muted-foreground">
+                  {index + 1}
+                </span>
+                <span className="min-w-0 flex-1 truncate text-sm font-medium">
+                  {formatPlatformLabel(provider)}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 rounded-md"
+                  disabled={index === 0}
+                  aria-label={t("settings.spotiflac.moveUp", {
+                    provider: formatPlatformLabel(provider),
+                  })}
+                  onClick={() => void handleMoveProvider(index, -1)}
+                >
+                  <ChevronUp className="h-4 w-4" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 rounded-md"
+                  disabled={index === serviceOrder.length - 1}
+                  aria-label={t("settings.spotiflac.moveDown", {
+                    provider: formatPlatformLabel(provider),
+                  })}
+                  onClick={() => void handleMoveProvider(index, 1)}
+                >
+                  <ChevronDown className="h-4 w-4" />
+                </Button>
+              </li>
+            ))}
+          </ol>
+        </div>
+
+        <div className="h-px bg-border/60" />
+
+        <div className="flex items-center justify-between gap-6 py-1">
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <Label htmlFor="spotiflac-quality" className="text-sm font-medium">
+              {t("settings.spotiflac.quality")}
+            </Label>
+            <span className="text-xs text-muted-foreground">
+              {t("settings.spotiflac.qualityHint")}
+            </span>
+          </div>
+          <Select
+            value={settings?.spotiflac_quality}
+            onValueChange={(tier) => void handleChangeQuality(tier as MusicQualityTier)}
+          >
+            <SelectTrigger id="spotiflac-quality" className="w-56 shrink-0">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {MUSIC_QUALITY_TIERS.map((tier) => (
+                <SelectItem key={tier} value={tier}>
+                  {t(`downloadForm.musicTier.${tier}`)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="h-px bg-border/60" />
+
+        <div className="flex items-center justify-between gap-6 py-1">
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <Label htmlFor="spotiflac-extensions-fallback" className="text-sm font-medium">
+              {t("settings.spotiflac.extensionsFallback")}
+            </Label>
+            <span className="text-xs text-muted-foreground">
+              {t("settings.spotiflac.extensionsFallbackHint")}
+            </span>
+          </div>
+          <Switch
+            id="spotiflac-extensions-fallback"
+            checked={settings?.spotiflac_extensions_fallback ?? false}
+            onCheckedChange={(checked) => void handleToggleExtensionsFallback(checked)}
+          />
+        </div>
+
+        <div className="h-px bg-border/60" />
+
+        {/* Not decoration: the token grants full control of the bot, and the
+            settings table is a plain SQLite file anyone on the machine can
+            read — the user must know that before pasting one in. */}
+        <p className="flex items-start gap-1.5 rounded-md bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-700 dark:text-amber-400">
+          <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>{t("settings.spotiflac.plaintextWarning")}</span>
+        </p>
+
+        <div className="flex items-center justify-between gap-6 py-1">
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <Label htmlFor="tg-bot-token" className="text-sm font-medium">
+              {t("settings.spotiflac.tgBotToken")}
+            </Label>
+            <span className="text-xs text-muted-foreground">
+              {t("settings.spotiflac.telegramHint")}
+            </span>
+          </div>
+          <Input
+            id="tg-bot-token"
+            type="password"
+            autoComplete="off"
+            placeholder={t("settings.spotiflac.tgBotTokenPlaceholder")}
+            value={botTokenValue}
+            onChange={(event) => setBotTokenDraft(event.target.value)}
+            onBlur={() => void handleCommitBotToken()}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur();
+            }}
+            className="w-64 shrink-0"
+          />
+        </div>
+
+        <div className="h-px bg-border/60" />
+
+        <div className="flex items-center justify-between gap-6 py-1">
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <Label htmlFor="tg-chat-id" className="text-sm font-medium">
+              {t("settings.spotiflac.tgChatId")}
+            </Label>
+          </div>
+          <Input
+            id="tg-chat-id"
+            inputMode="numeric"
+            autoComplete="off"
+            placeholder={t("settings.spotiflac.tgChatIdPlaceholder")}
+            value={chatIdValue}
+            onChange={(event) => setChatIdDraft(event.target.value)}
+            onBlur={() => void handleCommitChatId()}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur();
+            }}
+            className="w-40 shrink-0"
           />
         </div>
       </div>

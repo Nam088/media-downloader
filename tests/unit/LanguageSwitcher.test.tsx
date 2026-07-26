@@ -17,6 +17,11 @@ const SAMPLE_SETTINGS = {
   rate_limit_kbps: 0,
   max_retry_attempts: 3,
   run_in_background: false,
+  spotiflac_service_order: "tidal,qobuz,deezer,amazon",
+  spotiflac_quality: "flac16",
+  spotiflac_extensions_fallback: true,
+  tg_bot_token: "",
+  tg_chat_id: "",
 } satisfies AppSettings;
 
 describe("LanguageSwitcher", () => {

@@ -10,6 +10,7 @@ import {
   FolderInput,
   Images,
   Link2,
+  Music,
   Pencil,
   Play,
   RotateCcw,
@@ -249,6 +250,7 @@ const MEDIA_TYPE_ICONS: Record<MediaType, typeof FileAudio> = {
   audio: FileAudio,
   video: FileVideo,
   gallery: Images,
+  music: Music,
 };
 
 /** FR-301 acceptance #3: không ô nào để trống. Mọi mục trong CSDL hiện tại rơi
@@ -287,6 +289,40 @@ function Thumbnail({ item, className }: { item: LibraryItem; className?: string 
       data-testid="library-thumbnail-image"
       onError={() => setFailed(true)}
     />
+  );
+}
+
+/** T043 — nhãn nguồn phát đã thật sự giao file cho một mục nhạc lossless.
+ *
+ * Chỉ mục `media_type === "music"` mới có khái niệm này (engine SpotiFLAC thử
+ * lần lượt TIDAL → Qobuz → Deezer → Amazon → extension), nên mọi loại khác trả
+ * về `null` dù backend có gửi gì đi nữa. Trường `source_provider` còn optional
+ * vì `models::LibraryItem` phía Rust chưa expose nó — vắng field thì đơn giản
+ * là không có badge, không phải lỗi. */
+function ProviderBadge({ item }: { item: LibraryItem }) {
+  const { t } = useTranslation();
+
+  if (item.media_type !== "music") return null;
+  const provider = item.source_provider?.trim();
+  if (!provider) return null;
+
+  const extensionName = provider.startsWith("ext:") ? provider.slice(4).trim() : null;
+  if (extensionName === "") return null;
+
+  const label =
+    extensionName !== null
+      ? t("library.provider_extension", { name: extensionName })
+      : formatPlatformLabel(provider);
+
+  return (
+    <span
+      className="inline-flex items-center rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary"
+      data-testid="library-provider-badge"
+      data-provider={provider}
+      title={t("library.provider_badge_title", { provider: label })}
+    >
+      {label}
+    </span>
   );
 }
 
@@ -436,11 +472,13 @@ function SelectBox({
   );
 }
 
-/** Dòng phụ dưới tiêu đề. Thời lượng chỉ xuất hiện khi thật sự biết. */
+/** Dòng phụ dưới tiêu đề. Thời lượng chỉ xuất hiện khi thật sự biết; badge
+ * nguồn phát chỉ xuất hiện trên mục nhạc có `source_provider` (T043). */
 function ItemMeta({ item }: { item: LibraryItem }) {
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
       <span>{formatPlatformLabel(item.platform)}</span>
+      <ProviderBadge item={item} />
       <span>{item.file_format}</span>
       <span>{formatFileSize(item.file_size_bytes)}</span>
       {item.duration_seconds !== null && (

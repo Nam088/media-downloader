@@ -9,7 +9,7 @@ import { hasActiveFilters, useLibraryStore } from "@/stores/library-store";
 import type { MediaType } from "@/types/download";
 import type { LibrarySort } from "@/types/library";
 
-const MEDIA_TYPES: MediaType[] = ["audio", "video", "gallery"];
+const MEDIA_TYPES: MediaType[] = ["audio", "video", "gallery", "music"];
 const SORTS: LibrarySort[] = ["downloaded_at", "title", "file_size", "duration"];
 
 /**

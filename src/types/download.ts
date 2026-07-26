@@ -3,7 +3,19 @@
 // để hai nơi không bao giờ lệch nhau.
 import { DEFAULT_TEMPLATE as DEFAULT_FILENAME_TEMPLATE } from "../lib/filename-template";
 
-export type MediaType = "audio" | "video" | "gallery";
+export type MediaType = "audio" | "video" | "gallery" | "music";
+
+/** The three lossless-music quality tiers the SpotiFLAC engine offers
+ * (data-model.md §5). Stored in `DownloadJob.audio_quality` as-is for
+ * `media_type === "music"` jobs; the backend validates the value against the
+ * preview's `available_music_tiers`, so this list never overrides the source. */
+export type MusicQualityTier = "flac16" | "flac24" | "mp3_320";
+
+export const MUSIC_QUALITY_TIERS: readonly MusicQualityTier[] = [
+  "flac16",
+  "flac24",
+  "mp3_320",
+] as const;
 
 /** Only meaningful when `media_type === "gallery"`. Mirrors the three modes
  * the reference implementation offered for a TikTok slideshow post. */
@@ -243,6 +255,10 @@ export type JobStatus =
   | "queued"
   | "fetching_metadata"
   | "downloading"
+  /** A music job blocked on a Cloudflare challenge: the worker is alive and
+   * waiting for a grant code on stdin, so the job still holds its concurrency
+   * slot (data-model.md §2). Only `media_type === "music"` jobs enter it. */
+  | "waiting_input"
   | "paused"
   | "completed"
   | "failed"
@@ -345,6 +361,12 @@ export interface MediaSource {
    * chapter-split option with an explanation), non-empty = show the count and
    * enable it. */
   chapters?: ChapterPreview[] | null;
+  /** Only set on a SpotiFLAC-backed preview (Spotify/Tidal/Apple Music/
+   * Pandora links). Non-empty means "this is a music source": the form shows
+   * the tier picker instead of the video/audio quality lists, and the job is
+   * created with `media_type: "music"`. Always the full three-tier list in
+   * this scope — the worker does not probe tiers ahead of time. */
+  available_music_tiers?: MusicQualityTier[];
 }
 
 export interface DownloadJob {
@@ -462,6 +484,11 @@ export interface JobProgressEvent {
   downloaded_bytes: number | null;
   speed_bytes_per_sec: number | null;
   eta_seconds: number | null;
+  /** Only set for music jobs: the provider the SpotiFLAC worker is currently
+   * pulling from (`"tidal" | "qobuz" | "deezer" | "amazon" | "ext:<name>"`).
+   * Live-only, like `downloaded_bytes` — the queue shows it while the run is
+   * in flight; the final provider is persisted on the library row instead. */
+  provider?: string;
 }
 
 /** The parts of a `job:progress` event that only make sense for a run that is
@@ -476,6 +503,9 @@ export interface LiveProgress {
   /** `null` when the current run has no computable percentage. */
   progress_percent: number | null;
   downloaded_bytes: number | null;
+  /** See `JobProgressEvent.provider` — carried here so the queue row can name
+   * the source a music job is actually downloading from (FR-009). */
+  provider?: string;
 }
 
 export interface JobStatusChangedEvent {
@@ -490,4 +520,13 @@ export interface JobStatusChangedEvent {
    * A count on one event for one job, never N new queue rows: a chapter split
    * stays exactly one entry in the queue and in history. */
   produced_file_count?: number | null;
+}
+
+/** `job:cloudflare_challenge` — a music job's worker hit a Cloudflare
+ * challenge and the job just entered `waiting_input`. The frontend opens the
+ * grant dialog on `challenge_url`; the job resumes once
+ * `submit_cloudflare_grant` is accepted (contracts/tauri-interface.md §3). */
+export interface JobCloudflareChallengeEvent {
+  job_id: string;
+  challenge_url: string;
 }
