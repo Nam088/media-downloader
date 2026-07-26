@@ -267,6 +267,148 @@ impl DownloadQueue {
         self.enqueue(&mut retried).await?;
         Ok(retried)
     }
+
+    /// Tạm dừng mọi tác vụ chưa kết thúc (FR-118).
+    pub async fn pause_all(&self) -> Result<Vec<String>, AppError> {
+        self.apply_bulk(bulk_plan(BulkAction::Pause)).await
+    }
+
+    /// Đưa mọi tác vụ đang tạm dừng về hàng chờ, giữ nguyên thứ tự cũ —
+    /// `queue_position` không bị đụng tới nên hàng đợi chạy tiếp đúng chỗ cũ.
+    pub async fn resume_all(&self) -> Result<Vec<String>, AppError> {
+        self.apply_bulk(bulk_plan(BulkAction::Resume)).await
+    }
+
+    /// Huỷ mọi tác vụ chưa kết thúc, kể cả những tác vụ đang tạm dừng.
+    pub async fn cancel_all(&self) -> Result<Vec<String>, AppError> {
+        self.apply_bulk(bulk_plan(BulkAction::Cancel)).await
+    }
+
+    /// Phần thi hành dùng chung của ba lệnh hàng loạt. Mọi khác biệt giữa
+    /// chúng nằm trong `BulkPlan` (hàm thuần `bulk_plan`), nên hàm này chỉ còn
+    /// vào-ra: bảng `running`, DB, sự kiện.
+    ///
+    /// Trả về id của những job bị tác động để phía gọi phát `job:status_changed`
+    /// cho đúng chừng đó job — giao diện không phải nạp lại cả hàng đợi.
+    async fn apply_bulk(&self, plan: BulkPlan) -> Result<Vec<String>, AppError> {
+        // Thứ tự này là bắt buộc: gửi tín hiệu huỷ cho mọi job đang chạy TRƯỚC
+        // khi ghi trạng thái mới. Làm ngược lại thì giữa hai bước, dispatcher
+        // kịp thấy một slot vừa trống và khởi chạy một job vốn đang chờ — job
+        // đó vừa bị đánh dấu `paused` xong sẽ chạy bất chấp.
+        if plan.stops_jobs {
+            for entry in self.running.lock().await.values() {
+                let _ = entry.cancel_tx.send(true);
+            }
+        }
+
+        let changed = self
+            .db
+            .bulk_update_status(&plan.from_statuses, plan.to_status.clone())?;
+
+        for job_id in &changed {
+            // Một lần dừng hàng loạt phải giống hệt N lần dừng đơn lẻ
+            // (`stop_job`): người dùng đã can thiệp thủ công nên vòng thử lại
+            // tự động phải dừng hẳn và job được nhận lại đủ ngân sách thử lại
+            // (FR-123). Thiếu bước này, một job đang trong khoảng chờ thử lại
+            // vẫn còn `next_retry_at` và sẽ tự chạy lại dù người dùng vừa tạm
+            // dừng tất cả.
+            if plan.stops_jobs {
+                self.db.clear_retry_deadline(job_id)?;
+            }
+            emit_status_changed(&self.app, job_id, plan.to_status.clone(), None, None);
+        }
+
+        self.wake.notify_one();
+        Ok(changed)
+    }
+
+    /// Đặt một job vào giữa hai hàng xóm mới của nó sau một lần kéo-thả
+    /// (FR-117). Không đụng tới job đang chạy — chúng cứ chạy nốt, thứ tự chỉ
+    /// quyết định ai được khởi chạy tiếp theo.
+    pub fn move_job(
+        &self,
+        job_id: &str,
+        before_job_id: Option<&str>,
+        after_job_id: Option<&str>,
+    ) -> Result<(), AppError> {
+        self.db
+            .move_job_between(job_id, before_job_id, after_job_id)?;
+        // Thứ tự mới có thể đưa một job khác lên đầu hàng chờ; đánh thức
+        // dispatcher để nó chọn lại ngay thay vì đợi hết nhịp tick.
+        self.wake.notify_one();
+        Ok(())
+    }
+}
+
+/// Ba lệnh tác động lên cả hàng đợi. Tách khỏi phần thi hành để mọi quyết
+/// định của chúng nằm trong một hàm thuần, kiểm thử được mà không cần
+/// `AppHandle` hay database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkAction {
+    Pause,
+    Resume,
+    Cancel,
+}
+
+/// Toàn bộ khác biệt giữa ba lệnh hàng loạt.
+#[derive(Debug, PartialEq, Eq)]
+struct BulkPlan {
+    /// Chỉ những job đang ở một trong các trạng thái này mới bị tác động.
+    from_statuses: Vec<JobStatus>,
+    to_status: JobStatus,
+    /// Đây có phải một thao tác *dừng* (tạm dừng/huỷ) không. Thao tác dừng
+    /// phải giết tiến trình của job đang chạy và trả lại ngân sách thử lại,
+    /// đúng như `stop_job` làm cho một job đơn lẻ.
+    stops_jobs: bool,
+}
+
+/// Mọi trạng thái "chưa kết thúc" — tập hợp mà các lệnh hàng loạt được phép
+/// đụng tới. `completed`/`failed`/`canceled` là trạng thái cuối: một lệnh hàng
+/// loạt không được lôi chúng trở lại hàng đợi.
+const UNFINISHED_STATUSES: [JobStatus; 4] = [
+    JobStatus::Queued,
+    JobStatus::FetchingMetadata,
+    JobStatus::Downloading,
+    JobStatus::Paused,
+];
+
+/// Mọi trạng thái chưa kết thúc TRỪ chính trạng thái đích.
+///
+/// Loại trạng thái đích ra không phải chuyện làm đẹp: `Db::bulk_update_status`
+/// trả về id của những job **khớp** điều kiện chứ không phải những job thực sự
+/// đổi trạng thái. Để trạng thái đích lọt vào danh sách nguồn thì mỗi job vốn
+/// đã ở đúng trạng thái đó cũng bị coi là "vừa đổi": giao diện nhận sự kiện
+/// thừa, và với một thao tác dừng thì bộ đếm thử lại của nó bị xoá oan.
+fn unfinished_statuses_except(to_status: &JobStatus) -> Vec<JobStatus> {
+    UNFINISHED_STATUSES
+        .iter()
+        .filter(|status| *status != to_status)
+        .cloned()
+        .collect()
+}
+
+fn bulk_plan(action: BulkAction) -> BulkPlan {
+    match action {
+        BulkAction::Pause => BulkPlan {
+            from_statuses: unfinished_statuses_except(&JobStatus::Paused),
+            to_status: JobStatus::Paused,
+            stops_jobs: true,
+        },
+        // Cố tình KHÔNG dùng `unfinished_statuses_except`: chỉ job đang tạm
+        // dừng mới được tiếp tục. Nếu `downloading` lọt vào đây thì một job
+        // đang chạy sẽ bị đánh dấu `queued` và dispatcher khởi chạy nó lần thứ
+        // hai song song với chính nó.
+        BulkAction::Resume => BulkPlan {
+            from_statuses: vec![JobStatus::Paused],
+            to_status: JobStatus::Queued,
+            stops_jobs: false,
+        },
+        BulkAction::Cancel => BulkPlan {
+            from_statuses: unfinished_statuses_except(&JobStatus::Canceled),
+            to_status: JobStatus::Canceled,
+            stops_jobs: true,
+        },
+    }
 }
 
 /// Khởi chạy job cho tới khi hết slot hoặc hết job đủ điều kiện.
@@ -1519,6 +1661,77 @@ mod tests {
         // practice — this just guards the invariant.
         let job = sample_job(MediaType::Gallery, None, None);
         assert!(build_ytdlp_args(&job, 0).is_err());
+    }
+
+    #[test]
+    fn pause_all_leaves_already_paused_jobs_alone() {
+        // `Db::bulk_update_status` trả về id của những job KHỚP điều kiện, chứ
+        // không phải những job thực sự đổi trạng thái. Nếu `paused` lọt vào
+        // danh sách nguồn thì mọi job vốn đã tạm dừng cũng bị `apply_bulk` coi
+        // là "vừa đổi": giao diện nhận `job:status_changed` thừa, và tệ hơn,
+        // `clear_retry_deadline` xoá luôn bộ đếm thử lại của chúng.
+        let plan = bulk_plan(BulkAction::Pause);
+        assert!(!plan.from_statuses.contains(&JobStatus::Paused));
+        assert_eq!(
+            plan.from_statuses,
+            vec![
+                JobStatus::Queued,
+                JobStatus::FetchingMetadata,
+                JobStatus::Downloading
+            ]
+        );
+        assert_eq!(plan.to_status, JobStatus::Paused);
+    }
+
+    #[test]
+    fn cancel_all_also_cancels_jobs_that_are_merely_paused() {
+        // "Huỷ tất cả" mà bỏ sót job đang tạm dừng thì chúng vẫn nằm nguyên
+        // trong hàng đợi sau khi người dùng vừa bấm huỷ tất cả — và tiếp tục
+        // được lúc nào cũng chạy lại.
+        let plan = bulk_plan(BulkAction::Cancel);
+        assert!(plan.from_statuses.contains(&JobStatus::Paused));
+        assert_eq!(plan.from_statuses, UNFINISHED_STATUSES.to_vec());
+        assert_eq!(plan.to_status, JobStatus::Canceled);
+    }
+
+    #[test]
+    fn resume_all_only_ever_touches_paused_jobs() {
+        // Một job `downloading` bị đánh dấu `queued` sẽ được dispatcher chọn
+        // lại và chạy lần thứ hai song song với chính nó; một job `canceled`
+        // hay `failed` bị lôi về hàng chờ là tự ý chạy lại thứ người dùng đã
+        // dừng.
+        let plan = bulk_plan(BulkAction::Resume);
+        assert_eq!(plan.from_statuses, vec![JobStatus::Paused]);
+        assert_eq!(plan.to_status, JobStatus::Queued);
+    }
+
+    #[test]
+    fn only_the_stopping_actions_kill_running_processes_and_refund_retries() {
+        // `stops_jobs` điều khiển hai việc trong `apply_bulk`: gửi tín hiệu
+        // huỷ cho tiến trình đang chạy TRƯỚC khi ghi trạng thái, và gọi
+        // `clear_retry_deadline` để một lần dừng hàng loạt giống hệt N lần
+        // dừng đơn lẻ (FR-123).
+        assert!(bulk_plan(BulkAction::Pause).stops_jobs);
+        assert!(bulk_plan(BulkAction::Cancel).stops_jobs);
+        // Tiếp tục thì ngược lại: giết tiến trình ở đây là giết đúng những job
+        // vừa được cho chạy tiếp.
+        assert!(!bulk_plan(BulkAction::Resume).stops_jobs);
+    }
+
+    #[test]
+    fn bulk_actions_never_reopen_a_finished_job() {
+        // Chỉ trạng thái chưa kết thúc mới được đụng tới: `completed`,
+        // `failed` và `canceled` là trạng thái cuối, một lệnh hàng loạt không
+        // được lôi chúng trở lại hàng đợi.
+        for action in [BulkAction::Pause, BulkAction::Resume, BulkAction::Cancel] {
+            let plan = bulk_plan(action);
+            for terminal in [JobStatus::Completed, JobStatus::Failed, JobStatus::Canceled] {
+                assert!(
+                    !plan.from_statuses.contains(&terminal),
+                    "{action:?} không được nhận job đang ở {terminal:?} làm nguồn"
+                );
+            }
+        }
     }
 
     #[test]

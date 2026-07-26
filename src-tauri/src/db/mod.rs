@@ -218,14 +218,9 @@ impl Db {
 
     // ---- sắp xếp lại thứ tự và thao tác hàng loạt ---------------------
     //
-    // Nhóm này chưa có người gọi trong mã sản phẩm: người gọi chúng là các lệnh
-    // `reorder_queue` / `pause_all_jobs` / … được thêm ở bước sau (Task 7 của
-    // plan Phase 1), còn bộ điều phối ở Task 5 không dùng tới.
-    //
-    // Dùng `#[expect(dead_code)]` chứ không phải `#[allow(dead_code)]`: `expect`
-    // tự báo lỗi ngay khi mục được chú thích *bắt đầu* có người gọi, nên tới
-    // Task 7 trình biên dịch sẽ bắt phải gỡ nó ra. `allow` thì im lặng mãi mãi
-    // và sẽ che luôn mã chết thật sự về sau.
+    // Người gọi nhóm này là `DownloadQueue::move_job` (lệnh `reorder_queue`) và
+    // `DownloadQueue::apply_bulk` (các lệnh `pause_all_jobs` / `resume_all_jobs`
+    // / `cancel_all_jobs`).
 
     /// Đặt một job vào giữa hai hàng xóm (`None` nghĩa là đầu hoặc cuối danh
     /// sách) — thao tác đằng sau một lần kéo-thả (FR-117).
@@ -242,7 +237,6 @@ impl Db {
     /// ghi tách rời nhau thì một lần enqueue hay một lần kéo khác chen vào giữa
     /// sẽ khiến điểm giữa vừa tính trở thành số cũ — đúng loại tranh chấp mà
     /// hàm này tự nhận là tránh được.
-    #[cfg_attr(not(test), expect(dead_code, reason = "người gọi là lệnh `reorder_queue`, thêm ở Task 7"))]
     pub fn move_job_between(
         &self,
         job_id: &str,
@@ -358,7 +352,6 @@ impl Db {
     /// `from_statuses` thì các dòng vốn đã ở trạng thái đích vẫn được liệt kê,
     /// và phía gọi sẽ phát sự kiện thừa cho chúng. Phía gọi chịu trách nhiệm
     /// không truyền vào tổ hợp đó.
-    #[cfg_attr(not(test), expect(dead_code, reason = "người gọi là các lệnh hàng loạt, thêm ở Task 7"))]
     pub fn bulk_update_status(
         &self,
         from_statuses: &[JobStatus],
@@ -519,7 +512,6 @@ impl Db {
 /// ngưỡng này rất nhiều. Đặt ngưỡng cao hơn giới hạn thật nhiều bậc để không
 /// bao giờ chạm tới vùng mà phép lấy điểm giữa trả về đúng bằng một trong hai
 /// đầu mút — lúc đó thứ tự sẽ hỏng một cách âm thầm.
-#[cfg_attr(not(test), expect(dead_code, reason = "chỉ dùng bởi `needs_renormalize` — xem Task 7"))]
 const MIN_POSITION_GAP: f64 = 1e-6;
 
 /// Vị trí nằm giữa hai hàng xóm. `None` nghĩa là không có hàng xóm ở phía đó,
@@ -537,7 +529,6 @@ pub fn position_between(before: Option<f64>, after: Option<f64>) -> f64 {
 ///
 /// Chỉ đúng khi có cả hai hàng xóm: ở đầu hoặc cuối danh sách thì luôn còn chỗ
 /// vì ta cộng/trừ hẳn 1.0 chứ không chia đôi.
-#[cfg_attr(not(test), expect(dead_code, reason = "chỉ dùng bởi `move_job_between` — xem Task 7"))]
 pub fn needs_renormalize(before: Option<f64>, after: Option<f64>) -> bool {
     match (before, after) {
         (Some(before), Some(after)) => (after - before).abs() < MIN_POSITION_GAP,
@@ -552,7 +543,6 @@ pub fn needs_renormalize(before: Option<f64>, after: Option<f64>) -> bool {
 /// dòng nào thì đó là lỗi, không phải "đầu danh sách" — hàng xóm có thể vừa
 /// hoàn tất và biến khỏi danh sách trong lúc người dùng đang kéo, và đặt nhầm
 /// job vào một chỗ tuỳ tiện tệ hơn nhiều so với báo lỗi.
-#[cfg_attr(not(test), expect(dead_code, reason = "chỉ dùng bởi `move_job_between` — xem Task 7"))]
 fn position_of(conn: &Connection, job_id: Option<&str>) -> Result<Option<f64>, AppError> {
     let Some(job_id) = job_id else {
         return Ok(None);
@@ -575,7 +565,6 @@ fn position_of(conn: &Connection, job_id: Option<&str>) -> Result<Option<f64>, A
 /// Tách ra để `move_job_between` chuẩn hoá được *bên trong* transaction của
 /// chính nó thay vì mở một transaction thứ hai — nếu không, khoảng giữa hai
 /// transaction là chỗ một thao tác khác chen vào và làm hỏng giá trị vừa đọc.
-#[cfg_attr(not(test), expect(dead_code, reason = "chỉ dùng bởi `move_job_between` — xem Task 7"))]
 fn renormalize_positions_within(conn: &Connection) -> Result<(), AppError> {
     let ids: Vec<String> = {
         let mut stmt = conn.prepare(
