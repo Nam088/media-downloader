@@ -39,7 +39,7 @@
       "assetProtocol": {
         "enable": true,
         "scope": {
-          "allow": ["$DOWNLOAD/**", "$VIDEO/**", "$AUDIO/**", "$PICTURE/**"],
+          "allow": ["$DOWNLOAD/**", "$VIDEO/**", "$AUDIO/**", "$PICTURE/**", "$APPDATA/thumbnails/**"],
           "deny": [],
           "requireLiteralLeadingDot": true
         }
