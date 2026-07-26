@@ -12,6 +12,9 @@ function makeJob(overrides: Partial<DownloadJob> = {}): DownloadJob {
     media_type: "audio",
     audio_quality: "128kbps",
     video_quality: null,
+    // Audio job from yt-dlp: the gallery-dl fields never apply here.
+    gallery_mode: null,
+    selected_gallery_indices: null,
     status: "downloading",
     progress_percent: 42,
     speed_bytes_per_sec: 1_500_000,

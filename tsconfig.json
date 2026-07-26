@@ -23,6 +23,12 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src"],
+  "include": ["src", "tests"],
+  /* tests/e2e is a WebdriverIO suite whose devDependencies (@wdio/cli,
+     @wdio/types, ...) are a documented one-time opt-in install rather than
+     part of package.json — see the header of tests/e2e/wdio.conf.ts. Its
+     imports and Mocha globals therefore cannot resolve here. Drop this line
+     once those packages are installed. */
+  "exclude": ["tests/e2e"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

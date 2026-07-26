@@ -6,10 +6,18 @@ import { DownloadForm } from "@/components/DownloadForm";
 import type { MediaSource } from "@/types/download";
 import type { AppSettings } from "@/types/settings";
 
+// Mirrors the backend's own defaults (see `Db::get_settings`), except for the
+// output directory, which is pre-filled so the panel's submit button is
+// reachable without the test having to pick a folder first.
 const SAMPLE_SETTINGS = {
   theme: "system",
   language: "system",
   default_output_directory: "/tmp/out",
+  show_logs_tab: false,
+  max_concurrent_downloads: 3,
+  rate_limit_kbps: 0,
+  max_retry_attempts: 3,
+  run_in_background: false,
 } satisfies AppSettings;
 
 const PLAYLIST_PREVIEW: MediaSource = {

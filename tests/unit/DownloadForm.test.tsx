@@ -6,10 +6,17 @@ import { DownloadForm } from "@/components/DownloadForm";
 import type { MediaSource } from "@/types/download";
 import type { AppSettings } from "@/types/settings";
 
+// Mirrors the backend's own defaults (see `Db::get_settings`) so these tests
+// exercise the form as a fresh install would render it.
 const SAMPLE_SETTINGS = {
   theme: "system",
   language: "system",
   default_output_directory: "",
+  show_logs_tab: false,
+  max_concurrent_downloads: 3,
+  rate_limit_kbps: 0,
+  max_retry_attempts: 3,
+  run_in_background: false,
 } satisfies AppSettings;
 
 const SAMPLE_PREVIEW: MediaSource = {
@@ -28,6 +35,11 @@ const SAMPLE_PREVIEW: MediaSource = {
     { bitrate_kbps: 160, codec: "opus", filesize_bytes: 2_400_000 },
     { bitrate_kbps: 70, codec: "opus", filesize_bytes: 1_100_000 },
   ],
+  // A single yt-dlp-backed video: not gallery-dl's, and not a playlist, so
+  // both of those lists are empty for every case in this file.
+  is_gallery: false,
+  gallery_items: [],
+  playlist_entries: [],
 };
 
 function mockGetSettingsThenPreview(preview: MediaSource) {
