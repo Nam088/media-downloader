@@ -481,39 +481,6 @@ Thêm vào `mod tests` trong `src-tauri/src/db/mod.rs`:
     }
 
     #[test]
-    fn repair_unpositioned_jobs_appends_them_after_positioned_ones() {
-        let db = temp_db();
-        let mut positioned = sample_job("positioned");
-        positioned.queue_position = 4.0;
-        let mut orphan = sample_job("orphan");
-        orphan.queue_position = 0.0;
-        orphan.created_at = "2026-07-26T01:00:00Z".to_string();
-        db.insert_job(&positioned).unwrap();
-        db.insert_job(&orphan).unwrap();
-
-        let repaired = db.repair_unpositioned_jobs().unwrap();
-
-        assert_eq!(repaired, 1);
-        assert_eq!(db.get_job("positioned").unwrap().unwrap().queue_position, 4.0);
-        assert_eq!(
-            db.get_job("orphan").unwrap().unwrap().queue_position,
-            5.0,
-            "job chưa có vị trí phải xếp vào cuối, không phải đầu"
-        );
-    }
-
-    #[test]
-    fn repair_unpositioned_jobs_is_a_no_op_when_everything_has_a_position() {
-        let db = temp_db();
-        let mut job = sample_job("job-1");
-        job.queue_position = 2.0;
-        db.insert_job(&job).unwrap();
-
-        assert_eq!(db.repair_unpositioned_jobs().unwrap(), 0);
-        assert_eq!(db.get_job("job-1").unwrap().unwrap().queue_position, 2.0);
-    }
-
-    #[test]
     fn mark_job_for_retry_requeues_with_a_future_deadline() {
         let db = temp_db();
         let mut running = sample_job("job-1");
@@ -685,56 +652,6 @@ Trong `src-tauri/src/db/mod.rs`, thêm ngay sau `list_jobs_by_statuses` (`:173`)
         Ok(changed)
     }
 
-    /// Cấp vị trí cho các job chưa từng có vị trí thật.
-    ///
-    /// Migration 0008 chỉ đánh số một lần cho các dòng có sẵn tại thời điểm nó
-    /// chạy. Một job được chèn bởi đường nào đó không đi qua `enqueue` sẽ mang
-    /// `queue_position = 0.0` và vì thế sắp trước *mọi* job đã được đánh số —
-    /// một lỗi thứ tự âm thầm, không bao giờ tự khỏi vì backfill không quay
-    /// lại lần hai.
-    ///
-    /// Gọi một lần lúc khởi động, cạnh `reset_interrupted_jobs`. Trong vận
-    /// hành bình thường nó không đổi dòng nào; nó tồn tại để bất biến "mọi job
-    /// đều có vị trí phân biệt" không phụ thuộc vào việc mọi đường tạo job đều
-    /// nhớ gọi đúng hàm.
-    pub fn repair_unpositioned_jobs(&self) -> Result<usize, AppError> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-
-        let ids: Vec<String> = {
-            let mut stmt = tx.prepare(
-                "SELECT id FROM download_jobs
-                 WHERE queue_position = 0
-                   AND status IN ('queued','paused','downloading','fetching_metadata')
-                 ORDER BY created_at ASC",
-            )?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            rows.collect::<rusqlite::Result<Vec<String>>>()?
-        };
-        if ids.is_empty() {
-            return Ok(0);
-        }
-
-        let max: Option<f64> = tx.query_row(
-            "SELECT MAX(queue_position) FROM download_jobs",
-            [],
-            |row| row.get(0),
-        )?;
-        let mut next = max.unwrap_or(0.0);
-
-        // Xếp vào cuối theo thứ tự tạo: chúng chưa từng được người dùng sắp
-        // xếp, nên không có ý định nào để bảo toàn.
-        for id in &ids {
-            next += 1.0;
-            tx.execute(
-                "UPDATE download_jobs SET queue_position = ?1 WHERE id = ?2",
-                params![next, id],
-            )?;
-        }
-        tx.commit()?;
-        Ok(ids.len())
-    }
-
     /// Đưa job về hàng chờ kèm mốc thời gian được phép thử lại (FR-121).
     /// `error_message` được giữ lại để giao diện hiển thị lý do đang chờ.
     pub fn mark_job_for_retry(
@@ -799,6 +716,21 @@ Trong `src-tauri/src/db/mod.rs`, thêm ngay sau `list_jobs_by_statuses` (`:173`)
 Thêm hai hàm tự do ở cấp module trong cùng file (ngoài `impl Db`) — chúng thuần tuý tính toán nên kiểm thử được mà không cần cơ sở dữ liệu:
 
 ```rust
+> **Không có sentinel "chưa xếp chỗ".** Một bản nháp trước của plan này có hàm
+> `repair_unpositioned_jobs` coi `queue_position = 0` là "job chưa từng được
+> xếp chỗ" và dồn các dòng đó xuống cuối lúc khởi động. Nó tạo ra một lỗi thấy
+> được: `position_between(None, Some(1.0))` trả về đúng `0.0`, nên **kéo một
+> job lên đầu hàng đợi rồi mở lại ứng dụng sẽ thấy nó nằm dưới đáy**.
+>
+> Vá công thức đầu danh sách không giải quyết được: `after / 2.0` chỉ đẩy lùi
+> vấn đề — thả liên tiếp vào đầu sẽ chia đôi dần về 0 và cuối cùng chạm đúng
+> giá trị đó, mà `needs_renormalize` không bắt được vì không có hàng xóm phía
+> trước để đo khe hở.
+>
+> Cách đúng là bỏ hẳn sentinel. Vị trí âm và bằng 0 đều hợp lệ — thứ tự chỉ
+> quan tâm giá trị tương đối. Bất biến "mọi job đều có vị trí" được bảo đảm ở
+> chỗ chèn: `enqueue` (Task 5) luôn gán `next_queue_position()`.
+
 /// Khe hở hẹp nhất còn chấp nhận được giữa hai vị trí liền kề.
 ///
 /// `f64` có 52 bit phần định trị, nên trên lý thuyết còn chia đôi được sâu hơn
@@ -1015,7 +947,9 @@ Lưu ý: test cũ khẳng định `"ERROR: network timeout"` phải ra `DOWNLOAD
 
 - [ ] **Step 7: Hiện thực phân loại lỗi mạng**
 
-Trong `src-tauri/src/downloader/ytdlp.rs`, sửa `classify_ytdlp_error` — thêm nhánh kiểm tra lỗi mạng **trước** nhánh `DOWNLOAD_FAILED` gom cuối:
+Trong `src-tauri/src/downloader/ytdlp.rs`, sửa `classify_ytdlp_error` — thêm nhánh kiểm tra lỗi mạng **trước** nhánh `DOWNLOAD_FAILED` gom cuối.
+
+> **Chỉ chèn thêm nhánh mới, không viết lại cả hàm.** Đoạn mã minh hoạ dưới đây từng có một lỗi: nó thay cách trích thông báo từ `stderr.lines().last().unwrap_or(stderr)` thành `stderr.trim()` ở mọi nhánh, khiến toàn bộ stderr nhiều dòng của yt-dlp bị đẩy vào thông báo hiển thị cho người dùng thay vì chỉ dòng `ERROR:` cuối cùng. Giữ nguyên cách trích thông báo hiện có ở mọi nhánh, kể cả nhánh mới.
 
 ```rust
 /// Các dấu hiệu cho thấy lỗi đến từ đường truyền chứ không từ nội dung. Thử
@@ -1756,7 +1690,6 @@ Trong `src-tauri/src/lib.rs`, `DownloadQueue::new` giờ nhận thêm tham số:
 ```rust
             let db = Arc::new(Db::open(&app_data_dir.join("media-downloader.db"))?);
             let interrupted = db.reset_interrupted_jobs()?;
-            db.repair_unpositioned_jobs()?;
             let settings = db.get_settings()?;
             let queue = DownloadQueue::new(
                 Arc::clone(&db),
