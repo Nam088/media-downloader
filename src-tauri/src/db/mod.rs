@@ -6,7 +6,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use rusqlite_migration::{Migrations, M};
 
 use crate::error::AppError;
-use crate::models::{AppSettings, DownloadJob, DownloadedFile, GalleryMode, JobStatus, MediaType};
+use crate::models::{
+    AppSettings, DownloadJob, DownloadedFile, GalleryMode, JobStatus, MediaType, OutputOptions,
+};
 
 fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
@@ -19,6 +21,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/0007_job_titles.sql")),
         M::up(include_str!("migrations/0008_queue_scheduling.sql")),
         M::up(include_str!("migrations/0009_backfill_completed_progress.sql")),
+        M::up(include_str!("migrations/0010_job_output_options.sql")),
     ])
 }
 
@@ -78,6 +81,12 @@ impl Db {
             .selected_gallery_indices
             .as_ref()
             .map(|indices| serde_json::to_string(indices).expect("Vec<u32> always serializes"));
+        // Luôn ghi một chuỗi JSON, kể cả khi là bộ mặc định: từ đây trở đi mọi
+        // tác vụ đều nêu rõ nó đã chạy với lựa chọn nào (FR-235). NULL được để
+        // dành riêng cho những dòng có TRƯỚC migration 0010, nơi "không nêu"
+        // mới là sự thật.
+        let output_options_json = serde_json::to_string(&job.output_options)
+            .expect("OutputOptions always serializes");
         conn.execute(
             "INSERT INTO download_jobs (
                 id, source_url, platform, media_type, audio_quality, video_quality,
@@ -85,8 +94,8 @@ impl Db {
                 speed_bytes_per_sec, eta_seconds, error_message, output_directory,
                 output_file_path, is_playlist_item, parent_playlist_id,
                 retried_from_job_id, created_at, updated_at, title, playlist_title,
-                queue_position, retry_count, next_retry_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
+                queue_position, retry_count, next_retry_at, output_options
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)",
             params![
                 job.id,
                 job.source_url,
@@ -113,6 +122,7 @@ impl Db {
                 job.queue_position,
                 job.retry_count,
                 job.next_retry_at,
+                output_options_json,
             ],
         )?;
         Ok(())
@@ -657,6 +667,7 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<DownloadJob> {
     let media_type_raw: String = row.get("media_type")?;
     let gallery_mode_raw: Option<String> = row.get("gallery_mode")?;
     let selected_gallery_indices_raw: Option<String> = row.get("selected_gallery_urls")?;
+    let output_options_raw: Option<String> = row.get("output_options")?;
     let status_raw: String = row.get("status")?;
     Ok(DownloadJob {
         id: row.get("id")?,
@@ -695,6 +706,13 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<DownloadJob> {
         queue_position: row.get("queue_position")?,
         retry_count: row.get("retry_count")?,
         next_retry_at: row.get("next_retry_at")?,
+        // NULL = dòng có trước migration 0010, tức tác vụ chạy vào lúc chưa hề
+        // có lựa chọn nào để nêu; JSON hỏng = ai đó sửa tay CSDL. Cả hai đều
+        // rơi về bộ mặc định, vốn đúng bằng hành vi đang chạy hôm nay — nên
+        // một dòng cũ đọc ra vẫn mô tả đúng thứ nó đã thực sự làm.
+        output_options: output_options_raw
+            .and_then(|raw| serde_json::from_str::<OutputOptions>(&raw).ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -712,7 +730,7 @@ fn row_to_downloaded_file(row: &rusqlite::Row) -> rusqlite::Result<DownloadedFil
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{JobStatus, MediaType};
+    use crate::models::{AudioOutput, CodecPreference, JobStatus, MediaType, VideoContainer};
 
     /// Mỗi test dùng một file DB riêng trong thư mục tạm của hệ điều hành để
     /// migration chạy thật (in-memory không kiểm chứng được `to_latest`).
@@ -749,6 +767,7 @@ mod tests {
             queue_position: 0.0,
             retry_count: 0,
             next_retry_at: None,
+            output_options: OutputOptions::default(),
         }
     }
 
@@ -941,6 +960,148 @@ mod tests {
         assert_eq!(raw_progress_of(&conn, "failed-halfway"), 50.0);
         assert_eq!(raw_progress_of(&conn, "failed-at-zero"), 0.0);
         assert_eq!(raw_progress_of(&conn, "canceled"), 0.0);
+    }
+
+    // ---- specs/003-media-output: lựa chọn đầu ra (migration 0010) ---------
+
+    #[test]
+    fn migration_0010_leaves_pre_existing_jobs_meaning_exactly_what_they_meant() {
+        // Dòng này được tạo ở lược đồ version 9, khi cột `output_options` còn
+        // chưa tồn tại — nên phải chèn bằng SQL thô. Đi qua `insert_job` thì
+        // `Db::open` đã chạy `to_latest` và dòng sinh ra sẽ mang sẵn chuỗi JSON
+        // do chính lượt ghi ấy đặt vào; test khi đó chỉ kiểm chứng đúng thứ nó
+        // vừa tự tay ghi, chứ không nói gì về hành vi của migration.
+        let mut conn = raw_conn_at_version(9);
+        conn.execute(
+            "INSERT INTO download_jobs (
+                id, source_url, platform, media_type, audio_quality, status,
+                output_directory, created_at, updated_at
+            ) VALUES ('legacy','https://example.com/v','youtube','audio','128kbps',
+                      'completed','/tmp','2026-07-20T00:00:00Z','2026-07-20T00:00:00Z')",
+            [],
+        )
+        .expect("raw insert works against the version-9 schema");
+
+        migrations().to_latest(&mut conn).expect("0010 applies");
+
+        // Nửa thứ nhất: migration KHÔNG bịa giá trị cho dòng cũ. "Tác vụ này
+        // không nêu lựa chọn nào" và "tác vụ này đã chọn đúng bộ mặc định" là
+        // hai chuyện khác nhau, và chỉ cái đầu đúng với dữ liệu có trước.
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT output_options FROM download_jobs WHERE id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("cột output_options phải tồn tại sau migration");
+        assert_eq!(stored, None, "migration không được backfill dòng cũ");
+
+        // Nửa thứ hai, và là nửa người dùng thật sự cảm nhận được: đọc dòng ấy
+        // qua đúng bộ đọc thật phải cho ra bộ mặc định — tức đúng hành vi mà
+        // tác vụ đó đã chạy khi được tạo.
+        let job = conn
+            .query_row(
+                "SELECT * FROM download_jobs WHERE id = 'legacy'",
+                [],
+                row_to_job,
+            )
+            .expect("dòng cũ vẫn đọc được nguyên vẹn");
+        assert_eq!(job.output_options, OutputOptions::default());
+        assert_eq!(
+            job.audio_quality.as_deref(),
+            Some("128kbps"),
+            "migration không được đụng tới dữ liệu sẵn có của dòng"
+        );
+    }
+
+    #[test]
+    fn output_options_survive_a_round_trip_through_the_database() {
+        // FR-235: thử lại phải tái tạo đúng cấu hình ban đầu, nên mọi lựa chọn
+        // phải quay về nguyên vẹn — kể cả bitrate nằm bên trong biến thể enum,
+        // vốn là chỗ một lược đồ tuần tự hoá sai sẽ đánh rơi âm thầm.
+        let db = temp_db();
+        let mut job = sample_job("job-1");
+        job.output_options = OutputOptions {
+            audio: AudioOutput::Opus {
+                bitrate_kbps: Some(192),
+            },
+            video_container: VideoContainer::Mkv,
+            codec_preference: CodecPreference::Quality,
+            embed_metadata: true,
+            embed_thumbnail: true,
+        };
+        db.insert_job(&job).unwrap();
+
+        let loaded = db.get_job("job-1").unwrap().unwrap();
+        assert_eq!(loaded.output_options, job.output_options);
+        // So sánh nguyên cả bản ghi: `insert_job` gán tham số theo vị trí
+        // `?1..?26`, nên lệch một chỗ là ghi nhầm cột mà vẫn chạy trót lọt.
+        assert_eq!(loaded, job);
+    }
+
+    #[test]
+    fn a_lossless_choice_has_nowhere_to_put_a_bitrate_even_after_a_round_trip() {
+        // FR-203 ở tầng lưu trữ. Kiểu dữ liệu đã khiến `Flac { bitrate }`
+        // không viết ra được, nhưng cột là JSON tự do — nên điều đáng kiểm
+        // chứng là chuỗi thật sự nằm trong CSDL cũng không mang bitrate nào,
+        // chứ không phải chỉ struct trong bộ nhớ.
+        let db = temp_db();
+        let mut job = sample_job("job-1");
+        job.output_options = OutputOptions {
+            audio: AudioOutput::Flac,
+            ..OutputOptions::default()
+        };
+        db.insert_job(&job).unwrap();
+
+        let stored: String = db
+            .conn()
+            .query_row(
+                "SELECT output_options FROM download_jobs WHERE id = 'job-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(stored, r#"{"audio":{"format":"flac"},"video_container":"mp4","codec_preference":"compatibility","embed_metadata":false,"embed_thumbnail":false}"#);
+    }
+
+    #[test]
+    fn an_options_blob_from_an_older_version_keeps_working() {
+        // FR-233: bản ghi lưu trước khi một tuỳ chọn tồn tại phải vẫn đọc
+        // được, và tuỳ chọn mới nhận giá trị mặc định — chứ không làm hỏng cả
+        // bản ghi. Đây là hợp đồng mà các lát cắt sau của phase này (phụ đề,
+        // cắt đoạn, chapter) sẽ dựa vào khi thêm trường mới.
+        let stored = r#"{"audio":{"format":"m4a","bitrate_kbps":256}}"#;
+        let parsed: OutputOptions = serde_json::from_str(stored).expect("vẫn phải đọc được");
+
+        assert_eq!(
+            parsed.audio,
+            AudioOutput::M4a {
+                bitrate_kbps: Some(256)
+            }
+        );
+        assert_eq!(parsed.video_container, VideoContainer::Mp4);
+        assert_eq!(parsed.codec_preference, CodecPreference::Compatibility);
+        assert!(!parsed.embed_metadata);
+    }
+
+    #[test]
+    fn a_corrupted_options_blob_falls_back_to_todays_behaviour() {
+        // Cột JSON không có kiểm tra ở tầng SQL — đó là cái giá đã biết trước
+        // của quyết định gom một cột. Chỗ rơi phải là bộ mặc định (đúng hành
+        // vi hiện hành), chứ không phải một dòng không đọc nổi khiến cả hàng
+        // đợi biến mất khỏi giao diện.
+        let db = temp_db();
+        db.insert_job(&sample_job("job-1")).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE download_jobs SET output_options = 'not json at all' WHERE id = 'job-1'",
+                [],
+            )
+            .unwrap();
+
+        let loaded = db.get_job("job-1").unwrap().expect("dòng vẫn phải đọc được");
+        assert_eq!(loaded.output_options, OutputOptions::default());
     }
 
     #[test]

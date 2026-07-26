@@ -35,6 +35,170 @@ pub enum GalleryMode {
     Slideshow,
 }
 
+/// Định dạng audio đầu ra người dùng chọn (FR-201).
+///
+/// Bitrate nằm **bên trong** các biến thể nén mất dữ liệu, chứ không phải là
+/// một trường riêng cạnh chúng. Đó là điểm mấu chốt của kiểu này: FR-203 nói
+/// bitrate chỉ có nghĩa với định dạng nén mất dữ liệu, và cách duy nhất để
+/// điều đó không bao giờ bị vi phạm là làm cho một `Flac` mang bitrate trở
+/// nên **không biểu diễn được** — không có chỗ nào để đặt con số đó vào. Nếu
+/// bitrate là một trường ngang hàng (`OutputOptions { audio_format, bitrate }`)
+/// thì tổ hợp vô nghĩa vẫn dựng được, và việc nó không lọt xuống yt-dlp sẽ chỉ
+/// còn phụ thuộc vào một câu `if` ai đó nhớ viết — hoặc vào giao diện chịu ẩn
+/// ô nhập, thứ mà spec nói rõ là không được dựa vào.
+///
+/// `bitrate_kbps = None` trên một biến thể mất dữ liệu nghĩa là "không chọn
+/// bitrate cụ thể": bộ dựng tham số khi đó rơi về nhãn chất lượng đã được đối
+/// chiếu với danh sách format thật của nguồn (`DownloadJob.audio_quality`,
+/// FR-019), và nếu cả nhãn đó cũng không có thì để yt-dlp tự chọn mức tốt
+/// nhất. Nhờ vậy mặc định giữ nguyên đúng hành vi hiện tại.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "format", rename_all = "snake_case")]
+pub enum AudioOutput {
+    Mp3 {
+        #[serde(default)]
+        bitrate_kbps: Option<u32>,
+    },
+    M4a {
+        #[serde(default)]
+        bitrate_kbps: Option<u32>,
+    },
+    Opus {
+        #[serde(default)]
+        bitrate_kbps: Option<u32>,
+    },
+    /// Không nén mất dữ liệu — không có trường bitrate nào để đặt (FR-203).
+    Wav,
+    /// Không nén mất dữ liệu — không có trường bitrate nào để đặt (FR-203).
+    Flac,
+    /// Giữ nguyên định dạng nguồn: KHÔNG chạy bất kỳ bước chuyển mã nào
+    /// (FR-202) — không `-x`, không `--audio-format`.
+    Source,
+}
+
+impl Default for AudioOutput {
+    /// MP3 không kèm bitrate rõ ràng — đúng bằng hành vi đang chạy hôm nay,
+    /// nơi `--audio-format mp3` được viết cứng còn bitrate lấy từ
+    /// `DownloadJob.audio_quality`.
+    fn default() -> Self {
+        AudioOutput::Mp3 { bitrate_kbps: None }
+    }
+}
+
+impl AudioOutput {
+    /// Tên định dạng mà `--audio-format` nhận, hoặc `None` khi lựa chọn là
+    /// "giữ nguyên định dạng gốc" (lúc đó không có bước chuyển mã nào).
+    pub fn ytdlp_audio_format(&self) -> Option<&'static str> {
+        match self {
+            AudioOutput::Mp3 { .. } => Some("mp3"),
+            AudioOutput::M4a { .. } => Some("m4a"),
+            AudioOutput::Opus { .. } => Some("opus"),
+            AudioOutput::Wav => Some("wav"),
+            AudioOutput::Flac => Some("flac"),
+            AudioOutput::Source => None,
+        }
+    }
+
+    /// Bitrate người dùng chọn, chỉ tồn tại trên các biến thể mất dữ liệu.
+    ///
+    /// Trả `None` cho WAV/FLAC/Source *về mặt kiểu dữ liệu*, không phải vì một
+    /// nhánh `if` nào đó: các biến thể ấy không mang trường bitrate.
+    pub fn bitrate_kbps(&self) -> Option<u32> {
+        match self {
+            AudioOutput::Mp3 { bitrate_kbps }
+            | AudioOutput::M4a { bitrate_kbps }
+            | AudioOutput::Opus { bitrate_kbps } => *bitrate_kbps,
+            AudioOutput::Wav | AudioOutput::Flac | AudioOutput::Source => None,
+        }
+    }
+
+    /// Định dạng này có nén mất dữ liệu không — tức `--audio-quality` có nghĩa
+    /// gì với nó không (FR-203).
+    pub fn is_lossy(&self) -> bool {
+        matches!(
+            self,
+            AudioOutput::Mp3 { .. } | AudioOutput::M4a { .. } | AudioOutput::Opus { .. }
+        )
+    }
+}
+
+/// Container video đầu ra (FR-204).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoContainer {
+    #[default]
+    Mp4,
+    Mkv,
+    /// Giữ nguyên container nguồn — không truyền `--merge-output-format`, để
+    /// yt-dlp giữ đúng thứ nó tải về.
+    Source,
+}
+
+impl VideoContainer {
+    /// Giá trị cho `--merge-output-format`, hoặc `None` khi giữ nguyên gốc.
+    pub fn merge_output_format(&self) -> Option<&'static str> {
+        match self {
+            VideoContainer::Mp4 => Some("mp4"),
+            VideoContainer::Mkv => Some("mkv"),
+            VideoContainer::Source => None,
+        }
+    }
+}
+
+/// Ưu tiên tương thích hay chất lượng khi chọn codec video (FR-205).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CodecPreference {
+    /// H.264 + AAC như hiện nay: mở được ở gần như mọi trình phát. Là mặc
+    /// định, nên người dùng sẵn có không thấy hành vi đổi.
+    #[default]
+    Compatibility,
+    /// Lấy codec tốt nhất nguồn có, kể cả VP9/AV1 — nén tốt hơn nhưng nhiều
+    /// trình phát cũ và TV không giải mã được.
+    Quality,
+}
+
+/// Toàn bộ lựa chọn đầu ra gắn với một tác vụ (Key Entity "Tuỳ chọn đầu ra").
+///
+/// Lưu vào đúng MỘT cột JSON `download_jobs.output_options` chứ không phải mỗi
+/// lựa chọn một cột: những giá trị này chỉ được bộ chạy tác vụ đọc, không bao
+/// giờ được truy vấn, lọc hay sắp xếp theo, nên một cột riêng không đổi lấy
+/// được gì từ SQLite; trong khi đó số lượng lựa chọn còn tăng tiếp trong chính
+/// phase này (phụ đề, cắt đoạn, chapter, preset). Xem migration 0010.
+///
+/// `#[serde(default)]` ở cả struct lẫn từng trường là thứ hiện thực hoá FR-233:
+/// một bản ghi (hoặc preset) lưu từ phiên bản trước, khi có tuỳ chọn mới được
+/// thêm vào, vẫn đọc được và tuỳ chọn mới nhận giá trị mặc định thay vì làm
+/// hỏng cả bản ghi.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct OutputOptions {
+    pub audio: AudioOutput,
+    pub video_container: VideoContainer,
+    pub codec_preference: CodecPreference,
+    /// FR-208. Xem chú thích của `Default` bên dưới về việc vì sao mặc định ở
+    /// tầng Rust là `false` chứ không phải `true`.
+    pub embed_metadata: bool,
+    /// FR-209. Bị bỏ qua (có ghi nhật ký) khi container đích không chứa được
+    /// ảnh bìa — FR-210 nói rõ đó không phải là lỗi của tác vụ.
+    pub embed_thumbnail: bool,
+}
+
+// `OutputOptions::default()` trả lời câu hỏi "một tác vụ có TRƯỚC tính năng này
+// thì có nghĩa là gì?" — và câu trả lời đúng duy nhất là "đúng hành vi mà nó đã
+// chạy khi được tạo": MP3/MP4, ưu tiên tương thích, không nhúng gì cả. Vì thế
+// hai cờ nhúng mặc định `false` ở đây.
+//
+// Đó là một câu hỏi KHÁC với "một tác vụ MỚI nên bắt đầu từ đâu?", vốn do
+// FR-208/FR-209 quy định là bật sẵn cả hai. Câu hỏi thứ hai được trả lời ở
+// `NEW_JOB_OUTPUT_OPTIONS` trong `src/types/download.ts` — nơi giao diện lấy
+// giá trị khởi tạo cho bộ chọn.
+//
+// Gộp hai câu hỏi vào một giá trị chính là cách một lần thay mặc định âm thầm
+// viết lại ý nghĩa của những dòng dữ liệu cũ: mọi tác vụ đã tải xong từ trước
+// bỗng nhiên "đã từng được yêu cầu nhúng metadata", và một lần thử lại sẽ tái
+// tạo ra thứ khác hẳn bản gốc — trái thẳng FR-235.
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
@@ -134,6 +298,12 @@ pub struct DownloadJob {
     /// Khi khác `None` và ở tương lai, job này đang chờ tới lượt thử lại và
     /// bộ điều phối sẽ bỏ qua nó cho tới thời điểm đó (FR-121).
     pub next_retry_at: Option<String>,
+    /// Lựa chọn đầu ra đã dùng cho tác vụ này (FR-235): lưu cùng tác vụ nên
+    /// một lần thử lại tái tạo đúng cấu hình ban đầu thay vì cấu hình đang
+    /// hiển thị trên màn hình lúc bấm thử lại. Dòng tạo trước khi cột này tồn
+    /// tại đọc ra `OutputOptions::default()`, tức đúng hành vi chúng đã chạy.
+    #[serde(default)]
+    pub output_options: OutputOptions,
 }
 
 /// Mirrors `data-model.md` §2 (MediaSource). `available_audio_formats` /
