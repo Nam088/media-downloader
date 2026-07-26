@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useTheme } from "next-themes";
-import { Download, Sparkles, Home as HomeIcon, History as HistoryIcon, Settings as SettingsIcon, ScrollText } from "lucide-react";
+import { Download, Sparkles, Home as HomeIcon, History as HistoryIcon, Settings as SettingsIcon, ScrollText, Library as LibraryIcon } from "lucide-react";
 import { ThemeProvider } from "@/components/theme-provider";
 import { ComplianceDisclaimer } from "@/components/ComplianceDisclaimer";
 import { ThemeToggle } from "@/components/ThemeToggle";
@@ -10,10 +10,11 @@ import { Toaster } from "@/components/ui/sonner";
 import { useAppSettings } from "@/hooks/use-app-settings";
 import { Home } from "@/pages/Home";
 import { History } from "@/pages/History";
+import { Library } from "@/pages/Library";
 import { Settings } from "@/pages/Settings";
 import { Logs } from "@/pages/Logs";
 
-type Route = "home" | "history" | "logs" | "settings";
+type Route = "home" | "library" | "history" | "logs" | "settings";
 
 function useSyncBackendSettings() {
   const { settings } = useAppSettings();
@@ -44,6 +45,7 @@ function AppShell() {
   // most users need in the main nav; toggled on from Settings.
   const navItems: { id: Route; label: string; icon: typeof HomeIcon }[] = [
     { id: "home", label: t("nav.home", "Home"), icon: HomeIcon },
+    { id: "library", label: t("nav.library"), icon: LibraryIcon },
     { id: "history", label: t("nav.history", "History"), icon: HistoryIcon },
     ...(settings?.show_logs_tab
       ? [{ id: "logs" as const, label: t("nav.logs", "Logs"), icon: ScrollText }]
@@ -112,6 +114,14 @@ function AppShell() {
       <main className="flex-1 py-4">
         <div className={effectiveRoute === "home" ? "block animate-in fade-in-50 slide-in-from-bottom-2 zoom-in-98 duration-300 ease-out" : "hidden"}>
           <Home />
+        </div>
+        {/* Every page is mounted at once and toggled with block/hidden, so the
+            Library exists from the first frame. It is told whether it is the
+            visible route rather than fetching on mount: a library query plus a
+            disk reconciliation pass on every app start, for a tab nobody
+            opened, is not free. */}
+        <div className={effectiveRoute === "library" ? "block animate-in fade-in-50 slide-in-from-bottom-2 zoom-in-98 duration-300 ease-out" : "hidden"}>
+          <Library active={effectiveRoute === "library"} />
         </div>
         <div className={effectiveRoute === "history" ? "block animate-in fade-in-50 slide-in-from-bottom-2 zoom-in-98 duration-300 ease-out" : "hidden"}>
           <History />
