@@ -1,9 +1,18 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
-import { Clock, Globe, FolderOpen, Loader2, Download, Search, Images } from "lucide-react";
+import {
+  Clock,
+  Globe,
+  FolderOpen,
+  Loader2,
+  Download,
+  Search,
+  Images,
+  FileUp,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
@@ -11,10 +20,13 @@ import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { ErrorBanner } from "@/components/ErrorBanner";
+import { BatchPanel } from "@/components/BatchPanel";
 import { GalleryItemPicker } from "@/components/GalleryItemPicker";
 import { PlaylistDetailPanel } from "@/components/PlaylistDetailPanel";
 import { PlaylistScopeDialog } from "@/components/PlaylistScopeDialog";
 import { useAppSettings } from "@/hooks/use-app-settings";
+import { useBatchDownload, type BatchMediaType } from "@/hooks/use-batch-download";
+import { URL_LIST_EXTENSIONS, useFileDrop } from "@/hooks/use-file-drop";
 import { useQueueStore } from "@/stores/queue-store";
 import {
   GENERIC_PLAYLIST_AUDIO_QUALITIES,
@@ -23,7 +35,7 @@ import {
 } from "@/lib/generic-quality-options";
 import { buildJobInput } from "@/lib/build-job-input";
 import { formatDuration, formatFileSize } from "@/lib/format";
-import { extractUrlsFromText } from "@/lib/url-parsing";
+import { dedupeUrls, extractUrlsFromText } from "@/lib/url-parsing";
 import type {
   AppError,
   AudioFormatOption,
@@ -203,8 +215,8 @@ export function DownloadForm() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<AppError | null>(null);
   const [playlistDialogOpen, setPlaylistDialogOpen] = useState(false);
-  const [batchErrors, setBatchErrors] = useState<{ url: string; message: string }[]>([]);
   const { settings } = useAppSettings();
+  const batch = useBatchDownload();
 
   // Fall back to the persisted default (FR-008/Settings) so users don't have
   // to pick a folder on every single download; an explicit manual pick (via
@@ -215,6 +227,43 @@ export function DownloadForm() {
 
   const urls = extractUrlsFromText(rawInput);
   const isBatchMode = urls.length > 1;
+
+  /** Merge an externally-sourced list (dropped file, imported file) into the
+   * textarea without losing what is already typed there, and without adding a
+   * link twice. */
+  const mergeImportedUrls = useCallback(
+    (imported: string[]) => {
+      if (imported.length === 0) {
+        toast.info(t("downloadForm.dropped_urls_none"));
+        return;
+      }
+      setRawInput((current) => {
+        const merged = dedupeUrls([...extractUrlsFromText(current), ...imported]);
+        return merged.unique.join("\n");
+      });
+      toast.success(t("downloadForm.dropped_urls", { count: imported.length }));
+    },
+    [t],
+  );
+
+  useFileDrop(mergeImportedUrls);
+
+  async function handleImportUrlList() {
+    const selected = await openDialog({
+      multiple: false,
+      filters: [{ name: "URL list", extensions: [...URL_LIST_EXTENSIONS] }],
+    });
+    if (typeof selected !== "string") return;
+    setError(null);
+    try {
+      // Invoked directly rather than through `readUrlListFiles`: that helper
+      // swallows a bad file so one dud can't kill a multi-file drop, but here
+      // the user picked exactly one file and deserves to be told why it failed.
+      mergeImportedUrls(await invoke<string[]>("read_url_list_file", { path: selected }));
+    } catch (err) {
+      setError(err as AppError);
+    }
+  }
 
   async function handlePreview() {
     if (urls.length !== 1) return;
@@ -287,6 +336,7 @@ export function DownloadForm() {
     setPreview(null);
     setAudioQuality(undefined);
     setVideoQuality(undefined);
+    batch.reset();
   }
 
   async function submitSingleJob(scope?: "single_item" | "entire_playlist") {
@@ -333,49 +383,21 @@ export function DownloadForm() {
     submitSingleJob();
   }
 
-  async function handleDownloadAllBatch() {
+  /** Runs the whole pasted list with one shared media-type choice; per-link
+   * quality still comes from each link's own preview (FR-019), and each link's
+   * outcome is reported individually by `BatchPanel`. */
+  async function handleRunBatch(batchMediaType: BatchMediaType) {
     if (!effectiveOutputDirectory) return;
-    setSubmitting(true);
     setError(null);
-    setBatchErrors([]);
-    const errors: { url: string; message: string }[] = [];
-
-    for (const url of urls) {
-      try {
-        const previewResult = await invoke<MediaSource>("preview_media", { sourceUrl: url });
-        // Batch mode's whole point is "grab audio from each link with no
-        // per-item decisions" — for a gallery-backed link (no audio/video
-        // quality concept at all), the closest equivalent is "keep just the
-        // audio track", not a plain audio download that link doesn't have.
-        const input: CreateJobInput = buildJobInput({
-          preview: previewResult,
-          mediaType: "audio",
-          audioQuality:
-            previewResult.available_audio_formats.length > 0
-              ? audioQualityValue(previewResult.available_audio_formats[0].bitrate_kbps)
-              : null,
-          videoQuality: null,
-          outputDirectory: effectiveOutputDirectory,
-          // Only consulted for a gallery-backed link, which has no
-          // audio/video quality concept at all — "keep just the audio track"
-          // is the closest equivalent to batch mode's plain audio download.
-          galleryMode: "audio_only",
-        });
-        const createdJobs = await invoke<DownloadJob[]>("create_download_job", { input });
-        useQueueStore.getState().upsertJobs(createdJobs);
-      } catch (err) {
-        const appError = err as AppError;
-        errors.push({ url, message: appError.message });
-      }
-    }
-
-    setBatchErrors(errors);
-    setSubmitting(false);
-    if (errors.length === 0) {
+    const summary = await batch.run({
+      urls,
+      mediaType: batchMediaType,
+      outputDirectory: effectiveOutputDirectory,
+    });
+    if (summary.failed > 0) {
+      toast.warning(t("downloadForm.batch_partial_failure", { count: summary.failed }));
+    } else if (summary.created > 0) {
       toast.success(t("downloadForm.added_to_queue"));
-      resetForm();
-    } else {
-      toast.warning(t("downloadForm.batch_partial_failure", { count: errors.length }));
     }
   }
 
@@ -395,7 +417,6 @@ export function DownloadForm() {
       galleryHasValidSelection &&
       (mediaType === "gallery" || preview.is_playlist || selectedQuality),
   );
-  const canDownloadBatch = Boolean(effectiveOutputDirectory && !submitting && urls.length > 0);
   // Guard on the raw value, not the formatted string: formatDuration always
   // returns a placeholder, so testing its result would show a `--:--` clock
   // badge on sources with no duration (live streams). `!= null` rather than a
@@ -415,14 +436,22 @@ export function DownloadForm() {
                 {t("downloadForm.url_label")}
               </Label>
               <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleImportUrlList}
+                  className="inline-flex items-center gap-1.5 text-xs font-semibold text-primary transition-all hover:underline"
+                >
+                  <FileUp className="h-3.5 w-3.5" />
+                  {t("downloadForm.import_url_list")}
+                </button>
                 {rawInput.trim().length > 0 && (
                   <button
                     type="button"
                     onClick={() => setRawInput(urls.join("\n"))}
                     className="text-xs font-semibold text-primary hover:underline transition-all"
-                    title="Loại bỏ ký tự thừa & giữ lại link hợp lệ"
+                    title={t("downloadForm.clean_links_hint")}
                   >
-                    Làm sạch link ({urls.length} link hợp lệ)
+                    {t("downloadForm.clean_links", { count: urls.length })}
                   </button>
                 )}
                 {urls.length > 0 && (
@@ -445,7 +474,7 @@ export function DownloadForm() {
                   if (extracted.length > 0) {
                     e.preventDefault();
                     setRawInput(extracted.join("\n"));
-                    toast.success(`Đã tự động lọc ${extracted.length} link hợp lệ`);
+                    toast.success(t("downloadForm.paste_filtered", { count: extracted.length }));
                   }
                 }}
                 placeholder={t("downloadForm.url_placeholder_multi")}
@@ -633,37 +662,28 @@ export function DownloadForm() {
           </div>
         )}
 
-        {batchErrors.length > 0 && (
-          <ul className="flex flex-col gap-1 px-6 text-sm text-destructive">
-            {batchErrors.map((e) => (
-              <li key={e.url} className="truncate">
-                {e.url}: {e.message}
-              </li>
-            ))}
-          </ul>
+        {isBatchMode && (
+          <BatchPanel
+            urls={urls}
+            items={batch.items}
+            running={batch.running}
+            onRun={(batchMediaType) => void handleRunBatch(batchMediaType)}
+            disabled={!effectiveOutputDirectory}
+          />
         )}
 
         <div className="flex items-center justify-end gap-3 border-t border-border/60 bg-muted/20 px-6 py-4">
           {(preview || isBatchMode) && (
-            <Button variant="ghost" onClick={resetForm} disabled={submitting} className="rounded-lg text-sm font-medium h-10 px-4">
+            <Button
+              variant="ghost"
+              onClick={resetForm}
+              disabled={submitting || batch.running}
+              className="rounded-lg text-sm font-medium h-10 px-4"
+            >
               {t("common.cancel")}
             </Button>
           )}
-          {isBatchMode ? (
-            <Button onClick={handleDownloadAllBatch} disabled={!canDownloadBatch} className="rounded-lg shadow-xs h-10 px-6 text-sm font-semibold gap-2">
-              {submitting ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin text-primary-foreground" />
-                  <span>{t("common.loading")}</span>
-                </>
-              ) : (
-                <>
-                  <Download className="h-4 w-4" />
-                  <span>{t("downloadForm.download_all_button", { count: urls.length })}</span>
-                </>
-              )}
-            </Button>
-          ) : (
+          {!isBatchMode &&
             // Hidden once the playlist's own entries are showing inline
             // (PlaylistDetailPanel below). That panel has its own submit
             // button, since it queues a per-item selection this generic
@@ -689,8 +709,7 @@ export function DownloadForm() {
                   </>
                 )}
               </Button>
-            )
-          )}
+            )}
         </div>
       </CardContent>
 
