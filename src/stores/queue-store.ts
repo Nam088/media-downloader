@@ -11,6 +11,8 @@ interface QueueState {
   upsertJobs: (jobs: DownloadJob[]) => void;
   applyProgress: (event: JobProgressEvent) => void;
   applyStatusChanged: (event: JobStatusChangedEvent) => void;
+  hydrate: () => Promise<void>;
+  orderedJobs: () => DownloadJob[];
   pauseJob: (jobId: string) => Promise<void>;
   resumeJob: (jobId: string) => Promise<void>;
   cancelJob: (jobId: string) => Promise<void>;
@@ -56,6 +58,43 @@ export const useQueueStore = create<QueueState>((set, get) => ({
         },
       };
     }),
+  /**
+   * Reloads the queue from the database. The store used to live only in
+   * memory, so closing the app threw away the entire visible queue even though
+   * SQLite had kept every row and `list_queue` had existed, uncalled, the whole
+   * time (FR-114). Jobs interrupted by the last shutdown come back as `paused`
+   * and resume from their partial file — but only if the user can see them.
+   *
+   * Never throws: an empty queue is still a usable app, an exception during
+   * startup that blanks the screen is not.
+   */
+  hydrate: async () => {
+    try {
+      const rows = await invoke<DownloadJob[]>("list_queue");
+      if (!Array.isArray(rows)) return;
+      set((state) => {
+        const jobs = { ...state.jobs };
+        for (const row of rows) {
+          // Merge rather than replace, and let whatever is already in the
+          // store win: a `job:status_changed` event can land while this
+          // snapshot is in flight, and the event is by definition newer than
+          // the rows the database returned before it fired. At startup the
+          // store is empty anyway, so in practice this just adds everything.
+          if (!jobs[row.id]) jobs[row.id] = row;
+        }
+        return { jobs };
+      });
+    } catch (error) {
+      console.error("failed to restore the download queue", error);
+    }
+  },
+  /** Display order must equal run order: `queue_position` first (an f64 using
+   * fractional indexing, so 1.5 and -3.25 are ordinary values), then
+   * `created_at` to break ties. */
+  orderedJobs: () =>
+    Object.values(get().jobs).sort(
+      (a, b) => a.queue_position - b.queue_position || a.created_at.localeCompare(b.created_at),
+    ),
   pauseJob: async (jobId) => {
     await invoke("pause_job", { jobId });
   },
