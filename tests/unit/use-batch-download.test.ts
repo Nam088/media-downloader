@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useBatchDownload } from "@/hooks/use-batch-download";
 import { useQueueStore } from "@/stores/queue-store";
+import { NEW_JOB_OUTPUT_OPTIONS } from "@/types/download";
 import type { CreateJobInput, DownloadJob, MediaSource } from "@/types/download";
 
 /**
@@ -326,6 +327,71 @@ describe("useBatchDownload (FR-101, FR-102, FR-103)", () => {
       `job-${urls[0]}`,
       `job-${urls[1]}`,
     ]);
+  });
+
+  // FR-232 — one set of choices for the whole paste. This hook used to call
+  // `buildJobInput` with no options at all, which made a pasted list the one
+  // path that ignored the picker entirely.
+  it("attaches the shared output options to every job in the batch (FR-232)", async () => {
+    const urls = ["https://a.example/1", "https://b.example/2"];
+    mockPreviews({ [urls[0]]: previewFor(urls[0]), [urls[1]]: previewFor(urls[1]) });
+    const outputOptions = { ...NEW_JOB_OUTPUT_OPTIONS, audio: { format: "flac" } } as const;
+
+    const { result } = renderHook(() => useBatchDownload());
+    await act(async () => {
+      await result.current.run({
+        urls,
+        mediaType: "audio",
+        outputDirectory: "/out",
+        outputOptions,
+      });
+    });
+
+    const inputs = createdInputs();
+    expect(inputs).toHaveLength(2);
+    for (const input of inputs) {
+      expect(input.output_options).toEqual(outputOptions);
+    }
+  });
+
+  // Omitting them stays a supported call that means today's behaviour, so a
+  // caller with no picker is not forced to invent a value.
+  it("sends no output options at all when the caller passes none", async () => {
+    const urls = ["https://a.example/1"];
+    mockPreviews({ [urls[0]]: previewFor(urls[0]) });
+
+    const { result } = renderHook(() => useBatchDownload());
+    await act(async () => {
+      await result.current.run({ urls, mediaType: "audio", outputDirectory: "/out" });
+    });
+
+    expect(createdInputs()[0]).not.toHaveProperty("output_options");
+  });
+
+  // FR-234 — a gallery-backed link runs through gallery-dl, which reads none
+  // of these fields; recording them would claim a choice that was ignored.
+  it("keeps the output options off a gallery job (FR-234)", async () => {
+    const url = "https://tiktok.com/@a/photo/1";
+    mockPreviews({
+      [url]: previewFor(url, {
+        is_gallery: true,
+        available_video_qualities: [],
+        available_audio_formats: [],
+        gallery_items: [{ url: "https://cdn/1.jpg", extension: "jpg", is_audio: false }],
+      }),
+    });
+
+    const { result } = renderHook(() => useBatchDownload());
+    await act(async () => {
+      await result.current.run({
+        urls: [url],
+        mediaType: "audio",
+        outputDirectory: "/out",
+        outputOptions: NEW_JOB_OUTPUT_OPTIONS,
+      });
+    });
+
+    expect(createdInputs()[0]).not.toHaveProperty("output_options");
   });
 
   it("reports running while the batch is in flight and stops when it ends", async () => {

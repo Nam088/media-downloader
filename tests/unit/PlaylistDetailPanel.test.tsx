@@ -1,9 +1,10 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke } from "@tauri-apps/api/core";
 import { DownloadForm } from "@/components/DownloadForm";
-import type { MediaSource } from "@/types/download";
+import { NEW_JOB_OUTPUT_OPTIONS } from "@/types/download";
+import type { CreatePlaylistJobsInput, MediaSource } from "@/types/download";
 import type { AppSettings } from "@/types/settings";
 
 // Mirrors the backend's own defaults (see `Db::get_settings`), except for the
@@ -40,6 +41,14 @@ const PLAYLIST_PREVIEW: MediaSource = {
   })),
 };
 
+/** The `create_playlist_download_jobs` payloads, in call order. */
+function playlistInputs(): CreatePlaylistJobsInput[] {
+  return vi
+    .mocked(invoke)
+    .mock.calls.filter(([cmd]) => cmd === "create_playlist_download_jobs")
+    .map(([, args]) => (args as { input: CreatePlaylistJobsInput }).input);
+}
+
 function mockGetSettingsThenPreview(preview: MediaSource) {
   vi.mocked(invoke).mockImplementation((cmd: string) => {
     if (cmd === "get_settings") return Promise.resolve(SAMPLE_SETTINGS);
@@ -71,5 +80,67 @@ describe("Playlist detail panel (inline, reproduction)", () => {
     expect(screen.getByText("Video 0")).toBeInTheDocument();
     expect(screen.getByText("Video 6")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /download video/i })).not.toBeInTheDocument();
+  });
+
+  // FR-232. `CreatePlaylistJobsInput.output_options` existed from the day this
+  // command shipped and nothing ever filled it, so every playlist submission
+  // silently produced the pre-Phase-2 defaults no matter what was on screen.
+  it("carries the chosen output options into the playlist submission (FR-232)", async () => {
+    mockGetSettingsThenPreview(PLAYLIST_PREVIEW);
+    const user = userEvent.setup();
+    render(<DownloadForm />);
+
+    await user.type(screen.getByLabelText(/video or audio link/i), PLAYLIST_PREVIEW.source_url);
+    await user.click(screen.getByRole("button", { name: /preview/i }));
+    expect(await screen.findByText(/Choose videos to download/i)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /output options/i }));
+    await user.click(screen.getByRole("radio", { name: /^MKV$/ }));
+    await user.click(screen.getByRole("button", { name: /download 7 selected/i }));
+
+    await waitFor(() => expect(playlistInputs()).toHaveLength(1));
+    expect(playlistInputs()[0].output_options).toEqual({
+      ...NEW_JOB_OUTPUT_OPTIONS,
+      video_container: "mkv",
+    });
+  });
+
+  it("blocks the playlist submission while the trim range is unusable (FR-223)", async () => {
+    mockGetSettingsThenPreview(PLAYLIST_PREVIEW);
+    const user = userEvent.setup();
+    render(<DownloadForm />);
+
+    await user.type(screen.getByLabelText(/video or audio link/i), PLAYLIST_PREVIEW.source_url);
+    await user.click(screen.getByRole("button", { name: /preview/i }));
+    expect(await screen.findByText(/Choose videos to download/i)).toBeInTheDocument();
+
+    const submit = screen.getByRole("button", { name: /download 7 selected/i });
+    expect(submit).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: /output options/i }));
+    await user.click(screen.getByRole("radio", { name: /just one part/i }));
+
+    expect(screen.getByRole("button", { name: /download 7 selected/i })).toBeDisabled();
+
+    await user.type(screen.getByLabelText(/start at/i), "0:30");
+
+    expect(screen.getByRole("button", { name: /download 7 selected/i })).toBeEnabled();
+  });
+
+  // A flat playlist preview never fetched per-video metadata, so neither list
+  // was checked — which is not the same as their being empty.
+  it("says the subtitle and chapter lists were never checked for a playlist", async () => {
+    mockGetSettingsThenPreview(PLAYLIST_PREVIEW);
+    const user = userEvent.setup();
+    render(<DownloadForm />);
+
+    await user.type(screen.getByLabelText(/video or audio link/i), PLAYLIST_PREVIEW.source_url);
+    await user.click(screen.getByRole("button", { name: /preview/i }));
+    expect(await screen.findByText(/Choose videos to download/i)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /output options/i }));
+
+    expect(screen.getByText(/subtitles was never checked/i)).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /one file per chapter/i })).toBeDisabled();
+    expect(screen.getByText(/Chapters were never checked/i)).toBeInTheDocument();
   });
 });

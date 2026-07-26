@@ -13,10 +13,20 @@ import {
   videoOutputDetail,
   type AudioFormat,
 } from "@/lib/output-format-labels";
-import { supportsBitrate, supportsCoverArt } from "@/types/download";
+import { PresetManager } from "@/components/PresetManager";
+import { SegmentOptionsPicker } from "@/components/SegmentOptionsPicker";
+import { SubtitleOptionsPicker } from "@/components/SubtitleOptionsPicker";
+import {
+  NEW_JOB_SEGMENT_MODE,
+  NEW_JOB_SUBTITLE_OPTIONS,
+  supportsBitrate,
+  supportsCoverArt,
+  supportsEmbeddedSubtitles,
+} from "@/types/download";
 import type {
   AudioOutput,
   CodecPreference,
+  MediaSource,
   MediaType,
   OutputOptions,
   VideoContainer,
@@ -97,12 +107,34 @@ function coverArtBlockedReasonKey(
     : "downloadForm.output_cover_art_unavailable_source";
 }
 
+/** FR-220 — why a subtitle track cannot be embedded into this particular
+ * choice. `null` when it can. Mirrors `queue::subtitle_embed_support`. */
+function subtitleEmbedBlockedReasonKey(
+  mediaType: MediaType,
+  options: OutputOptions,
+): string | null {
+  if (supportsEmbeddedSubtitles(mediaType, options)) return null;
+  return mediaType === "audio"
+    ? "downloadForm.subtitles_embed_unavailable_audio"
+    : "downloadForm.subtitles_embed_unavailable_source";
+}
+
 export interface OutputOptionsPickerProps {
   /** Decides which controls even apply: audio jobs never use the container,
    * video jobs never use the audio format, gallery jobs use none of it. */
   mediaType: MediaType;
   value: OutputOptions;
   onChange: (next: OutputOptions) => void;
+  /**
+   * The link these options will be applied to, when there is exactly one.
+   *
+   * Supplies the three source-dependent facts the sub-pickers need — the
+   * subtitle list, the chapter list, and the duration — and the format list
+   * a preset is reconciled against (FR-231). `null`/omitted is the batch case:
+   * several links share one set of options, so nothing here is knowable, and
+   * every control that depends on the source says so rather than guessing.
+   */
+  source?: MediaSource | null;
 }
 
 /**
@@ -114,13 +146,38 @@ export interface OutputOptionsPickerProps {
  * run (FR-207) — hiding that behind the toggle would mean the users who never
  * open the section are exactly the ones never told.
  */
-export function OutputOptionsPicker({ mediaType, value, onChange }: OutputOptionsPickerProps) {
+export function OutputOptionsPicker({
+  mediaType,
+  value,
+  onChange,
+  source,
+}: OutputOptionsPickerProps) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
 
   // FR-234: a gallery-dl job never reaches yt-dlp, so none of these choices
   // are read. Hiding them beats rendering controls whose input is discarded.
   if (mediaType === "gallery") return null;
+
+  /**
+   * Every change leaves through here so one rule cannot be applied by some
+   * controls and forgotten by others: switching the container to "keep source"
+   * takes away the ability to embed a subtitle track (FR-220), and a delivery
+   * choice made before that switch would otherwise survive as a request the
+   * backend silently drops.
+   */
+  function emit(next: OutputOptions) {
+    const subtitles = next.subtitles;
+    if (
+      subtitles &&
+      subtitles.delivery === "embedded" &&
+      !supportsEmbeddedSubtitles(mediaType, next)
+    ) {
+      onChange({ ...next, subtitles: { ...subtitles, delivery: "separate_files" } });
+      return;
+    }
+    onChange(next);
+  }
 
   const isAudio = mediaType === "audio";
   const bitrate = currentBitrate(value.audio);
@@ -180,6 +237,16 @@ export function OutputOptionsPicker({ mediaType, value, onChange }: OutputOption
 
       {open && (
         <div className="flex flex-col gap-4 border-t border-border/60 pt-3">
+          {/* FR-228→FR-233. Inside the collapsed section on purpose: presets
+              are an advanced-user tool, and the spec's assumptions say the
+              basic flow must not grow a control for them. */}
+          <PresetManager
+            value={value}
+            onApply={onChange}
+            mediaType={mediaType}
+            source={source}
+          />
+
           {isAudio ? (
             <>
               <div className="flex flex-col gap-2">
@@ -189,7 +256,7 @@ export function OutputOptionsPicker({ mediaType, value, onChange }: OutputOption
                 <RadioGroup
                   value={value.audio.format}
                   onValueChange={(next) =>
-                    onChange({ ...value, audio: withAudioFormat(value.audio, next as AudioFormat) })
+                    emit({ ...value, audio: withAudioFormat(value.audio, next as AudioFormat) })
                   }
                   className="grid grid-cols-3 gap-1.5"
                 >
@@ -219,7 +286,7 @@ export function OutputOptionsPicker({ mediaType, value, onChange }: OutputOption
                   <RadioGroup
                     value={bitrate == null ? AUTO_BITRATE_VALUE : String(bitrate)}
                     onValueChange={(next) =>
-                      onChange({
+                      emit({
                         ...value,
                         audio: withBitrate(
                           value.audio,
@@ -263,7 +330,7 @@ export function OutputOptionsPicker({ mediaType, value, onChange }: OutputOption
                 <RadioGroup
                   value={value.video_container}
                   onValueChange={(next) =>
-                    onChange({ ...value, video_container: next as VideoContainer })
+                    emit({ ...value, video_container: next as VideoContainer })
                   }
                   className="grid grid-cols-3 gap-1.5"
                 >
@@ -289,7 +356,7 @@ export function OutputOptionsPicker({ mediaType, value, onChange }: OutputOption
                 <RadioGroup
                   value={value.codec_preference}
                   onValueChange={(next) =>
-                    onChange({ ...value, codec_preference: next as CodecPreference })
+                    emit({ ...value, codec_preference: next as CodecPreference })
                   }
                   className="gap-1.5"
                 >
@@ -328,7 +395,7 @@ export function OutputOptionsPicker({ mediaType, value, onChange }: OutputOption
               <Switch
                 id="embed-metadata"
                 checked={value.embed_metadata}
-                onCheckedChange={(checked) => onChange({ ...value, embed_metadata: checked })}
+                onCheckedChange={(checked) => emit({ ...value, embed_metadata: checked })}
               />
             </div>
 
@@ -350,10 +417,29 @@ export function OutputOptionsPicker({ mediaType, value, onChange }: OutputOption
                 id="embed-thumbnail"
                 checked={value.embed_thumbnail && coverArtBlockedKey === null}
                 disabled={coverArtBlockedKey !== null}
-                onCheckedChange={(checked) => onChange({ ...value, embed_thumbnail: checked })}
+                onCheckedChange={(checked) => emit({ ...value, embed_thumbnail: checked })}
               />
             </div>
           </div>
+
+          {/* FR-217→FR-221. The three states of `source.subtitles` are passed
+              straight through; `source` being absent (a batch) is itself the
+              "not checked" state, which is exactly what it means. */}
+          <SubtitleOptionsPicker
+            tracks={source?.subtitles}
+            value={value.subtitles ?? NEW_JOB_SUBTITLE_OPTIONS}
+            onChange={(subtitles) => emit({ ...value, subtitles })}
+            embedSupported={supportsEmbeddedSubtitles(mediaType, value)}
+            embedBlockedReasonKey={subtitleEmbedBlockedReasonKey(mediaType, value)}
+          />
+
+          {/* FR-222→FR-227. */}
+          <SegmentOptionsPicker
+            value={value.segment ?? NEW_JOB_SEGMENT_MODE}
+            onChange={(segment) => emit({ ...value, segment })}
+            chapters={source?.chapters}
+            durationSeconds={source?.duration_seconds}
+          />
         </div>
       )}
     </div>

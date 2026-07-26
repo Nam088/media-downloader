@@ -35,6 +35,7 @@ import {
   audioQualityValue,
 } from "@/lib/generic-quality-options";
 import { buildJobInput } from "@/lib/build-job-input";
+import { trimErrorFor } from "@/lib/trim-input";
 import { audioOutputDetail, videoOutputDetail } from "@/lib/output-format-labels";
 import { formatDuration, formatFileSize } from "@/lib/format";
 import { dedupeUrls, extractUrlsFromText } from "@/lib/url-parsing";
@@ -232,6 +233,10 @@ export function DownloadForm() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<AppError | null>(null);
   const [playlistDialogOpen, setPlaylistDialogOpen] = useState(false);
+  // Held here, not in BatchPanel, so the shared output picker above the list
+  // shows the controls that match what the batch will be downloaded as.
+  // Audio is the common case and stays the default.
+  const [batchMediaType, setBatchMediaType] = useState<BatchMediaType>("audio");
   const { settings } = useAppSettings();
   const batch = useBatchDownload();
 
@@ -406,13 +411,16 @@ export function DownloadForm() {
   /** Runs the whole pasted list with one shared media-type choice; per-link
    * quality still comes from each link's own preview (FR-019), and each link's
    * outcome is reported individually by `BatchPanel`. */
-  async function handleRunBatch(batchMediaType: BatchMediaType) {
+  async function handleRunBatch(runMediaType: BatchMediaType) {
     if (!effectiveOutputDirectory) return;
     setError(null);
     const summary = await batch.run({
       urls,
-      mediaType: batchMediaType,
+      mediaType: runMediaType,
       outputDirectory: effectiveOutputDirectory,
+      // FR-232 — the same choices for every link in the paste. Without this
+      // the batch path was the one that quietly reverted to MP3/MP4.
+      outputOptions,
     });
     if (summary.failed > 0) {
       toast.warning(t("downloadForm.batch_partial_failure", { count: summary.failed }));
@@ -430,11 +438,16 @@ export function DownloadForm() {
   // AudioOnly ignores the image selection entirely (it discards images
   // regardless), so it's the one gallery mode that's fine with zero picked.
   const galleryHasValidSelection = mediaType !== "gallery" || galleryMode === "audio_only" || selectedGalleryIndices.size > 0;
+  // FR-223 — an unusable trim range blocks the job at the button, matching
+  // the message the picker already shows at the field. The same check runs in
+  // the backend, which is what actually enforces it (`TrimRange::validate`).
+  const trimError = trimErrorFor(outputOptions, preview?.duration_seconds);
   const canDownloadSingle = Boolean(
     preview &&
       effectiveOutputDirectory &&
       !submitting &&
       galleryHasValidSelection &&
+      trimError === null &&
       (mediaType === "gallery" || preview.is_playlist || selectedQuality),
   );
   // Guard on the raw value, not the formatted string: formatDuration always
@@ -588,7 +601,12 @@ export function DownloadForm() {
 
             {preview.is_playlist && preview.playlist_entries.length > 0 ? (
               <div className="px-6 pt-2 pb-4">
-                <PlaylistDetailPanel preview={preview} outputDirectory={effectiveOutputDirectory} />
+                <PlaylistDetailPanel
+                  preview={preview}
+                  outputDirectory={effectiveOutputDirectory}
+                  outputOptions={outputOptions}
+                  onOutputOptionsChange={setOutputOptions}
+                />
               </div>
             ) : preview.is_gallery ? (
               <div className="flex flex-col gap-6 px-6 pt-2 pb-2">
@@ -680,6 +698,7 @@ export function DownloadForm() {
                   mediaType={mediaType}
                   value={outputOptions}
                   onChange={setOutputOptions}
+                  source={preview}
                 />
               </div>
             )}
@@ -702,13 +721,29 @@ export function DownloadForm() {
         )}
 
         {isBatchMode && (
-          <BatchPanel
-            urls={urls}
-            items={batch.items}
-            running={batch.running}
-            onRun={(batchMediaType) => void handleRunBatch(batchMediaType)}
-            disabled={!effectiveOutputDirectory}
-          />
+          <>
+            {/* FR-232 — one picker for the whole paste. `source` is null on
+                purpose: several links have no single format list, no single
+                subtitle list and no single chapter list, and the picker says
+                so rather than describing one link as if it were all of them. */}
+            <div className="px-6 pb-2">
+              <OutputOptionsPicker
+                mediaType={batchMediaType}
+                value={outputOptions}
+                onChange={setOutputOptions}
+                source={null}
+              />
+            </div>
+            <BatchPanel
+              urls={urls}
+              items={batch.items}
+              running={batch.running}
+              mediaType={batchMediaType}
+              onMediaTypeChange={setBatchMediaType}
+              onRun={(runMediaType) => void handleRunBatch(runMediaType)}
+              disabled={!effectiveOutputDirectory || trimError !== null}
+            />
+          </>
         )}
 
         <div className="flex items-center justify-end gap-3 border-t border-border/60 bg-muted/20 px-6 py-4">
