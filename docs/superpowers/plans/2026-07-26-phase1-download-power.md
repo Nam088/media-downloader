@@ -49,7 +49,7 @@
 
 | File | Thay đổi |
 |---|---|
-| `src-tauri/src/db/mod.rs` | Đăng ký migration 0008; thêm `next_dispatchable_job`, `next_queue_position`, `set_queue_positions`, `reset_interrupted_jobs`, `mark_job_for_retry`, `bulk_update_status`; mở rộng `insert_job`/`row_to_job`; 4 setting mới |
+| `src-tauri/src/db/mod.rs` | Đăng ký migration 0008; fractional indexing (`position_between`, `needs_renormalize`, `move_job_between`, `renormalize_queue_positions`); thêm `next_dispatchable_job`, `next_queue_position`, `reset_interrupted_jobs`, `mark_job_for_retry`, `bulk_update_status`; mở rộng `insert_job`/`row_to_job`; 4 setting mới |
 | `src-tauri/src/models.rs` | `DownloadJob` thêm `queue_position`/`retry_count`/`next_retry_at`; `AppSettings` thêm 4 trường |
 | `src-tauri/src/downloader/queue.rs` | Bỏ `Semaphore` và vòng `for attempt`; `enqueue` chỉ ghi DB + đánh thức; thêm `start_job`, `set_max_concurrent`; sửa lỗi tranh chấp handle; đưa cancel vào giai đoạn dump gallery; `build_ytdlp_args` nhận giới hạn tốc độ |
 | `src-tauri/src/downloader/ytdlp.rs` | `classify_ytdlp_error` nhận thêm nhánh `NETWORK_ERROR` |
@@ -80,7 +80,7 @@
 |---|---|
 | `src/components/DownloadForm.tsx` | Rút gọn: dùng các module vừa tách; chế độ lô dùng `BatchPanel`; nhận file/URL thả vào |
 | `src/components/QueueList.tsx` | Nạp lại từ backend lúc khởi động; kéo sắp xếp; đếm ngược retry; thanh thao tác hàng loạt |
-| `src/stores/queue-store.ts` | `hydrate()` từ `list_queue`; `reorder()`; các hành động hàng loạt |
+| `src/stores/queue-store.ts` | `hydrate()` từ `list_queue`; `moveJob()` (fractional); các hành động hàng loạt |
 | `src/pages/Settings.tsx` | Số luồng song song, giới hạn tốc độ, chạy nền |
 | `src/types/download.ts`, `src/types/settings.ts` | Trường mới khớp Rust |
 | `src/locales/en.json`, `src/locales/vi.json` | Chuỗi mới + bù key thiếu |
@@ -141,7 +141,7 @@ mod tests {
             updated_at: "2026-07-26T00:00:00Z".to_string(),
             title: None,
             playlist_title: None,
-            queue_position: 0,
+            queue_position: 0.0,
             retry_count: 0,
             next_retry_at: None,
         }
@@ -151,13 +151,13 @@ mod tests {
     fn round_trips_scheduling_fields() {
         let db = temp_db();
         let mut job = sample_job("job-1");
-        job.queue_position = 7;
+        job.queue_position = 7.5;
         job.retry_count = 2;
         job.next_retry_at = Some("2026-07-26T00:00:30Z".to_string());
         db.insert_job(&job).expect("insert works");
 
         let loaded = db.get_job("job-1").expect("query works").expect("job exists");
-        assert_eq!(loaded.queue_position, 7);
+        assert_eq!(loaded.queue_position, 7.5);
         assert_eq!(loaded.retry_count, 2);
         assert_eq!(
             loaded.next_retry_at.as_deref(),
@@ -180,15 +180,31 @@ Tạo `src-tauri/src/db/migrations/0008_queue_scheduling.sql`:
 -- Phase 1 (specs/002-download-power): hàng đợi chờ có thứ tự thật sự + retry
 -- là trạng thái dữ liệu thay vì vòng lặp trong task.
 --
--- `queue_position`: thứ tự chạy do người dùng sắp xếp (FR-117). Job cũ nhận 0
--- và được phân định tiếp bằng `created_at` trong mệnh đề ORDER BY.
+-- `queue_position` là REAL chứ không phải INTEGER vì thứ tự dùng *fractional
+-- indexing*: kéo một mục vào giữa hai mục khác chỉ ghi đúng MỘT dòng, với giá
+-- trị là điểm giữa của hai hàng xóm.
+--
+-- Lý do quan trọng hơn cả hiệu năng: nếu mỗi lần kéo phải ghi lại vị trí của
+-- cả danh sách, thì một job vừa được thêm vào trong lúc người dùng đang kéo sẽ
+-- bị ghi đè vị trí — snapshot mà giao diện gửi lên đã cũ. Chỉ đụng một dòng thì
+-- không có tranh chấp đó (FR-117, FR-119).
+--
+-- Khe hở giữa hai vị trí bị chia đôi mỗi lần chèn vào cùng một chỗ; khi nó nhỏ
+-- hơn ngưỡng an toàn, `renormalize_queue_positions` đánh số lại 1.0, 2.0, 3.0…
+-- Xem `db::position_between` và `db::needs_renormalize`.
+--
 -- `retry_count` / `next_retry_at`: một job đang chờ thử lại là job có
 -- status='queued' và next_retry_at ở tương lai (FR-121, FR-122). Cách này
 -- tránh phải thêm giá trị mới vào ràng buộc CHECK trên cột status — SQLite
 -- không ALTER được CHECK, sẽ phải rebuild cả bảng.
-ALTER TABLE download_jobs ADD COLUMN queue_position INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE download_jobs ADD COLUMN queue_position REAL NOT NULL DEFAULT 0;
 ALTER TABLE download_jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE download_jobs ADD COLUMN next_retry_at TEXT;
+
+-- Job có sẵn đều mang mặc định 0, tức là hoà nhau hết. Đánh số lại theo rowid
+-- (xấp xỉ thứ tự tạo) để chúng có vị trí phân biệt ngay từ đầu, thay vì phải
+-- dựa vào `created_at` làm tiêu chí phân định mãi mãi.
+UPDATE download_jobs SET queue_position = rowid;
 
 CREATE INDEX idx_download_jobs_dispatch
     ON download_jobs (status, queue_position, created_at);
@@ -209,10 +225,11 @@ Trong `src-tauri/src/db/mod.rs`, thêm dòng cuối vào `vec!` của `migration
 Trong `src-tauri/src/models.rs`, thêm vào cuối `struct DownloadJob` (ngay sau `playlist_title`):
 
 ```rust
-    /// Thứ tự chạy trong hàng đợi chờ. Số nhỏ chạy trước. Các job có cùng giá
-    /// trị được phân định bằng `created_at`, nên job cũ (mặc định 0) vẫn giữ
-    /// nguyên thứ tự tương đối như trước khi có trường này.
-    pub queue_position: i64,
+    /// Thứ tự chạy trong hàng đợi chờ, dùng fractional indexing: số nhỏ chạy
+    /// trước, và chèn vào giữa hai mục chỉ cần lấy điểm giữa của chúng nên mỗi
+    /// lần kéo-thả chỉ ghi đúng một dòng. `created_at` vẫn là tiêu chí phân
+    /// định khi hai giá trị bằng nhau.
+    pub queue_position: f64,
     /// Số lần đã tự thử lại vì lỗi tạm thời. Không tính lần chạy đầu tiên.
     pub retry_count: i64,
     /// Khi khác `None` và ở tương lai, job này đang chờ tới lượt thử lại và
@@ -279,7 +296,7 @@ Trong `row_to_job` (`db/mod.rs:280-320`), thêm 3 dòng cuối trước dấu `}
 Trình biên dịch sẽ chỉ ra các vị trí thiếu trường. Có 3 nơi — thêm vào mỗi nơi:
 
 ```rust
-            queue_position: 0,
+            queue_position: 0.0,
             retry_count: 0,
             next_retry_at: None,
 ```
@@ -322,10 +339,10 @@ Thêm vào `mod tests` trong `src-tauri/src/db/mod.rs`:
     fn next_dispatchable_job_respects_position_then_created_at() {
         let db = temp_db();
         let mut later = sample_job("later");
-        later.queue_position = 5;
+        later.queue_position = 5.0;
         later.created_at = "2026-07-26T00:00:00Z".to_string();
         let mut earlier = sample_job("earlier");
-        earlier.queue_position = 1;
+        earlier.queue_position = 1.0;
         earlier.created_at = "2026-07-26T23:00:00Z".to_string();
         db.insert_job(&later).unwrap();
         db.insert_job(&earlier).unwrap();
@@ -365,33 +382,77 @@ Thêm vào `mod tests` trong `src-tauri/src/db/mod.rs`:
     }
 
     #[test]
-    fn next_queue_position_returns_one_past_the_maximum() {
+    fn next_queue_position_appends_past_the_maximum() {
         let db = temp_db();
-        assert_eq!(db.next_queue_position().unwrap(), 0, "hàng đợi rỗng bắt đầu từ 0");
+        assert_eq!(db.next_queue_position().unwrap(), 1.0, "hàng đợi rỗng bắt đầu từ 1.0");
 
         let mut job = sample_job("job-1");
-        job.queue_position = 4;
+        job.queue_position = 4.0;
         db.insert_job(&job).unwrap();
-        assert_eq!(db.next_queue_position().unwrap(), 5);
+        assert_eq!(db.next_queue_position().unwrap(), 5.0);
     }
 
     #[test]
-    fn set_queue_positions_applies_the_given_order() {
+    fn position_between_takes_the_midpoint_of_two_neighbours() {
+        assert_eq!(position_between(Some(1.0), Some(2.0)), 1.5);
+        assert_eq!(position_between(Some(1.5), Some(2.0)), 1.75);
+    }
+
+    #[test]
+    fn position_between_handles_the_ends_of_the_list() {
+        assert_eq!(position_between(None, None), 1.0, "hàng đợi rỗng");
+        assert_eq!(position_between(None, Some(3.0)), 2.0, "thả lên đầu");
+        assert_eq!(position_between(Some(3.0), None), 4.0, "thả xuống cuối");
+    }
+
+    #[test]
+    fn needs_renormalize_only_when_the_gap_has_collapsed() {
+        assert!(!needs_renormalize(Some(1.0), Some(2.0)));
+        assert!(needs_renormalize(Some(1.0), Some(1.0 + 1e-9)));
+        assert!(
+            !needs_renormalize(None, Some(1.0)),
+            "ở đầu hoặc cuối danh sách thì luôn còn chỗ"
+        );
+    }
+
+    #[test]
+    fn move_job_between_only_rewrites_the_moved_row() {
         let db = temp_db();
-        db.insert_job(&sample_job("a")).unwrap();
-        db.insert_job(&sample_job("b")).unwrap();
-        db.insert_job(&sample_job("c")).unwrap();
+        for (id, position) in [("a", 1.0), ("b", 2.0), ("c", 3.0)] {
+            let mut job = sample_job(id);
+            job.queue_position = position;
+            db.insert_job(&job).unwrap();
+        }
 
-        db.set_queue_positions(&[
-            "c".to_string(),
-            "a".to_string(),
-            "b".to_string(),
-        ])
-        .unwrap();
+        // Kéo "c" vào giữa "a" và "b".
+        db.move_job_between("c", Some("a"), Some("b")).unwrap();
 
-        assert_eq!(db.get_job("c").unwrap().unwrap().queue_position, 0);
-        assert_eq!(db.get_job("a").unwrap().unwrap().queue_position, 1);
-        assert_eq!(db.get_job("b").unwrap().unwrap().queue_position, 2);
+        assert_eq!(db.get_job("c").unwrap().unwrap().queue_position, 1.5);
+        assert_eq!(
+            db.get_job("a").unwrap().unwrap().queue_position,
+            1.0,
+            "hàng xóm không được đụng tới"
+        );
+        assert_eq!(db.get_job("b").unwrap().unwrap().queue_position, 2.0);
+    }
+
+    #[test]
+    fn move_job_between_renormalizes_when_the_gap_collapses() {
+        let db = temp_db();
+        // Hai hàng xóm sát nhau tới mức không còn chỗ chèn vào giữa.
+        for (id, position) in [("a", 1.0), ("b", 1.0 + 1e-12), ("c", 9.0)] {
+            let mut job = sample_job(id);
+            job.queue_position = position;
+            db.insert_job(&job).unwrap();
+        }
+
+        db.move_job_between("c", Some("a"), Some("b")).unwrap();
+
+        let a = db.get_job("a").unwrap().unwrap().queue_position;
+        let b = db.get_job("b").unwrap().unwrap().queue_position;
+        let c = db.get_job("c").unwrap().unwrap().queue_position;
+        assert!(a < c && c < b, "thứ tự a < c < b phải đúng sau khi chuẩn hoá");
+        assert!(b - a > 0.1, "sau chuẩn hoá khe hở phải rộng trở lại");
     }
 
     #[test]
@@ -491,26 +552,86 @@ Trong `src-tauri/src/db/mod.rs`, thêm ngay sau `list_jobs_by_statuses` (`:173`)
     }
 
     /// Vị trí cho job mới thêm vào cuối hàng đợi.
-    pub fn next_queue_position(&self) -> Result<i64, AppError> {
+    pub fn next_queue_position(&self) -> Result<f64, AppError> {
         let conn = self.conn();
-        let max: Option<i64> = conn.query_row(
+        let max: Option<f64> = conn.query_row(
             "SELECT MAX(queue_position) FROM download_jobs
              WHERE status IN ('queued','paused','downloading','fetching_metadata')",
             [],
             |row| row.get(0),
         )?;
-        Ok(max.map(|m| m + 1).unwrap_or(0))
+        Ok(position_between(max, None))
     }
 
-    /// Ghi lại thứ tự hàng đợi theo đúng danh sách id truyền vào (FR-117).
-    /// Chạy trong một transaction để không bao giờ tồn tại trạng thái nửa vời.
-    pub fn set_queue_positions(&self, ordered_job_ids: &[String]) -> Result<(), AppError> {
+    /// Đặt một job vào giữa hai hàng xóm (`None` nghĩa là đầu hoặc cuối danh
+    /// sách) — thao tác đằng sau một lần kéo-thả (FR-117).
+    ///
+    /// Chỉ ghi đúng một dòng. Đó không chỉ là chuyện nhanh: nếu phải đánh số
+    /// lại cả danh sách thì một job được thêm vào trong lúc người dùng đang kéo
+    /// sẽ bị ghi đè vị trí, vì danh sách giao diện gửi lên đã cũ.
+    ///
+    /// Giao diện gửi id của hai hàng xóm chứ không gửi số: giao diện không nên
+    /// phải biết gì về cách đánh số nội bộ.
+    pub fn move_job_between(
+        &self,
+        job_id: &str,
+        before_job_id: Option<&str>,
+        after_job_id: Option<&str>,
+    ) -> Result<(), AppError> {
+        let mut before = self.position_of(before_job_id)?;
+        let mut after = self.position_of(after_job_id)?;
+
+        // Chèn liên tiếp vào cùng một chỗ chia đôi khe hở mỗi lần. Khi nó hẹp
+        // tới mức f64 sắp hết chỗ, đánh số lại rồi đọc lại hàng xóm.
+        if needs_renormalize(before, after) {
+            self.renormalize_queue_positions()?;
+            before = self.position_of(before_job_id)?;
+            after = self.position_of(after_job_id)?;
+        }
+
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE download_jobs SET queue_position = ?1, updated_at = ?2 WHERE id = ?3",
+            params![position_between(before, after), Utc::now().to_rfc3339(), job_id],
+        )?;
+        Ok(())
+    }
+
+    fn position_of(&self, job_id: Option<&str>) -> Result<Option<f64>, AppError> {
+        let Some(job_id) = job_id else {
+            return Ok(None);
+        };
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT queue_position FROM download_jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(AppError::from)
+    }
+
+    /// Đánh số lại các job chưa kết thúc thành 1.0, 2.0, 3.0… giữ nguyên thứ tự
+    /// hiện tại. Chỉ chạy khi khe hở đã hẹp tới ngưỡng — trong sử dụng bình
+    /// thường gần như không bao giờ xảy ra.
+    pub fn renormalize_queue_positions(&self) -> Result<(), AppError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        for (position, job_id) in ordered_job_ids.iter().enumerate() {
+
+        let ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM download_jobs
+                 WHERE status IN ('queued','paused','downloading','fetching_metadata')
+                 ORDER BY queue_position ASC, created_at ASC",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<String>>>()?
+        };
+
+        for (index, id) in ids.iter().enumerate() {
             tx.execute(
-                "UPDATE download_jobs SET queue_position = ?1, updated_at = ?2 WHERE id = ?3",
-                params![position as i64, Utc::now().to_rfc3339(), job_id],
+                "UPDATE download_jobs SET queue_position = ?1 WHERE id = ?2",
+                params![(index + 1) as f64, id],
             )?;
         }
         tx.commit()?;
@@ -591,6 +712,40 @@ Trong `src-tauri/src/db/mod.rs`, thêm ngay sau `list_jobs_by_statuses` (`:173`)
 ```
 
 `Db` bọc `Mutex<Connection>` và `conn()` trả `MutexGuard`; `transaction()` cần `&mut Connection` nên hai hàm dùng transaction khai báo `let mut conn = self.conn();`.
+
+Thêm hai hàm tự do ở cấp module trong cùng file (ngoài `impl Db`) — chúng thuần tuý tính toán nên kiểm thử được mà không cần cơ sở dữ liệu:
+
+```rust
+/// Khe hở hẹp nhất còn chấp nhận được giữa hai vị trí liền kề.
+///
+/// `f64` có 52 bit phần định trị, nên trên lý thuyết còn chia đôi được sâu hơn
+/// ngưỡng này rất nhiều. Đặt ngưỡng cao hơn giới hạn thật nhiều bậc để không
+/// bao giờ chạm tới vùng mà phép lấy điểm giữa trả về đúng bằng một trong hai
+/// đầu mút — lúc đó thứ tự sẽ hỏng một cách âm thầm.
+const MIN_POSITION_GAP: f64 = 1e-6;
+
+/// Vị trí nằm giữa hai hàng xóm. `None` nghĩa là không có hàng xóm ở phía đó,
+/// tức là đang thả vào đầu hoặc cuối danh sách.
+pub fn position_between(before: Option<f64>, after: Option<f64>) -> f64 {
+    match (before, after) {
+        (None, None) => 1.0,
+        (None, Some(after)) => after - 1.0,
+        (Some(before), None) => before + 1.0,
+        (Some(before), Some(after)) => (before + after) / 2.0,
+    }
+}
+
+/// Khe hở giữa hai hàng xóm đã hẹp tới mức phải đánh số lại chưa.
+///
+/// Chỉ đúng khi có cả hai hàng xóm: ở đầu hoặc cuối danh sách thì luôn còn chỗ
+/// vì ta cộng/trừ hẳn 1.0 chứ không chia đôi.
+pub fn needs_renormalize(before: Option<f64>, after: Option<f64>) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => (after - before).abs() < MIN_POSITION_GAP,
+        _ => false,
+    }
+}
+```
 
 - [ ] **Step 4: Cho phép so sánh JobStatus trong assert**
 
@@ -1609,7 +1764,7 @@ Nếu `mod tests` chưa có helper dựng job, thêm:
             updated_at: "2026-07-26T00:00:00Z".to_string(),
             title: None,
             playlist_title: None,
-            queue_position: 0,
+            queue_position: 0.0,
             retry_count: 0,
             next_retry_at: None,
         }
@@ -1738,10 +1893,15 @@ Thêm vào `impl DownloadQueue` trong `src-tauri/src/downloader/queue.rs`:
         Ok(changed)
     }
 
-    /// Ghi lại thứ tự hàng đợi. Không đụng tới job đang chạy — chúng cứ chạy
-    /// nốt, thứ tự chỉ quyết định ai được khởi chạy tiếp theo (FR-119).
-    pub fn reorder(&self, ordered_job_ids: &[String]) -> Result<(), AppError> {
-        self.db.set_queue_positions(ordered_job_ids)?;
+    /// Đặt một job vào giữa hai hàng xóm. Không đụng tới job đang chạy — chúng
+    /// cứ chạy nốt, thứ tự chỉ quyết định ai được khởi chạy tiếp theo (FR-119).
+    pub fn move_job(
+        &self,
+        job_id: &str,
+        before_job_id: Option<&str>,
+        after_job_id: Option<&str>,
+    ) -> Result<(), AppError> {
+        self.db.move_job_between(job_id, before_job_id, after_job_id)?;
         self.wake.notify_one();
         Ok(())
     }
@@ -1774,16 +1934,20 @@ pub async fn cancel_all_jobs(queue: State<'_, DownloadQueue>) -> Result<Vec<Stri
     queue.cancel_all().await
 }
 
-/// `ordered_job_ids` là thứ tự mới, đầy đủ, của các tác vụ đang hiển thị.
-/// Giao diện gửi cả danh sách chứ không gửi thao tác "chuyển từ i sang j" —
-/// như vậy trạng thái cuối cùng luôn khớp với những gì người dùng đang nhìn,
-/// kể cả khi có sự kiện từ backend chen vào giữa lúc kéo.
+/// Đặt một tác vụ vào giữa hai hàng xóm của nó sau khi người dùng thả chuột.
+///
+/// Giao diện gửi id hai hàng xóm chứ không gửi cả danh sách đã sắp xếp: chỉ có
+/// đúng một dòng bị ghi, nên một tác vụ được thêm vào trong lúc người dùng đang
+/// kéo không bị ghi đè vị trí. `None` ở một phía nghĩa là thả vào đầu (không có
+/// hàng xóm phía trước) hoặc cuối (không có hàng xóm phía sau) danh sách.
 #[tauri::command]
 pub fn reorder_queue(
     queue: State<'_, DownloadQueue>,
-    ordered_job_ids: Vec<String>,
+    job_id: String,
+    before_job_id: Option<String>,
+    after_job_id: Option<String>,
 ) -> Result<(), AppError> {
-    queue.reorder(&ordered_job_ids)
+    queue.move_job(&job_id, before_job_id.as_deref(), after_job_id.as_deref())
 }
 ```
 
@@ -3203,24 +3367,50 @@ Dùng thuộc tính `draggable` gốc của HTML thay vì thêm thư viện: dan
 Thêm vào `tests/unit/QueueList.test.tsx`:
 
 ```typescript
-  it("sends the full new order to the backend after a drag (FR-117)", async () => {
+  it("sends only the dropped job and its new neighbours (FR-117)", async () => {
     useQueueStore.setState({
       jobs: {
-        a: makeJob({ id: "a", queue_position: 0, status: "queued" }),
-        b: makeJob({ id: "b", queue_position: 1, status: "queued" }),
-        c: makeJob({ id: "c", queue_position: 2, status: "queued" }),
+        a: makeJob({ id: "a", queue_position: 1, status: "queued" }),
+        b: makeJob({ id: "b", queue_position: 2, status: "queued" }),
+        c: makeJob({ id: "c", queue_position: 3, status: "queued" }),
       },
     });
     render(<QueueList />);
 
     const rows = screen.getAllByRole("listitem");
-    // Kéo phần tử thứ ba lên vị trí đầu.
+    // Kéo phần tử thứ ba lên vị trí đầu: nó không còn hàng xóm phía trước, và
+    // hàng xóm phía sau là "a".
     fireEvent.dragStart(rows[2]);
     fireEvent.dragOver(rows[0]);
     fireEvent.drop(rows[0]);
 
     expect(invoke).toHaveBeenCalledWith("reorder_queue", {
-      orderedJobIds: ["c", "a", "b"],
+      jobId: "c",
+      beforeJobId: null,
+      afterJobId: "a",
+    });
+  });
+
+  it("passes both neighbours when dropping into the middle", async () => {
+    useQueueStore.setState({
+      jobs: {
+        a: makeJob({ id: "a", queue_position: 1, status: "queued" }),
+        b: makeJob({ id: "b", queue_position: 2, status: "queued" }),
+        c: makeJob({ id: "c", queue_position: 3, status: "queued" }),
+      },
+    });
+    render(<QueueList />);
+
+    const rows = screen.getAllByRole("listitem");
+    // Kéo "a" xuống vị trí của "b": nằm giữa "b" và "c".
+    fireEvent.dragStart(rows[0]);
+    fireEvent.dragOver(rows[1]);
+    fireEvent.drop(rows[1]);
+
+    expect(invoke).toHaveBeenCalledWith("reorder_queue", {
+      jobId: "a",
+      beforeJobId: "b",
+      afterJobId: "c",
     });
   });
 
@@ -3247,19 +3437,38 @@ Trong `src/stores/queue-store.ts`:
 
 ```typescript
   /**
-   * Ghi thứ tự mới. Cập nhật lạc quan trong store trước rồi mới gọi backend,
-   * để thao tác kéo không bị giật; nếu backend lỗi thì `hydrate` ở lần mở sau
-   * sẽ đưa về đúng trạng thái thật.
+   * Đặt một job vào giữa hai hàng xóm mới của nó.
+   *
+   * Cập nhật lạc quan trước rồi mới gọi backend để thao tác kéo không bị giật.
+   * Vị trí lạc quan tính đúng bằng công thức backend dùng (điểm giữa, hoặc
+   * cộng/trừ 1.0 ở hai đầu) nên thứ tự hiển thị khớp ngay cả trước khi backend
+   * trả lời; nếu có sai lệch thì `hydrate` ở lần mở sau đưa về trạng thái thật.
    */
-  reorder: async (orderedJobIds: string[]) => {
-    set((state) => {
-      const jobs = { ...state.jobs };
-      orderedJobIds.forEach((id, index) => {
-        if (jobs[id]) jobs[id] = { ...jobs[id], queue_position: index };
-      });
-      return { jobs };
-    });
-    await invoke("reorder_queue", { orderedJobIds });
+  moveJob: async (
+    jobId: string,
+    beforeJobId: string | null,
+    afterJobId: string | null,
+  ) => {
+    const { jobs } = get();
+    const before = beforeJobId ? jobs[beforeJobId]?.queue_position : undefined;
+    const after = afterJobId ? jobs[afterJobId]?.queue_position : undefined;
+
+    const optimisticPosition =
+      before !== undefined && after !== undefined
+        ? (before + after) / 2
+        : before !== undefined
+          ? before + 1
+          : after !== undefined
+            ? after - 1
+            : 1;
+
+    set((state) => ({
+      jobs: state.jobs[jobId]
+        ? { ...state.jobs, [jobId]: { ...state.jobs[jobId], queue_position: optimisticPosition } }
+        : state.jobs,
+    }));
+
+    await invoke("reorder_queue", { jobId, beforeJobId, afterJobId });
   },
 ```
 
@@ -3269,7 +3478,7 @@ Thêm vào `src/components/QueueList.tsx`:
 
 ```typescript
   const [draggingId, setDraggingId] = useState<string | null>(null);
-  const reorder = useQueueStore((state) => state.reorder);
+  const moveJob = useQueueStore((state) => state.moveJob);
 
   /** Chỉ tác vụ chưa chạy mới kéo được — đổi chỗ một tác vụ đang tải
    *  không có ý nghĩa gì vì nó đã chiếm slot rồi (FR-119). */
@@ -3278,14 +3487,18 @@ Thêm vào `src/components/QueueList.tsx`:
   const handleDrop = (targetId: string) => {
     if (!draggingId || draggingId === targetId) return;
 
+    // Tính danh sách sau khi thả để lấy ra hai hàng xóm, rồi chỉ gửi hai id đó
+    // lên backend — không gửi cả danh sách (xem `move_job_between`).
     const ids = orderedJobs.map((job) => job.id);
     const from = ids.indexOf(draggingId);
     const to = ids.indexOf(targetId);
     if (from === -1 || to === -1) return;
 
     ids.splice(to, 0, ids.splice(from, 1)[0]);
+    const landed = ids.indexOf(draggingId);
+
     setDraggingId(null);
-    void reorder(ids);
+    void moveJob(draggingId, ids[landed - 1] ?? null, ids[landed + 1] ?? null);
   };
 ```
 

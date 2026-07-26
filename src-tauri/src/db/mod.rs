@@ -17,6 +17,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/0005_fix_stale_app_settings_schema.sql")),
         M::up(include_str!("migrations/0006_gallery_selected_urls.sql")),
         M::up(include_str!("migrations/0007_job_titles.sql")),
+        M::up(include_str!("migrations/0008_queue_scheduling.sql")),
     ])
 }
 
@@ -70,8 +71,9 @@ impl Db {
                 gallery_mode, selected_gallery_urls, status, progress_percent,
                 speed_bytes_per_sec, eta_seconds, error_message, output_directory,
                 output_file_path, is_playlist_item, parent_playlist_id,
-                retried_from_job_id, created_at, updated_at, title, playlist_title
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+                retried_from_job_id, created_at, updated_at, title, playlist_title,
+                queue_position, retry_count, next_retry_at
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
             params![
                 job.id,
                 job.source_url,
@@ -95,6 +97,9 @@ impl Db {
                 job.updated_at,
                 job.title,
                 job.playlist_title,
+                job.queue_position,
+                job.retry_count,
+                job.next_retry_at,
             ],
         )?;
         Ok(())
@@ -316,6 +321,9 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<DownloadJob> {
         updated_at: row.get("updated_at")?,
         title: row.get("title")?,
         playlist_title: row.get("playlist_title")?,
+        queue_position: row.get("queue_position")?,
+        retry_count: row.get("retry_count")?,
+        next_retry_at: row.get("next_retry_at")?,
     })
 }
 
@@ -328,4 +336,166 @@ fn row_to_downloaded_file(row: &rusqlite::Row) -> rusqlite::Result<DownloadedFil
         file_size_bytes: row.get("file_size_bytes")?,
         completed_at: row.get("completed_at")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{JobStatus, MediaType};
+
+    /// Mỗi test dùng một file DB riêng trong thư mục tạm của hệ điều hành để
+    /// migration chạy thật (in-memory không kiểm chứng được `to_latest`).
+    fn temp_db() -> Db {
+        let path = std::env::temp_dir()
+            .join(format!("media-downloader-test-{}.db", uuid::Uuid::new_v4()));
+        Db::open(&path).expect("db opens")
+    }
+
+    fn sample_job(id: &str) -> DownloadJob {
+        DownloadJob {
+            id: id.to_string(),
+            source_url: "https://example.com/v".to_string(),
+            platform: "youtube".to_string(),
+            media_type: MediaType::Audio,
+            audio_quality: Some("128kbps".to_string()),
+            video_quality: None,
+            gallery_mode: None,
+            selected_gallery_indices: None,
+            status: JobStatus::Queued,
+            progress_percent: 0.0,
+            speed_bytes_per_sec: None,
+            eta_seconds: None,
+            error_message: None,
+            output_directory: "/tmp".to_string(),
+            output_file_path: None,
+            is_playlist_item: false,
+            parent_playlist_id: None,
+            retried_from_job_id: None,
+            created_at: "2026-07-26T00:00:00Z".to_string(),
+            updated_at: "2026-07-26T00:00:00Z".to_string(),
+            title: None,
+            playlist_title: None,
+            queue_position: 0.0,
+            retry_count: 0,
+            next_retry_at: None,
+        }
+    }
+
+    #[test]
+    fn round_trips_scheduling_fields() {
+        let db = temp_db();
+        let mut job = sample_job("job-1");
+        job.queue_position = 7.5;
+        job.retry_count = 2;
+        job.next_retry_at = Some("2026-07-26T00:00:30Z".to_string());
+        db.insert_job(&job).expect("insert works");
+
+        let loaded = db.get_job("job-1").expect("query works").expect("job exists");
+        assert_eq!(loaded.queue_position, 7.5);
+        assert_eq!(loaded.retry_count, 2);
+        assert_eq!(
+            loaded.next_retry_at.as_deref(),
+            Some("2026-07-26T00:00:30Z")
+        );
+        // `insert_job` gán tham số theo vị trí `?1..?25`: chỉ cần lệch thứ tự
+        // một chỗ là ghi nhầm cột mà vẫn chạy trót lọt. So sánh nguyên cả bản
+        // ghi canh giữ đủ 25 cột, chứ không riêng ba cột vừa thêm.
+        assert_eq!(loaded, job);
+    }
+
+    #[test]
+    fn queue_position_column_is_declared_real_not_integer() {
+        // Kiểu cột ở đây là thứ chịu tải: fractional indexing chèn điểm giữa
+        // hai hàng xóm (1.0 và 2.0 -> 1.5), nên cột mang affinity INTEGER sẽ
+        // làm tròn mất giá trị đó và phá luôn cách sắp thứ tự. Một phép
+        // `assert_eq!(pos, 7.5)` bình thường KHÔNG bắt được lỗi này: SQLite
+        // vẫn lưu 7.5 nguyên vẹn vào cột INTEGER (affinity chỉ là gợi ý, và
+        // 7.5 không chuyển vô tổn hao sang integer nên nó giữ dạng real). Vì
+        // vậy phải kiểm tra thẳng kiểu đã khai báo trong lược đồ.
+        let db = temp_db();
+        let conn = db.conn();
+        let mut stmt = conn.prepare("PRAGMA table_info(download_jobs)").unwrap();
+        let declared_type = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>("name")?, row.get::<_, String>("type")?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .find(|(name, _)| name == "queue_position")
+            .map(|(_, column_type)| column_type)
+            .expect("cột queue_position phải tồn tại");
+
+        assert_eq!(declared_type, "REAL");
+    }
+
+    /// Mở một DB tạm rồi chỉ chạy migration *tới* `version`, dựng lại đúng
+    /// lược đồ ở thời điểm trước khi 0008 tồn tại — `Db::open` luôn chạy
+    /// `to_latest` nên không dùng được cho việc này. Việc tắt/bật
+    /// `PRAGMA foreign_keys` lặp lại y hệt `Db::open` vì migration 0002/0003
+    /// rebuild `download_jobs` bằng DROP + RENAME trong khi
+    /// `downloaded_files.job_id` vẫn trỏ vào nó (xem chú thích ở `Db::open`).
+    fn raw_conn_at_version(version: usize) -> Connection {
+        let path =
+            std::env::temp_dir().join(format!("media-downloader-test-{}.db", uuid::Uuid::new_v4()));
+        let mut conn = Connection::open(&path).expect("db opens");
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        migrations()
+            .to_version(&mut conn, version)
+            .expect("migrates to the requested version");
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn
+    }
+
+    #[test]
+    fn migration_backfills_positions_for_pre_existing_rows() {
+        // Job tạo trước 0008 không hề có `queue_position`, nên ngay sau khi
+        // thêm cột chúng đều mang mặc định 0 — hoà nhau hết, không còn thứ tự
+        // tương đối nào để sắp. Dòng `UPDATE ... SET queue_position = rowid`
+        // trong 0008 tồn tại chính là để phá thế hoà đó, nên test phải dựng
+        // được một dòng *có trước* migration mới kiểm chứng được nó.
+        //
+        // Phải chèn bằng SQL thô: `insert_job` ghi cả ba cột mới, vốn chưa tồn
+        // tại ở version 7.
+        let mut conn = raw_conn_at_version(7);
+        for (index, id) in ["job-a", "job-b", "job-c"].into_iter().enumerate() {
+            conn.execute(
+                "INSERT INTO download_jobs (
+                    id, source_url, platform, media_type, status,
+                    output_directory, created_at, updated_at
+                ) VALUES (?1,?2,'youtube','audio','queued','/tmp',?3,?3)",
+                params![
+                    id,
+                    format!("https://example.com/{id}"),
+                    format!("2026-07-26T00:00:0{index}Z"),
+                ],
+            )
+            .expect("raw insert works against the version-7 schema");
+        }
+
+        migrations().to_latest(&mut conn).expect("0008 applies");
+
+        let mut stmt = conn
+            .prepare("SELECT queue_position FROM download_jobs ORDER BY rowid")
+            .unwrap();
+        let positions: Vec<f64> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+
+        assert_eq!(positions.len(), 3);
+        // Con số cụ thể không phải hợp đồng — điều backfill phải bảo đảm là
+        // các dòng cũ sắp được thứ tự *so với nhau*, tức phân biệt và tăng dần
+        // theo rowid, thay vì cùng nằm ở 0.
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "vị trí sau backfill phải tăng dần theo rowid, nhận được {positions:?}"
+        );
+        assert!(
+            positions.iter().all(|position| *position > 0.0),
+            "không dòng cũ nào được phép giữ mặc định 0, nhận được {positions:?}"
+        );
+    }
 }

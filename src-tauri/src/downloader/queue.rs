@@ -183,6 +183,11 @@ impl DownloadQueue {
             updated_at: now,
             title: original.title,
             playlist_title: original.playlist_title,
+            queue_position: 0.0,
+            // Thử lại thủ công tạo ra một job MỚI chạy lại từ đầu, nên bộ đếm
+            // tự-thử-lại bắt đầu lại từ 0 thay vì kế thừa của job cũ.
+            retry_count: 0,
+            next_retry_at: None,
         };
 
         self.enqueue(retried.clone()).await?;
@@ -1170,6 +1175,9 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".into(),
             title: None,
             playlist_title: None,
+            queue_position: 0.0,
+            retry_count: 0,
+            next_retry_at: None,
         }
     }
 

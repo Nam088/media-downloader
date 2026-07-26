@@ -26,6 +26,9 @@ function makeJob(overrides: Partial<DownloadJob> = {}): DownloadJob {
     updated_at: "2026-01-01T00:00:00Z",
     title: null,
     playlist_title: null,
+    queue_position: 0,
+    retry_count: 0,
+    next_retry_at: null,
     ...overrides,
   };
 }

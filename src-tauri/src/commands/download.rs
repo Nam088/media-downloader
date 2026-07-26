@@ -184,6 +184,9 @@ fn new_job(args: NewJobArgs) -> DownloadJob {
         updated_at: now,
         title: args.title,
         playlist_title: args.playlist_title,
+        queue_position: 0.0,
+        retry_count: 0,
+        next_retry_at: None,
     }
 }
 

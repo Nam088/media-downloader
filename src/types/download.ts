@@ -98,6 +98,16 @@ export interface DownloadJob {
    * `parent_playlist_id`), used as the queue's group header. `null` for
    * non-playlist jobs. */
   playlist_title: string | null;
+  /** Run order in the waiting queue, using fractional indexing: lower runs
+   * first, and dropping between two items just takes their midpoint so a
+   * drag writes exactly one row. `created_at` still breaks ties. */
+  queue_position: number;
+  /** How many times this job has auto-retried after a transient failure.
+   * Does not count the first run. */
+  retry_count: number;
+  /** When non-null and in the future, this job is waiting for its retry turn
+   * and the dispatcher skips it until then. */
+  next_retry_at: string | null;
 }
 
 export interface AppError {

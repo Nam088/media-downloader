@@ -74,7 +74,7 @@ impl JobStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DownloadJob {
     pub id: String,
     pub source_url: String,
@@ -124,6 +124,16 @@ pub struct DownloadJob {
     /// header without a separate playlist table. `None` for non-playlist
     /// jobs.
     pub playlist_title: Option<String>,
+    /// Thứ tự chạy trong hàng đợi chờ, dùng fractional indexing: số nhỏ chạy
+    /// trước, và chèn vào giữa hai mục chỉ cần lấy điểm giữa của chúng nên mỗi
+    /// lần kéo-thả chỉ ghi đúng một dòng. `created_at` vẫn là tiêu chí phân
+    /// định khi hai giá trị bằng nhau.
+    pub queue_position: f64,
+    /// Số lần đã tự thử lại vì lỗi tạm thời. Không tính lần chạy đầu tiên.
+    pub retry_count: i64,
+    /// Khi khác `None` và ở tương lai, job này đang chờ tới lượt thử lại và
+    /// bộ điều phối sẽ bỏ qua nó cho tới thời điểm đó (FR-121).
+    pub next_retry_at: Option<String>,
 }
 
 /// Mirrors `data-model.md` §2 (MediaSource). `available_audio_formats` /
