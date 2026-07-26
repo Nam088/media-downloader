@@ -152,7 +152,6 @@ function JobRow({ job }: { job: DownloadJob }) {
             {retryCountdown === null
               ? t(`queue.status.${job.status}`)
               : t("queue.retry_countdown", {
-                  defaultValue: "Retrying in {{seconds}}s (attempt {{attempt}})",
                   seconds: retryCountdown,
                   attempt: job.retry_count + 1,
                 })}
@@ -465,10 +464,9 @@ export function QueueList() {
                   <button
                     type="button"
                     aria-label={t("queue.drag_handle", {
-                      defaultValue: "Reorder {{title}}",
                       title: job.title ?? job.source_url,
                     })}
-                    title={t("queue.drag_handle_hint", { defaultValue: "Drag to reorder" })}
+                    title={t("queue.drag_handle_hint")}
                     // `touch-none`: without it the browser claims the gesture
                     // for scrolling and never sends the moves.
                     className="flex w-7 shrink-0 cursor-grab touch-none items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground active:cursor-grabbing"

@@ -15,7 +15,7 @@ export function History() {
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div className="flex flex-col gap-1">
           <h2 className="text-xl font-bold tracking-tight text-foreground">{t("nav.history")}</h2>
-          <p className="text-xs text-muted-foreground">Manage and access all your downloaded media files</p>
+          <p className="text-xs text-muted-foreground">{t("history.subtitle")}</p>
         </div>
 
         {/* Search Input Box */}
@@ -24,7 +24,7 @@ export function History() {
           <Input
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            placeholder="Search downloads..."
+            placeholder={t("history.search_placeholder")}
             className="pl-9 h-9 text-xs rounded-lg border-border/80 bg-card shadow-2xs focus-visible:ring-1 focus-visible:ring-primary/40"
           />
         </div>
@@ -33,10 +33,10 @@ export function History() {
       {/* Filter Tabs */}
       <div className="flex items-center gap-2 border-b border-border/60 pb-3">
         {[
-          { id: "all", label: "All Downloads" },
-          { id: "completed", label: "Completed" },
-          { id: "failed", label: "Failed" },
-          { id: "canceled", label: "Canceled" },
+          { id: "all", label: t("history.tab_all") },
+          { id: "completed", label: t("history.tab_completed") },
+          { id: "failed", label: t("history.tab_failed") },
+          { id: "canceled", label: t("history.tab_canceled") },
         ].map((tab) => (
           <button
             key={tab.id}

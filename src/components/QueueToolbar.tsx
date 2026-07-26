@@ -40,7 +40,7 @@ export function QueueToolbar({ activeCount, pausedCount, finishedCount }: QueueT
         onClick={() => void pauseAll()}
       >
         <Pause className="mr-1 size-4" />
-        {t("queue.pause_all", { defaultValue: "Pause all" })}
+        {t("queue.pause_all")}
       </Button>
 
       <Button
@@ -50,7 +50,7 @@ export function QueueToolbar({ activeCount, pausedCount, finishedCount }: QueueT
         onClick={() => void resumeAll()}
       >
         <Play className="mr-1 size-4" />
-        {t("queue.resume_all", { defaultValue: "Resume all" })}
+        {t("queue.resume_all")}
       </Button>
 
       {confirmingCancel ? (
@@ -64,7 +64,7 @@ export function QueueToolbar({ activeCount, pausedCount, finishedCount }: QueueT
             }}
           >
             <CheckCheck className="mr-1 size-4" />
-            {t("queue.confirm_cancel_all", { defaultValue: "Confirm cancel all" })}
+            {t("queue.confirm_cancel_all")}
           </Button>
           <Button variant="ghost" size="sm" onClick={() => setConfirmingCancel(false)}>
             {t("common.cancel")}
@@ -78,7 +78,7 @@ export function QueueToolbar({ activeCount, pausedCount, finishedCount }: QueueT
           onClick={() => setConfirmingCancel(true)}
         >
           <X className="mr-1 size-4" />
-          {t("queue.cancel_all", { defaultValue: "Cancel all" })}
+          {t("queue.cancel_all")}
         </Button>
       )}
 
@@ -89,7 +89,7 @@ export function QueueToolbar({ activeCount, pausedCount, finishedCount }: QueueT
         onClick={() => clearFinished()}
       >
         <Trash2 className="mr-1 size-4" />
-        {t("queue.clear_finished", { defaultValue: "Clear finished" })}
+        {t("queue.clear_finished")}
       </Button>
     </div>
   );

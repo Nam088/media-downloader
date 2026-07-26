@@ -71,7 +71,7 @@ export function HistoryList({
     return (
       <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border/80 p-12 text-center">
         <Globe className="h-10 w-10 text-muted-foreground/40 mb-3" />
-        <h3 className="text-sm font-bold text-foreground">No download history yet</h3>
+        <h3 className="text-sm font-bold text-foreground">{t("history.empty_title")}</h3>
         <p className="text-xs text-muted-foreground mt-1 max-w-sm">{t("history.empty")}</p>
       </div>
     );
@@ -80,7 +80,7 @@ export function HistoryList({
   if (filteredJobs.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border/80 p-10 text-center">
-        <p className="text-sm font-semibold text-muted-foreground">No results matching your filters</p>
+        <p className="text-sm font-semibold text-muted-foreground">{t("history.empty_filtered")}</p>
       </div>
     );
   }
@@ -133,19 +133,19 @@ export function HistoryList({
                 {job.status === "completed" && (
                   <span className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500/10 px-2 py-0.5 font-semibold text-[11px] text-emerald-600 dark:text-emerald-400">
                     <CheckCircle2 className="h-3 w-3" />
-                    Completed
+                    {t("queue.status.completed")}
                   </span>
                 )}
                 {job.status === "failed" && (
                   <span className="inline-flex items-center gap-1.5 rounded-md bg-destructive/10 px-2 py-0.5 font-semibold text-[11px] text-destructive">
                     <XCircle className="h-3 w-3" />
-                    Failed
+                    {t("queue.status.failed")}
                   </span>
                 )}
                 {job.status === "canceled" && (
                   <span className="inline-flex items-center gap-1.5 rounded-md bg-muted px-2 py-0.5 font-semibold text-[11px] text-muted-foreground">
                     <AlertCircle className="h-3 w-3" />
-                    Canceled
+                    {t("queue.status.canceled")}
                   </span>
                 )}
 
@@ -167,7 +167,7 @@ export function HistoryList({
                     title={t("history.open_folder")}
                   >
                     <FolderOpen className="h-3.5 w-3.5" />
-                    <span>Open Folder</span>
+                    <span>{t("history.open_folder_button")}</span>
                   </Button>
                 )}
                 {job.status === "failed" && (
@@ -179,7 +179,7 @@ export function HistoryList({
                     title={t("common.retry")}
                   >
                     <RotateCcw className="h-3.5 w-3.5" />
-                    <span>Retry</span>
+                    <span>{t("common.retry")}</span>
                   </Button>
                 )}
               </div>

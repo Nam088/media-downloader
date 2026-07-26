@@ -40,8 +40,17 @@
     "system": "System"
   },
   "history": {
+    "subtitle": "Manage and access all your downloaded media files",
+    "search_placeholder": "Search downloads…",
+    "tab_all": "All Downloads",
+    "tab_completed": "Completed",
+    "tab_failed": "Failed",
+    "tab_canceled": "Canceled",
+    "empty_title": "No download history yet",
     "empty": "No download history yet.",
-    "open_folder": "Open containing folder"
+    "empty_filtered": "No results matching your filters",
+    "open_folder": "Open containing folder",
+    "open_folder_button": "Open folder"
   },
   "playlistScope": {
     "title": "This link is a playlist",
@@ -80,6 +89,8 @@
     "confirm_cancel_all": "Confirm cancel all",
     "clear_finished": "Clear finished",
     "retry_countdown": "Retrying in {{seconds}}s (attempt {{attempt}})",
+    "drag_handle": "Reorder {{title}}",
+    "drag_handle_hint": "Drag to reorder",
     "reorder_failed": "Could not reorder the queue.",
     "progress_unknown": "Progress unknown — this source does not report a total size",
     "downloaded_so_far": "{{size}} downloaded",
@@ -98,6 +109,10 @@
     "url_placeholder": "Paste a YouTube, TikTok, Facebook, Instagram, X, or SoundCloud link",
     "url_placeholder_multi": "Paste one or more links (one per line) — YouTube, TikTok, Facebook, Instagram, X, SoundCloud",
     "supported_sites_hint": "Works with YouTube, TikTok, Facebook, Instagram, X, SoundCloud, and thousands of other sites yt-dlp supports.",
+    "supported_label": "Supported:",
+    "url_count_one": "Single URL",
+    "url_count_other": "{{count}} URLs",
+    "url_list_filter_name": "URL list",
     "batch_mode_hint": "{{count}} links detected — pick below how all of them should be downloaded.",
     "batch_partial_failure": "{{count}} link(s) could not be added — see the list above.",
     "batch_media_type": "Download these as",

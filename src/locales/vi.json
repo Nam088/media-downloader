@@ -40,8 +40,17 @@
     "system": "Theo hệ thống"
   },
   "history": {
+    "subtitle": "Quản lý và mở lại mọi tệp media đã tải",
+    "search_placeholder": "Tìm trong các lượt tải…",
+    "tab_all": "Tất cả lượt tải",
+    "tab_completed": "Hoàn tất",
+    "tab_failed": "Thất bại",
+    "tab_canceled": "Đã huỷ",
+    "empty_title": "Chưa có lịch sử tải nào",
     "empty": "Chưa có lịch sử tải nào.",
-    "open_folder": "Mở thư mục chứa tệp"
+    "empty_filtered": "Không có kết quả nào khớp với bộ lọc",
+    "open_folder": "Mở thư mục chứa tệp",
+    "open_folder_button": "Mở thư mục"
   },
   "playlistScope": {
     "title": "Liên kết này là một playlist",
@@ -80,6 +89,8 @@
     "confirm_cancel_all": "Xác nhận huỷ tất cả",
     "clear_finished": "Xoá lượt tải đã xong",
     "retry_countdown": "Thử lại sau {{seconds}}s (lần {{attempt}})",
+    "drag_handle": "Sắp xếp lại {{title}}",
+    "drag_handle_hint": "Kéo để sắp xếp lại",
     "reorder_failed": "Không thể sắp xếp lại hàng đợi.",
     "progress_unknown": "Không rõ tiến độ — nguồn này không báo tổng dung lượng",
     "downloaded_so_far": "Đã tải {{size}}",
@@ -98,6 +109,9 @@
     "url_placeholder": "Dán liên kết YouTube, TikTok, Facebook, Instagram, X, hoặc SoundCloud",
     "url_placeholder_multi": "Dán một hoặc nhiều liên kết (mỗi dòng một liên kết) — YouTube, TikTok, Facebook, Instagram, X, SoundCloud",
     "supported_sites_hint": "Hỗ trợ YouTube, TikTok, Facebook, Instagram, X, SoundCloud, và hàng nghìn trang khác mà yt-dlp hỗ trợ.",
+    "supported_label": "Hỗ trợ:",
+    "url_count_other": "{{count}} URL",
+    "url_list_filter_name": "Danh sách URL",
     "batch_mode_hint": "Đã phát hiện {{count}} liên kết — chọn bên dưới cách tải tất cả.",
     "batch_partial_failure": "{{count}} liên kết không thêm được — xem danh sách phía trên.",
     "batch_media_type": "Tải các liên kết này dưới dạng",

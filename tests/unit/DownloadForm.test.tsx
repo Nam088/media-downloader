@@ -137,6 +137,31 @@ describe("DownloadForm", () => {
     expect(screen.getByRole("button", { name: /download 2 links/i })).toBeInTheDocument();
   });
 
+  // The link counter went through `t()` in Task 22, which turned a plain
+  // template string into a pluralised key. Asserting the rendered words (not
+  // just "some counter exists") is what catches a missing `_one`/`_other`
+  // form, which i18next would otherwise paper over by echoing the key back.
+  it("labels the link counter with the singular form for one link (FR-132)", async () => {
+    const user = userEvent.setup();
+    render(<DownloadForm />);
+
+    await user.type(screen.getByLabelText(/video or audio link/i), "https://youtube.com/1");
+
+    expect(screen.getByText("Single URL")).toBeInTheDocument();
+  });
+
+  it("labels the link counter with the plural form for several links (FR-132)", async () => {
+    const user = userEvent.setup();
+    render(<DownloadForm />);
+
+    await user.type(
+      screen.getByLabelText(/video or audio link/i),
+      "https://youtube.com/1\nhttps://youtube.com/2\nhttps://youtube.com/3",
+    );
+
+    expect(screen.getByText("3 URLs")).toBeInTheDocument();
+  });
+
   it("queues video jobs for the whole batch when the user picks video (FR-101)", async () => {
     mockBatchBackend();
     const user = userEvent.setup();
