@@ -39,7 +39,16 @@ fn canceled(during: &str) -> AppError {
 #[derive(Clone, serde::Serialize)]
 struct JobProgressEvent {
     job_id: String,
-    progress_percent: f64,
+    /// `null` when the source reported no total size (audio-only formats,
+    /// HLS), i.e. the percentage is genuinely unknown — see
+    /// `ytdlp::ProgressUpdate::percent`. The frontend renders an
+    /// indeterminate bar plus `downloaded_bytes`/`speed_bytes_per_sec` in
+    /// that case instead of a "0%" that would be a lie.
+    progress_percent: Option<f64>,
+    /// Carried so the UI has a true number to show when there is no
+    /// percentage. Never persisted — the queue table has no column for it,
+    /// and it only means anything for a run that is currently in flight.
+    downloaded_bytes: Option<i64>,
     speed_bytes_per_sec: Option<i64>,
     eta_seconds: Option<i64>,
 }
@@ -844,13 +853,19 @@ async fn run_gallery_job(
         &job_dir,
         total_files,
         move |update| {
-            let percent = (update.completed_files as f64 / update.total_files as f64) * 100.0;
+            // Gallery progress is counted by the app itself (files done /
+            // files total), so unlike the yt-dlp path it is always known —
+            // hence `Some`, never `None`. This is why gallery jobs were the
+            // only media type whose stored progress was already always
+            // correct.
+            let percent = Some((update.completed_files as f64 / update.total_files as f64) * 100.0);
             let _ = db_for_progress.update_job_progress(&job_id_for_progress, percent, None, None);
             emit_progress(
                 &app_for_progress,
                 &job_id_for_progress,
                 &ytdlp::ProgressUpdate {
                     percent,
+                    downloaded_bytes: None,
                     speed_bytes_per_sec: None,
                     eta_seconds: None,
                 },
@@ -1402,6 +1417,7 @@ fn emit_progress(app: &AppHandle, job_id: &str, update: &ytdlp::ProgressUpdate) 
         JobProgressEvent {
             job_id: job_id.to_string(),
             progress_percent: update.percent,
+            downloaded_bytes: update.downloaded_bytes,
             speed_bytes_per_sec: update.speed_bytes_per_sec,
             eta_seconds: update.eta_seconds,
         },

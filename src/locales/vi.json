@@ -81,6 +81,8 @@
     "clear_finished": "Xoá lượt tải đã xong",
     "retry_countdown": "Thử lại sau {{seconds}}s (lần {{attempt}})",
     "reorder_failed": "Không thể sắp xếp lại hàng đợi.",
+    "progress_unknown": "Không rõ tiến độ — nguồn này không báo tổng dung lượng",
+    "downloaded_so_far": "Đã tải {{size}}",
     "status": {
       "queued": "Đang chờ",
       "fetching_metadata": "Đang lấy thông tin…",

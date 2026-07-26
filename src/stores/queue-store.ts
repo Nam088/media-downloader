@@ -3,13 +3,21 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import i18n from "@/lib/i18n";
-import type { DownloadJob, JobProgressEvent, JobStatusChangedEvent } from "@/types/download";
+import type {
+  DownloadJob,
+  JobProgressEvent,
+  JobStatusChangedEvent,
+  LiveProgress,
+} from "@/types/download";
 
 /** Statuses a job never leaves on its own — the ones `clearFinished` hides. */
 const FINISHED_STATUSES = new Set(["completed", "failed", "canceled"]);
 
 interface QueueState {
   jobs: Record<string, DownloadJob>;
+  /** Keyed by job id, and only present while that job is actually running.
+   * Holds what the database has no column for — see `LiveProgress`. */
+  liveProgress: Record<string, LiveProgress>;
   upsertJob: (job: DownloadJob) => void;
   upsertJobs: (jobs: DownloadJob[]) => void;
   applyProgress: (event: JobProgressEvent) => void;
@@ -29,6 +37,7 @@ interface QueueState {
 
 export const useQueueStore = create<QueueState>((set, get) => ({
   jobs: {},
+  liveProgress: {},
   upsertJob: (job) => set((state) => ({ jobs: { ...state.jobs, [job.id]: job } })),
   upsertJobs: (jobs) =>
     set((state) => ({
@@ -43,9 +52,20 @@ export const useQueueStore = create<QueueState>((set, get) => ({
           ...state.jobs,
           [event.job_id]: {
             ...existing,
-            progress_percent: event.progress_percent,
+            // A tick with no percentage keeps the last one that was known,
+            // mirroring what the database row does (`COALESCE`). It must not
+            // fall back to 0: that is exactly the "unknown means zero" bug,
+            // just moved into the frontend.
+            progress_percent: event.progress_percent ?? existing.progress_percent,
             speed_bytes_per_sec: event.speed_bytes_per_sec,
             eta_seconds: event.eta_seconds,
+          },
+        },
+        liveProgress: {
+          ...state.liveProgress,
+          [event.job_id]: {
+            progress_percent: event.progress_percent,
+            downloaded_bytes: event.downloaded_bytes,
           },
         },
       };
@@ -54,6 +74,15 @@ export const useQueueStore = create<QueueState>((set, get) => ({
     set((state) => {
       const existing = state.jobs[event.job_id];
       if (!existing) return state;
+      // A job that has stopped has no live run to describe any more, so the
+      // ephemeral half goes away and the row falls back to its stored
+      // numbers. For a completed job that means 100%: the backend forces it
+      // on the row, and this event carries no progress of its own, so
+      // without mirroring it here the queue would keep showing whatever the
+      // last tick happened to say until the next hydrate.
+      const finished = FINISHED_STATUSES.has(event.status);
+      const liveProgress = { ...state.liveProgress };
+      if (finished) delete liveProgress[event.job_id];
       return {
         jobs: {
           ...state.jobs,
@@ -62,8 +91,11 @@ export const useQueueStore = create<QueueState>((set, get) => ({
             status: event.status,
             error_message: event.error_message,
             output_file_path: event.output_file_path ?? existing.output_file_path,
+            progress_percent:
+              event.status === "completed" ? 100 : existing.progress_percent,
           },
         },
+        liveProgress,
       };
     }),
   /**
