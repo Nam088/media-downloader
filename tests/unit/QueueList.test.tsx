@@ -24,6 +24,8 @@ function makeJob(overrides: Partial<DownloadJob> = {}): DownloadJob {
     retried_from_job_id: null,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-01T00:00:00Z",
+    title: null,
+    playlist_title: null,
     ...overrides,
   };
 }
@@ -51,5 +53,112 @@ describe("QueueList", () => {
     });
     render(<QueueList />);
     expect(screen.getByText(/no downloads in progress/i)).toBeInTheDocument();
+  });
+
+  it("shows a job's title instead of its raw source_url when a title is set", () => {
+    useQueueStore.setState({ jobs: { "job-1": makeJob({ title: "Some Song (Official Video)" }) } });
+    render(<QueueList />);
+    expect(screen.getByText("Some Song (Official Video)")).toBeInTheDocument();
+    expect(screen.queryByText("https://youtube.com/watch?v=abc")).not.toBeInTheDocument();
+  });
+
+  it("groups playlist jobs under one header instead of N separate rows", () => {
+    useQueueStore.setState({
+      jobs: {
+        "job-1": makeJob({
+          id: "job-1",
+          is_playlist_item: true,
+          parent_playlist_id: "pl-1",
+          playlist_title: "My Playlist",
+          title: "Video 1",
+          status: "downloading",
+          progress_percent: 100,
+        }),
+        "job-2": makeJob({
+          id: "job-2",
+          is_playlist_item: true,
+          parent_playlist_id: "pl-1",
+          playlist_title: "My Playlist",
+          title: "Video 2",
+          status: "downloading",
+          progress_percent: 0,
+        }),
+      },
+    });
+    render(<QueueList />);
+    expect(screen.getByText("My Playlist")).toBeInTheDocument();
+    expect(screen.getByText("0/2 completed")).toBeInTheDocument();
+    // Expanded by default: both children are visible under the group.
+    expect(screen.getByText("Video 1")).toBeInTheDocument();
+    expect(screen.getByText("Video 2")).toBeInTheDocument();
+  });
+
+  it("keeps a playlist group visible, with the finished child still shown, until every job in it is completed", () => {
+    useQueueStore.setState({
+      jobs: {
+        "job-1": makeJob({
+          id: "job-1",
+          is_playlist_item: true,
+          parent_playlist_id: "pl-1",
+          playlist_title: "My Playlist",
+          title: "Video 1",
+          status: "completed",
+          progress_percent: 100,
+        }),
+        "job-2": makeJob({
+          id: "job-2",
+          is_playlist_item: true,
+          parent_playlist_id: "pl-1",
+          playlist_title: "My Playlist",
+          title: "Video 2",
+          status: "downloading",
+          progress_percent: 30,
+        }),
+      },
+    });
+    render(<QueueList />);
+    // Regression guard: a standalone job disappears from this list once
+    // completed (see the test above). A playlist group must not do the
+    // same to individual children while siblings are still active, or the
+    // completed count above would have nothing to count against.
+    expect(screen.getByText("My Playlist")).toBeInTheDocument();
+    expect(screen.getByText("Video 1")).toBeInTheDocument();
+    expect(screen.getByText("Video 2")).toBeInTheDocument();
+  });
+
+  it("hides the playlist group once every job in it has completed", () => {
+    useQueueStore.setState({
+      jobs: {
+        "job-1": makeJob({
+          id: "job-1",
+          is_playlist_item: true,
+          parent_playlist_id: "pl-1",
+          playlist_title: "My Playlist",
+          status: "completed",
+          progress_percent: 100,
+        }),
+        "job-2": makeJob({
+          id: "job-2",
+          is_playlist_item: true,
+          parent_playlist_id: "pl-1",
+          playlist_title: "My Playlist",
+          status: "completed",
+          progress_percent: 100,
+        }),
+      },
+    });
+    render(<QueueList />);
+    expect(screen.queryByText("My Playlist")).not.toBeInTheDocument();
+    expect(screen.getByText(/no downloads in progress/i)).toBeInTheDocument();
+  });
+
+  it("falls back to a generic label when a playlist group has no stored title", () => {
+    useQueueStore.setState({
+      jobs: {
+        "job-1": makeJob({ id: "job-1", is_playlist_item: true, parent_playlist_id: "pl-1", playlist_title: null }),
+      },
+    });
+    render(<QueueList />);
+    expect(screen.getByText("Playlist")).toBeInTheDocument();
   });
 });

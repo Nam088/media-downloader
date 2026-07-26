@@ -44,6 +44,19 @@
     "single_item_button": "Chỉ mục này",
     "entire_playlist_button": "Cả danh sách"
   },
+  "playlistDetail": {
+    "title": "Chọn video muốn tải",
+    "description_with_count": "Playlist này có {{count}} video. Chọn video muốn tải, và mỗi video tải dưới dạng video hay âm thanh.",
+    "selected_count": "Đã chọn {{selected}}/{{total}}",
+    "select_all": "Chọn tất cả",
+    "select_none": "Bỏ chọn hết",
+    "set_all_video": "Tất cả → Video",
+    "set_all_audio": "Tất cả → Âm thanh",
+    "item_type_video": "Tải dạng video",
+    "item_type_audio": "Tải dạng âm thanh",
+    "submit_button": "Tải {{count}} mục đã chọn",
+    "added_to_queue": "Đã thêm {{count}} lượt tải vào hàng đợi"
+  },
   "home": {
     "queue_heading": "Đang tải",
     "completed_heading": "Đã hoàn tất"
@@ -51,6 +64,10 @@
   "queue": {
     "empty": "Không có tác vụ nào đang tải.",
     "download_completed": "Đã tải xong",
+    "playlist_fallback_title": "Playlist",
+    "playlist_progress": "{{completed}}/{{total}} hoàn tất",
+    "collapse_group": "Thu gọn",
+    "expand_group": "Mở rộng",
     "status": {
       "queued": "Đang chờ",
       "fetching_metadata": "Đang lấy thông tin…",

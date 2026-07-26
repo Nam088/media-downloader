@@ -11,9 +11,16 @@ import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { ErrorBanner } from "@/components/ErrorBanner";
+import { PlaylistDetailPanel } from "@/components/PlaylistDetailPanel";
 import { PlaylistScopeDialog } from "@/components/PlaylistScopeDialog";
 import { useAppSettings } from "@/hooks/use-app-settings";
 import { useQueueStore } from "@/stores/queue-store";
+import {
+  GENERIC_PLAYLIST_AUDIO_QUALITIES,
+  GENERIC_PLAYLIST_VIDEO_QUALITIES,
+  BEST_AUDIO_QUALITY_VALUE,
+  audioQualityValue,
+} from "@/lib/generic-quality-options";
 import type {
   AppError,
   AudioFormatOption,
@@ -24,16 +31,6 @@ import type {
   MediaType,
   VideoQualityOption,
 } from "@/types/download";
-
-/** Radio value used when a link has no explicit audio bitrate at all (e.g.
- * TikTok's pre-muxed formats — see `commands::media::extract_format_options`
- * on the backend). Submitting this means "omit audio_quality" (let yt-dlp
- * extract whatever's actually there) rather than sending a made-up number. */
-const BEST_AUDIO_QUALITY_VALUE = "__best__";
-
-function audioQualityValue(bitrateKbps: number | null): string {
-  return bitrateKbps == null ? BEST_AUDIO_QUALITY_VALUE : `${bitrateKbps}kbps`;
-}
 
 function formatDuration(seconds: number | null): string | null {
   if (seconds == null) return null;
@@ -89,30 +86,6 @@ function extractUrlsFromText(raw: string): string[] {
 function splitUrls(raw: string): string[] {
   return extractUrlsFromText(raw);
 }
-
-/** Flat-playlist previews carry no per-entry format list at all (see
- * `commands::media::build_media_source`'s own comment on the backend) — so
- * there's nothing real to render per FR-004/FR-019's "never invent options"
- * rule. But that shouldn't mean playlist downloads can never pick a
- * resolution/bitrate at all: this is a fixed, generic set of common labels
- * (not validated against any specific link) that the backend passes through
- * as-is to yt-dlp's own graceful per-video format selector for each fanned-out
- * entry (`queue::video_format_selector` already tolerates a quality that
- * doesn't exist for a given video by falling back to the nearest one). */
-const GENERIC_PLAYLIST_VIDEO_QUALITIES: VideoQualityOption[] = [
-  { label: "2160p", filesize_bytes: null },
-  { label: "1440p", filesize_bytes: null },
-  { label: "1080p", filesize_bytes: null },
-  { label: "720p", filesize_bytes: null },
-  { label: "480p", filesize_bytes: null },
-  { label: "360p", filesize_bytes: null },
-];
-const GENERIC_PLAYLIST_AUDIO_QUALITIES: AudioFormatOption[] = [
-  { bitrate_kbps: 320, codec: "mp3", filesize_bytes: null },
-  { bitrate_kbps: 256, codec: "mp3", filesize_bytes: null },
-  { bitrate_kbps: 192, codec: "mp3", filesize_bytes: null },
-  { bitrate_kbps: 128, codec: "mp3", filesize_bytes: null },
-];
 
 /** One row in the quality picker — mirrors the reference layout: radio +
  * bold quality label + codec detail + right-aligned estimated size. Options
@@ -376,6 +349,7 @@ export function DownloadForm() {
                   ? undefined
                   : Array.from(selectedGalleryIndices),
               output_directory: effectiveOutputDirectory,
+              title: preview.title,
             }
           : {
               source_url: preview.source_url,
@@ -385,6 +359,7 @@ export function DownloadForm() {
               video_quality: mediaType === "video" ? videoQuality : undefined,
               output_directory: effectiveOutputDirectory,
               playlist_scope: preview.is_playlist ? (scope ?? "single_item") : undefined,
+              title: preview.title,
             };
       const createdJobs = await invoke<DownloadJob[]>("create_download_job", { input });
       useQueueStore.getState().upsertJobs(createdJobs);
@@ -430,6 +405,7 @@ export function DownloadForm() {
               media_type: "gallery",
               gallery_mode: "audio_only",
               output_directory: effectiveOutputDirectory,
+              title: previewResult.title,
             }
           : {
               source_url: previewResult.source_url,
@@ -441,6 +417,7 @@ export function DownloadForm() {
               })(),
               output_directory: effectiveOutputDirectory,
               playlist_scope: previewResult.is_playlist ? "single_item" : undefined,
+              title: previewResult.title,
             };
         const createdJobs = await invoke<DownloadJob[]>("create_download_job", { input });
         useQueueStore.getState().upsertJobs(createdJobs);
@@ -611,7 +588,11 @@ export function DownloadForm() {
               </div>
             </div>
 
-            {preview.is_gallery ? (
+            {preview.is_playlist && preview.playlist_entries.length > 0 ? (
+              <div className="px-6 pt-2 pb-4">
+                <PlaylistDetailPanel preview={preview} outputDirectory={effectiveOutputDirectory} />
+              </div>
+            ) : preview.is_gallery ? (
               <div className="flex flex-col gap-6 px-6 pt-2 pb-2">
                 {(() => {
                   const imageItems = preview.gallery_items
@@ -801,7 +782,12 @@ export function DownloadForm() {
               )}
             </Button>
           ) : (
-            preview && (
+            // Hidden once the playlist's own entries are showing inline
+            // (PlaylistDetailPanel below). That panel has its own submit
+            // button, since it queues a per-item selection this generic
+            // button can't express.
+            preview &&
+            !(preview.is_playlist && preview.playlist_entries.length > 0) && (
               <Button onClick={handleDownloadClick} disabled={!canDownloadSingle} className="rounded-lg shadow-xs h-10 px-7 text-sm font-semibold gap-2">
                 {submitting ? (
                   <>

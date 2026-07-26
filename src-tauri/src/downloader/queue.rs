@@ -181,6 +181,8 @@ impl DownloadQueue {
             retried_from_job_id: Some(job_id.to_string()),
             created_at: now.clone(),
             updated_at: now,
+            title: original.title,
+            playlist_title: original.playlist_title,
         };
 
         self.enqueue(retried.clone()).await?;
@@ -652,6 +654,65 @@ fn compute_image_duration_secs(probed_audio_secs: Option<f64>, image_count: usiz
 /// direction throughout the whole slideshow.
 const SLIDESHOW_TRANSITION: &str = "slideleft";
 
+/// Builds the ffmpeg video-side filter/map arguments for the slideshow
+/// encode, split out from `merge_gallery_slideshow` so the N=1 vs N>1
+/// branching is unit-testable without spawning ffmpeg. Every branch must end
+/// in an explicit `-map` for its own video output: once any `-map` is
+/// present on a command (the audio track always gets one, added by the
+/// caller), ffmpeg disables automatic stream selection for that output
+/// entirely, so an unmapped filtered video stream is silently dropped
+/// instead of erroring, leaving an audio-only file with no picture.
+fn build_slideshow_video_args(
+    image_count: usize,
+    scale_pad: &str,
+    transition_secs: f64,
+    image_duration_secs: f64,
+) -> Vec<String> {
+    if image_count == 1 {
+        vec!["-vf".to_string(), scale_pad.to_string(), "-map".to_string(), "0:v".to_string()]
+    } else {
+        let mut filter = String::new();
+        for i in 0..image_count {
+            filter.push_str(&format!("[{i}:v]{scale_pad}[v{i}];"));
+        }
+        let mut last_label = "v0".to_string();
+        let mut offset = image_duration_secs;
+        for i in 1..image_count {
+            let out_label = if i == image_count - 1 {
+                "vout".to_string()
+            } else {
+                format!("vx{i}")
+            };
+            filter.push_str(&format!(
+                "[{last_label}][v{i}]xfade=transition={SLIDESHOW_TRANSITION}:duration={transition_secs}:offset={offset}[{out_label}];"
+            ));
+            last_label = out_label;
+            offset += image_duration_secs;
+        }
+        filter.pop(); // trailing ';'
+        vec!["-filter_complex".to_string(), filter, "-map".to_string(), "[vout]".to_string()]
+    }
+}
+
+/// How much extra time to add to only the LAST image's on-screen duration so
+/// the slideshow's total length always covers the real audio length, even
+/// though `image_duration_secs` (the per-image share) is clamped to a sane
+/// range and so can't itself be relied on to sum back up to the real total.
+/// Returns `0.0` whenever the naive total already covers the audio (or the
+/// audio's length couldn't be probed at all). `-shortest` handles trimming
+/// the other direction (naive total longer than audio) on its own.
+fn compute_tail_extension_secs(
+    probed_audio_secs: Option<f64>,
+    image_count: usize,
+    image_duration_secs: f64,
+    transition_secs: f64,
+) -> f64 {
+    let nominal_total_secs = image_count as f64 * image_duration_secs + transition_secs;
+    probed_audio_secs
+        .map(|total| (total - nominal_total_secs).max(0.0))
+        .unwrap_or(0.0)
+}
+
 /// Merges downloaded gallery images + one audio track into a single
 /// slideshow video via ffmpeg's `xfade` filter, crossfading each image into
 /// the next with a horizontal slide (`SLIDESHOW_TRANSITION`, the same
@@ -662,11 +723,15 @@ const SLIDESHOW_TRANSITION: &str = "slideleft";
 ///
 /// The audio track is never trimmed: each image's display time is the
 /// audio's own real length (probed via `probe_audio_duration_secs`) divided
-/// evenly across the image count — not a fixed per-image duration, which
+/// evenly across the image count, not a fixed per-image duration, which
 /// would either run past the music (dead air) or, combined with `-shortest`,
-/// silently truncate the audio early to match a shorter slideshow. `-shortest`
-/// stays only as a rounding-error safety net now that the two are computed to
-/// already match.
+/// silently truncate the audio early to match a shorter slideshow. Because
+/// that per-image share is clamped to a sane range (see
+/// `compute_image_duration_secs`), a long track shared by few images (or a
+/// short track shared by many) can still leave the naive total short of the
+/// real audio length; that shortfall is folded entirely into the last
+/// image's own on-screen time so the video always covers the full track and
+/// `-shortest` stays only a rounding-error safety net.
 async fn merge_gallery_slideshow(
     job_dir: &str,
     image_paths: &[String],
@@ -701,39 +766,33 @@ async fn merge_gallery_slideshow(
     // much of both clips' tails/heads to blend them) — otherwise the
     // transition would eat into black/nothing past the loop's own duration.
     let clip_duration = image_duration_secs + transition_secs;
-    for image_path in image_paths {
+    let tail_extension_secs = compute_tail_extension_secs(
+        probed_audio_secs,
+        image_paths.len(),
+        image_duration_secs,
+        transition_secs,
+    );
+    let last_index = image_paths.len() - 1;
+    for (index, image_path) in image_paths.iter().enumerate() {
         let file_name = std::path::Path::new(image_path)
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| AppError::internal("gallery image has no filename"))?;
-        cmd.args(["-loop", "1", "-t", &clip_duration.to_string(), "-i", file_name]);
+        let this_clip_duration = if index == last_index {
+            clip_duration + tail_extension_secs
+        } else {
+            clip_duration
+        };
+        cmd.args(["-loop", "1", "-t", &this_clip_duration.to_string(), "-i", file_name]);
     }
     cmd.args(["-i", &audio_file_name]);
 
-    if image_paths.len() == 1 {
-        cmd.args(["-vf", &scale_pad]);
-    } else {
-        let mut filter = String::new();
-        for i in 0..image_paths.len() {
-            filter.push_str(&format!("[{i}:v]{scale_pad}[v{i}];"));
-        }
-        let mut last_label = "v0".to_string();
-        let mut offset = image_duration_secs;
-        for i in 1..image_paths.len() {
-            let out_label = if i == image_paths.len() - 1 {
-                "vout".to_string()
-            } else {
-                format!("vx{i}")
-            };
-            filter.push_str(&format!(
-                "[{last_label}][v{i}]xfade=transition={SLIDESHOW_TRANSITION}:duration={transition_secs}:offset={offset}[{out_label}];"
-            ));
-            last_label = out_label;
-            offset += image_duration_secs;
-        }
-        filter.pop(); // trailing ';'
-        cmd.args(["-filter_complex", &filter, "-map", "[vout]"]);
-    }
+    cmd.args(build_slideshow_video_args(
+        image_paths.len(),
+        &scale_pad,
+        transition_secs,
+        image_duration_secs,
+    ));
 
     let audio_input_index = image_paths.len();
     cmd.args([
@@ -1042,6 +1101,51 @@ mod tests {
         assert_eq!(compute_image_duration_secs(Some(120.0), 1), MAX_SLIDESHOW_IMAGE_DURATION_SECS);
     }
 
+    #[test]
+    fn tail_extension_covers_the_shortfall_from_a_max_duration_clamp() {
+        // Regression test: 1 image against a 120s track clamps
+        // image_duration_secs to MAX_SLIDESHOW_IMAGE_DURATION_SECS (8.0), so
+        // the naive total (8.0 + 0.5 transition = 8.5s) is nowhere near the
+        // real 120s track. Without extending the tail, `-shortest` would cut
+        // the audio down to 8.5s instead of keeping the full track.
+        let tail = compute_tail_extension_secs(Some(120.0), 1, MAX_SLIDESHOW_IMAGE_DURATION_SECS, 0.5);
+        assert_eq!(tail, 120.0 - (MAX_SLIDESHOW_IMAGE_DURATION_SECS + 0.5));
+    }
+
+    #[test]
+    fn tail_extension_is_zero_when_no_clamp_was_applied() {
+        // 4 images at 17.3/4 = 4.325s each: no clamp involved, so the naive
+        // total (which also includes the trailing transition) already meets
+        // or exceeds the real track length, so no extension is needed.
+        let image_duration_secs = 17.3 / 4.0;
+        let tail = compute_tail_extension_secs(Some(17.3), 4, image_duration_secs, 0.5);
+        assert_eq!(tail, 0.0);
+    }
+
+    #[test]
+    fn tail_extension_is_zero_when_audio_length_is_unknown() {
+        assert_eq!(compute_tail_extension_secs(None, 3, DEFAULT_SLIDESHOW_IMAGE_DURATION_SECS, 0.5), 0.0);
+    }
+
+    #[test]
+    fn single_image_slideshow_explicitly_maps_the_filtered_video_stream() {
+        // Regression test: ffmpeg disables automatic stream selection for an
+        // output once ANY -map is present on it (the caller always adds one
+        // for the audio track), so a bare `-vf` with no matching `-map`
+        // silently drops the video entirely. The merged file plays audio
+        // but has no video track at all.
+        let args = build_slideshow_video_args(1, "scale=1080:1920", 0.5, 3.0);
+        assert_eq!(args, vec!["-vf", "scale=1080:1920", "-map", "0:v"]);
+    }
+
+    #[test]
+    fn multi_image_slideshow_still_maps_the_crossfaded_output() {
+        let args = build_slideshow_video_args(3, "scale=1080:1920", 0.5, 3.0);
+        assert_eq!(args[0], "-filter_complex");
+        assert_eq!(args[2], "-map");
+        assert_eq!(args[3], "[vout]");
+    }
+
     fn sample_job(media_type: MediaType, audio_quality: Option<&str>, video_quality: Option<&str>) -> DownloadJob {
         DownloadJob {
             id: "job-1".into(),
@@ -1064,6 +1168,8 @@ mod tests {
             retried_from_job_id: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
+            title: None,
+            playlist_title: None,
         }
     }
 

@@ -36,6 +36,16 @@ export interface GalleryItemPreview {
   is_audio: boolean;
 }
 
+/** One entry in a playlist, as flattened by `yt-dlp --flat-playlist`. Empty
+ * whenever the source isn't a playlist. `thumbnail_url` can be null when
+ * yt-dlp reports no thumbnail for that specific entry. */
+export interface PlaylistEntryPreview {
+  url: string;
+  title: string;
+  duration_seconds: number | null;
+  thumbnail_url: string | null;
+}
+
 /** Options are always populated from the real formats yt-dlp returned for
  * this specific link (FR-004, FR-019) — never a fixed list in this file.
  *
@@ -55,6 +65,7 @@ export interface MediaSource {
   available_audio_formats: AudioFormatOption[];
   is_gallery: boolean;
   gallery_items: GalleryItemPreview[];
+  playlist_entries: PlaylistEntryPreview[];
 }
 
 export interface DownloadJob {
@@ -78,6 +89,15 @@ export interface DownloadJob {
   retried_from_job_id: string | null;
   created_at: string;
   updated_at: string;
+  /** This job's own display title, shown instead of the raw `source_url`
+   * when available. `null` for jobs created before this field existed, or
+   * paths where the backend never had a title to begin with. */
+  title: string | null;
+  /** The shared playlist's own title, duplicated onto every job fanned out
+   * from the same submission (same value for every job sharing
+   * `parent_playlist_id`), used as the queue's group header. `null` for
+   * non-playlist jobs. */
+  playlist_title: string | null;
 }
 
 export interface AppError {
@@ -94,6 +114,28 @@ export interface CreateJobInput {
   selected_gallery_indices?: number[];
   output_directory: string;
   playlist_scope?: "single_item" | "entire_playlist";
+  /** This job's own display title (e.g. `MediaSource.title`). */
+  title?: string;
+}
+
+/** One entry submitted to `create_playlist_download_jobs` — lets each video
+ * in the playlist get its own media type and quality, per the "some video,
+ * some audio" requirement. */
+export interface PlaylistItemJobInput {
+  source_url: string;
+  media_type: MediaType;
+  audio_quality?: string;
+  video_quality?: string;
+  /** This video's own title, from `MediaSource.playlist_entries[].title`. */
+  title?: string;
+}
+
+export interface CreatePlaylistJobsInput {
+  output_directory: string;
+  items: PlaylistItemJobInput[];
+  /** The playlist's own title (`MediaSource.title`), shared across every job
+   * created from this submission as the queue's group header. */
+  playlist_title?: string;
 }
 
 export interface JobProgressEvent {

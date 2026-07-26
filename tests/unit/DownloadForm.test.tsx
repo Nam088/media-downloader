@@ -64,6 +64,11 @@ describe("DownloadForm", () => {
     await user.click(screen.getByRole("button", { name: /preview/i }));
 
     expect(await screen.findByText("Sample video")).toBeInTheDocument();
+
+    // Quality options default to the video panel; switch to audio to reach
+    // the list this test actually exercises.
+    await user.click(screen.getByRole("button", { name: /audio only/i }));
+
     // Only the bitrates preview_media returned should exist as options —
     // no "128kbps"/"320kbps" style constants baked into the component.
     expect(screen.getByText("160kbps")).toBeInTheDocument();

@@ -48,6 +48,11 @@ pub struct CreateJobInput {
     pub output_directory: String,
     #[serde(default)]
     pub playlist_scope: Option<PlaylistScope>,
+    /// This job's own display title (e.g. `MediaSource.title`), shown in the
+    /// queue instead of the raw `source_url` when available. See
+    /// `models::DownloadJob.title`.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// Validates the requested quality against the most recent `preview_media`
@@ -141,6 +146,8 @@ struct NewJobArgs {
     output_directory: String,
     is_playlist_item: bool,
     parent_playlist_id: Option<String>,
+    title: Option<String>,
+    playlist_title: Option<String>,
 }
 
 fn new_job(args: NewJobArgs) -> DownloadJob {
@@ -175,6 +182,8 @@ fn new_job(args: NewJobArgs) -> DownloadJob {
         retried_from_job_id: None,
         created_at: now.clone(),
         updated_at: now,
+        title: args.title,
+        playlist_title: args.playlist_title,
     }
 }
 
@@ -228,6 +237,12 @@ pub async fn create_download_job(
                 output_directory: input.output_directory.clone(),
                 is_playlist_item: true,
                 parent_playlist_id: Some(parent_playlist_id.clone()),
+                // A flat-playlist entry URL list has no per-entry title (see
+                // `extract_playlist_entry_urls`'s doc comment). Only the
+                // playlist's own title is known here, shared across every
+                // fanned-out entry as the group header.
+                title: None,
+                playlist_title: Some(preview.title.clone()),
             });
             queue.enqueue(job.clone()).await?;
             jobs.push(job);
@@ -252,9 +267,82 @@ pub async fn create_download_job(
         output_directory: input.output_directory,
         is_playlist_item: false,
         parent_playlist_id: None,
+        title: input.title,
+        playlist_title: None,
     });
     queue.enqueue(job.clone()).await?;
     Ok(vec![job])
+}
+
+/// One playlist video the user picked, with its own independently-chosen
+/// media type/quality — see `create_playlist_download_jobs`.
+#[derive(Debug, Deserialize)]
+pub struct PlaylistItemJobInput {
+    pub source_url: String,
+    pub media_type: MediaTypeInput,
+    pub audio_quality: Option<String>,
+    pub video_quality: Option<String>,
+    /// This video's own title, from `MediaSource.playlist_entries[].title`.
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreatePlaylistJobsInput {
+    pub output_directory: String,
+    pub items: Vec<PlaylistItemJobInput>,
+    /// The playlist's own title (`MediaSource.title`), shared across every
+    /// job created from this submission as the queue's group header.
+    #[serde(default)]
+    pub playlist_title: Option<String>,
+}
+
+/// The detailed playlist download flow: one job per user-picked video, each
+/// with its own media type and quality (so a single playlist can mix, e.g.,
+/// "video for these 3, audio for that one"), all sharing one
+/// `parent_playlist_id`. This is the sibling of `create_download_job`'s
+/// `playlist_scope: "entire_playlist"` path (which applies one media
+/// type/quality uniformly to every entry) — that simpler path is kept for
+/// whichever caller still wants "just grab the whole thing the same way".
+///
+/// No `PreviewCache` lookup/`validate_quality` here: a flat-playlist preview
+/// never had a real per-entry format list to validate against in the first
+/// place (see `validate_quality`'s own early return for playlists) — each
+/// item's quality is already just a generic, unvalidated label exactly like
+/// a single playlist-item job already was.
+#[tauri::command]
+pub async fn create_playlist_download_jobs(
+    queue: State<'_, DownloadQueue>,
+    input: CreatePlaylistJobsInput,
+) -> Result<Vec<DownloadJob>, AppError> {
+    if input.items.is_empty() {
+        return Err(AppError::new("MISSING_QUALITY", "Select at least one video to download"));
+    }
+
+    let parent_playlist_id = uuid::Uuid::new_v4().to_string();
+    let mut jobs = Vec::with_capacity(input.items.len());
+    for item in input.items {
+        let platform = detect_platform(&item.source_url)
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let job = new_job(NewJobArgs {
+            source_url: item.source_url,
+            platform,
+            media_type: item.media_type,
+            audio_quality: item.audio_quality,
+            video_quality: item.video_quality,
+            gallery_mode: None,
+            selected_gallery_indices: None,
+            output_directory: input.output_directory.clone(),
+            is_playlist_item: true,
+            parent_playlist_id: Some(parent_playlist_id.clone()),
+            title: item.title,
+            playlist_title: input.playlist_title.clone(),
+        });
+        queue.enqueue(job.clone()).await?;
+        jobs.push(job);
+    }
+    Ok(jobs)
 }
 
 #[tauri::command]

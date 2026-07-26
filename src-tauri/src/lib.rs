@@ -37,6 +37,7 @@ pub fn run() {
             commands::media::preview_media,
             commands::media::cancel_preview_media,
             commands::download::create_download_job,
+            commands::download::create_playlist_download_jobs,
             commands::download::pause_job,
             commands::download::resume_job,
             commands::download::cancel_job,

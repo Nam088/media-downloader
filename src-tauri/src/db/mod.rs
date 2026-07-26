@@ -16,6 +16,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/0004_settings_key_value.sql")),
         M::up(include_str!("migrations/0005_fix_stale_app_settings_schema.sql")),
         M::up(include_str!("migrations/0006_gallery_selected_urls.sql")),
+        M::up(include_str!("migrations/0007_job_titles.sql")),
     ])
 }
 
@@ -69,8 +70,8 @@ impl Db {
                 gallery_mode, selected_gallery_urls, status, progress_percent,
                 speed_bytes_per_sec, eta_seconds, error_message, output_directory,
                 output_file_path, is_playlist_item, parent_playlist_id,
-                retried_from_job_id, created_at, updated_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                retried_from_job_id, created_at, updated_at, title, playlist_title
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
             params![
                 job.id,
                 job.source_url,
@@ -92,6 +93,8 @@ impl Db {
                 job.retried_from_job_id,
                 job.created_at,
                 job.updated_at,
+                job.title,
+                job.playlist_title,
             ],
         )?;
         Ok(())
@@ -311,6 +314,8 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<DownloadJob> {
         retried_from_job_id: row.get("retried_from_job_id")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
+        title: row.get("title")?,
+        playlist_title: row.get("playlist_title")?,
     })
 }
 

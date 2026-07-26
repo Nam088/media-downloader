@@ -112,6 +112,18 @@ pub struct DownloadJob {
     pub retried_from_job_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// This job's own display title (e.g. a video's title), shown in the
+    /// queue instead of the raw `source_url` when available. `None` for
+    /// rows created before this field existed, or paths where the backend
+    /// never had a title to begin with (e.g. a flat-playlist fan-out where
+    /// yt-dlp only enumerated URLs, not per-entry titles).
+    pub title: Option<String>,
+    /// The shared playlist's own title, duplicated onto every job fanned
+    /// out from the same submission (same value for every row sharing
+    /// `parent_playlist_id`) so the frontend can group them under one
+    /// header without a separate playlist table. `None` for non-playlist
+    /// jobs.
+    pub playlist_title: Option<String>,
 }
 
 /// Mirrors `data-model.md` §2 (MediaSource). `available_audio_formats` /

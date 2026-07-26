@@ -44,6 +44,19 @@
     "single_item_button": "Just this item",
     "entire_playlist_button": "Entire playlist"
   },
+  "playlistDetail": {
+    "title": "Choose videos to download",
+    "description_with_count": "This playlist has {{count}} videos. Pick which ones to queue, and whether each one downloads as video or audio.",
+    "selected_count": "{{selected}} of {{total}} selected",
+    "select_all": "Select all",
+    "select_none": "Select none",
+    "set_all_video": "All → Video",
+    "set_all_audio": "All → Audio",
+    "item_type_video": "Download as video",
+    "item_type_audio": "Download as audio",
+    "submit_button": "Download {{count}} selected",
+    "added_to_queue": "{{count}} download(s) added to the queue"
+  },
   "home": {
     "queue_heading": "Active downloads",
     "completed_heading": "Completed"
@@ -51,6 +64,10 @@
   "queue": {
     "empty": "No downloads in progress.",
     "download_completed": "Download complete",
+    "playlist_fallback_title": "Playlist",
+    "playlist_progress": "{{completed}}/{{total}} completed",
+    "collapse_group": "Collapse",
+    "expand_group": "Expand",
     "status": {
       "queued": "Queued",
       "fetching_metadata": "Fetching info…",

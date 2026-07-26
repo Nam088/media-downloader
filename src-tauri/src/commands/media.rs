@@ -305,6 +305,8 @@ fn build_media_source(source_url: &str, platform: &str, raw: &serde_json::Value)
         extract_format_options(raw)
     };
 
+    let playlist_entries = if is_playlist { extract_playlist_entries(raw) } else { Vec::new() };
+
     MediaSource {
         source_url: source_url.to_string(),
         title: raw
@@ -321,7 +323,55 @@ fn build_media_source(source_url: &str, platform: &str, raw: &serde_json::Value)
         available_audio_formats,
         is_gallery: false,
         gallery_items: Vec::new(),
+        playlist_entries,
     }
+}
+
+/// Best-effort thumbnail for a flat-playlist entry: yt-dlp's own `thumbnail`
+/// field is often absent at flat-playlist depth (confirmed empirically — a
+/// real YouTube playlist entry had it `null`), falling back to the first of
+/// its `thumbnails` array (present instead, smallest-first) when so.
+fn extract_entry_thumbnail(entry: &serde_json::Value) -> Option<String> {
+    entry
+        .get("thumbnail")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| {
+            entry
+                .get("thumbnails")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|t| t.get("url"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+}
+
+fn extract_playlist_entries(raw: &serde_json::Value) -> Vec<crate::models::PlaylistEntryPreview> {
+    raw.get("entries")
+        .and_then(|v| v.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let url = entry
+                        .get("webpage_url")
+                        .or_else(|| entry.get("url"))
+                        .and_then(|v| v.as_str())?;
+                    Some(crate::models::PlaylistEntryPreview {
+                        url: url.to_string(),
+                        title: entry
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Untitled")
+                            .to_string(),
+                        duration_seconds: entry.get("duration").and_then(|v| v.as_f64()).map(|d| d as i64),
+                        thumbnail_url: extract_entry_thumbnail(entry),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn build_gallery_media_source(source_url: &str, platform: &str, dump: &GalleryDump) -> MediaSource {
@@ -361,6 +411,7 @@ fn build_gallery_media_source(source_url: &str, platform: &str, dump: &GalleryDu
         available_audio_formats: Vec::new(),
         is_gallery: true,
         gallery_items,
+        playlist_entries: Vec::new(),
     }
 }
 
