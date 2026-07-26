@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use rusqlite_migration::{Migrations, M};
+use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 use crate::models::{
@@ -22,6 +23,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/0008_queue_scheduling.sql")),
         M::up(include_str!("migrations/0009_backfill_completed_progress.sql")),
         M::up(include_str!("migrations/0010_job_output_options.sql")),
+        M::up(include_str!("migrations/0011_output_presets.sql")),
     ])
 }
 
@@ -565,6 +567,230 @@ impl Db {
         )?;
         Ok(())
     }
+
+    // ---- presets (FR-228 → FR-233) -------------------------------------
+
+    /// Sắp theo tên vì đây là danh sách người dùng đọc và chọn từ đó; thứ tự
+    /// theo thời điểm tạo sẽ khiến vị trí của một preset đổi chỗ chỉ vì nó
+    /// vừa được sửa.
+    pub fn list_presets(&self) -> Result<Vec<Preset>, AppError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, output_options, is_default, created_at, updated_at
+             FROM presets ORDER BY name",
+        )?;
+        let presets = stmt
+            .query_map([], row_to_preset)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(presets)
+    }
+
+    /// Preset mới KHÔNG bao giờ tự nhận cờ mặc định, kể cả khi nó là preset
+    /// đầu tiên: "lưu cấu hình này lại" (FR-228) và "từ nay áp nó cho mọi liên
+    /// kết mới" (FR-230) là hai ý định khác nhau, và gộp chúng lại sẽ âm thầm
+    /// đổi hành vi của mọi lần xem trước sau đó mà người dùng không hề yêu cầu.
+    pub fn create_preset(&self, name: &str, options: &OutputOptions) -> Result<Preset, AppError> {
+        let preset = Preset {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: normalize_preset_name(name)?,
+            output_options: options.clone(),
+            is_default: false,
+            created_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO presets (id, name, output_options, is_default, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+            params![
+                preset.id,
+                preset.name,
+                serialize_options(&preset.output_options)?,
+                preset.created_at,
+                preset.updated_at,
+            ],
+        )
+        .map_err(preset_write_error)?;
+        Ok(preset)
+    }
+
+    pub fn rename_preset(&self, preset_id: &str, name: &str) -> Result<Preset, AppError> {
+        let name = normalize_preset_name(name)?;
+        let conn = self.conn();
+        let changed = conn
+            .execute(
+                "UPDATE presets SET name = ?2, updated_at = ?3 WHERE id = ?1",
+                params![preset_id, name, Utc::now().to_rfc3339()],
+            )
+            .map_err(preset_write_error)?;
+        if changed == 0 {
+            return Err(AppError::not_found("Preset"));
+        }
+        preset_at(&conn, preset_id)?.ok_or_else(|| AppError::not_found("Preset"))
+    }
+
+    /// Ghi đè cả blob tuỳ chọn, không vá từng trường: bên gọi gửi lên nguyên
+    /// một `OutputOptions`, nên "trường này không xuất hiện" phải có nghĩa là
+    /// giá trị mặc định của nó, chứ không phải "giữ nguyên giá trị cũ".
+    pub fn update_preset_options(
+        &self,
+        preset_id: &str,
+        options: &OutputOptions,
+    ) -> Result<Preset, AppError> {
+        let conn = self.conn();
+        let changed = conn.execute(
+            "UPDATE presets SET output_options = ?2, updated_at = ?3 WHERE id = ?1",
+            params![
+                preset_id,
+                serialize_options(options)?,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        if changed == 0 {
+            return Err(AppError::not_found("Preset"));
+        }
+        preset_at(&conn, preset_id)?.ok_or_else(|| AppError::not_found("Preset"))
+    }
+
+    /// Xoá preset mặc định KHÔNG đôn preset khác lên thay. Trạng thái sau đó là
+    /// "không có preset mặc định" — đúng bằng trạng thái của một cài đặt mới,
+    /// nên mọi nơi đọc đã phải xử lý được nó rồi. Tự chọn đại một preset khác
+    /// sẽ là chuyện ngược lại: từ lần xem trước kế tiếp, một bộ tuỳ chọn người
+    /// dùng chưa bao giờ chọn làm mặc định bỗng được áp cho mọi liên kết.
+    pub fn delete_preset(&self, preset_id: &str) -> Result<(), AppError> {
+        let conn = self.conn();
+        let changed = conn.execute("DELETE FROM presets WHERE id = ?1", params![preset_id])?;
+        if changed == 0 {
+            return Err(AppError::not_found("Preset"));
+        }
+        Ok(())
+    }
+
+    /// Đặt `preset_id` làm mặc định, xoá cờ của preset mặc định cũ trong CÙNG
+    /// một giao dịch.
+    ///
+    /// Thứ tự hai câu lệnh không đổi chỗ được: chỉ mục một phần
+    /// `presets_single_default` được SQLite kiểm tra ngay tại từng dòng bị
+    /// ghi, nên bật cờ mới trước sẽ đụng phải cờ cũ còn nguyên và thất bại.
+    /// Giao dịch lo nốt nửa còn lại: một lỗi ở bước sau (kể cả trường hợp
+    /// `preset_id` không tồn tại) cuộn ngược cả việc xoá cờ cũ, nên không có
+    /// đường nào dẫn tới "không còn preset mặc định nào" ngoài việc người dùng
+    /// tự xoá nó.
+    pub fn set_default_preset(&self, preset_id: &str) -> Result<Preset, AppError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE presets SET is_default = 0, updated_at = ?2
+             WHERE is_default = 1 AND id <> ?1",
+            params![preset_id, now],
+        )?;
+        let changed = tx.execute(
+            "UPDATE presets SET is_default = 1, updated_at = ?2 WHERE id = ?1",
+            params![preset_id, now],
+        )?;
+        if changed == 0 {
+            return Err(AppError::not_found("Preset"));
+        }
+        let preset = preset_at(&tx, preset_id)?.ok_or_else(|| AppError::not_found("Preset"))?;
+        tx.commit()?;
+        Ok(preset)
+    }
+}
+
+/// Một bộ `Tuỳ chọn đầu ra` có tên, lưu lâu dài, có cờ đánh dấu mặc định
+/// (Key Entity "Preset", FR-228 → FR-233).
+///
+/// `output_options` mang NGUYÊN kiểu mà một tác vụ mang, không phải một bản
+/// sao rút gọn: một preset đúng là tuỳ chọn đầu ra của một tác vụ cộng thêm
+/// cái tên. Nhờ vậy giao diện áp preset bằng một phép gán, việc thêm tuỳ chọn
+/// mới không phải sửa chỗ nào ở đây, và FR-233 được `#[serde(default)]` của
+/// `OutputOptions` lo sẵn.
+///
+/// Giao diện cần đủ dữ liệu để thực hiện FR-231 (mức chất lượng trong preset
+/// không có ở nguồn hiện tại thì chọn mức gần nhất và nói rõ đã đổi gì) — nên
+/// bản ghi trả về nguyên vẹn thứ đã lưu, không hề bị lọc theo nguồn nào cả;
+/// việc đối chiếu với danh sách format thật là việc của phía áp preset.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Preset {
+    pub id: String,
+    pub name: String,
+    pub output_options: OutputOptions,
+    pub is_default: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn serialize_options(options: &OutputOptions) -> Result<String, AppError> {
+    serde_json::to_string(options).map_err(AppError::internal)
+}
+
+/// Cắt khoảng trắng thừa rồi chặn tên rỗng.
+///
+/// Việc cắt không phải để cho đẹp: `" Nhạc "` và `"Nhạc"` mà cùng lưu được thì
+/// chỉ mục UNIQUE trên tên chẳng ngăn được gì, và danh sách preset sẽ có hai
+/// mục trông hệt nhau.
+fn normalize_preset_name(name: &str) -> Result<String, AppError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::new(
+            "PRESET_NAME_REQUIRED",
+            "A preset needs a name",
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Dịch vi phạm ràng buộc thành mã lỗi mà giao diện dịch được.
+///
+/// Chỉ dùng cho hai câu lệnh ghi tên (thêm mới, đổi tên). Cả hai đều không hề
+/// chạm vào `is_default`, nên chỉ mục UNIQUE duy nhất chúng có thể đụng phải
+/// là `presets_name_unique` — `presets_single_default` nằm ngoài tầm với của
+/// chúng. Nhờ giới hạn ấy mà việc quy mọi `ConstraintViolation` về "trùng tên"
+/// ở đây là đúng chứ không phải đoán.
+fn preset_write_error(err: rusqlite::Error) -> AppError {
+    match &err {
+        rusqlite::Error::SqliteFailure(inner, _)
+            if inner.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            AppError::new(
+                "PRESET_NAME_TAKEN",
+                "A preset with this name already exists",
+            )
+        }
+        _ => AppError::from(err),
+    }
+}
+
+fn preset_at(conn: &Connection, preset_id: &str) -> Result<Option<Preset>, AppError> {
+    conn.query_row(
+        "SELECT id, name, output_options, is_default, created_at, updated_at
+         FROM presets WHERE id = ?1",
+        params![preset_id],
+        row_to_preset,
+    )
+    .optional()
+    .map_err(AppError::from)
+}
+
+fn row_to_preset(row: &rusqlite::Row) -> rusqlite::Result<Preset> {
+    let output_options_raw: String = row.get("output_options")?;
+    Ok(Preset {
+        id: row.get("id")?,
+        name: row.get("name")?,
+        // FR-233 nằm ở chính phép đọc này: blob thiếu trường (preset lưu từ
+        // phiên bản trước khi tuỳ chọn ấy tồn tại) vẫn đọc *thành công* nhờ
+        // `#[serde(default)]` trên `OutputOptions`, và trường vắng mặt nhận
+        // giá trị mặc định.
+        //
+        // `unwrap_or_default` chỉ đỡ trường hợp còn lại: blob hỏng hẳn (sửa
+        // tay CSDL). Chỗ rơi là bộ mặc định chứ không phải một lỗi làm biến
+        // mất TOÀN BỘ danh sách preset khỏi giao diện.
+        output_options: serde_json::from_str(&output_options_raw).unwrap_or_default(),
+        is_default: row.get::<_, i64>("is_default")? != 0,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
 }
 
 /// Khe hở hẹp nhất còn chấp nhận được giữa hai vị trí liền kề.
@@ -1029,6 +1255,7 @@ mod tests {
             codec_preference: CodecPreference::Quality,
             embed_metadata: true,
             embed_thumbnail: true,
+            ..OutputOptions::default()
         };
         db.insert_job(&job).unwrap();
 
@@ -1062,7 +1289,20 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(stored, r#"{"audio":{"format":"flac"},"video_container":"mp4","codec_preference":"compatibility","embed_metadata":false,"embed_thumbnail":false}"#);
+        // Kiểm đúng điều đang được khẳng định — nhánh `audio` trong chuỗi đã
+        // lưu không mang bitrate — chứ không so nguyên cả chuỗi: một khẳng
+        // định trên toàn chuỗi sẽ đỏ mỗi lần phase này thêm một tuỳ chọn
+        // không liên quan, và khi đó chẳng nói được gì về FR-203 cả.
+        let stored_value: serde_json::Value =
+            serde_json::from_str(&stored).expect("cột chứa JSON hợp lệ");
+        let audio = stored_value
+            .get("audio")
+            .expect("lựa chọn audio phải nằm trong chuỗi đã lưu");
+        assert_eq!(audio.get("format").and_then(|v| v.as_str()), Some("flac"));
+        assert!(
+            !stored.contains("bitrate"),
+            "chuỗi thật sự nằm trong CSDL không được mang bitrate nào: {stored}"
+        );
     }
 
     #[test]
@@ -1527,5 +1767,320 @@ mod tests {
         assert_eq!(settings.max_concurrent_downloads, 3);
         assert_eq!(settings.rate_limit_kbps, 0);
         assert_eq!(settings.max_retry_attempts, 3);
+    }
+
+    // ---- presets (FR-228 → FR-233) -------------------------------------
+
+    /// Một bộ tuỳ chọn khác mặc định ở ít nhất hai chỗ, dựng bằng struct-update
+    /// từ `default()` để không vỡ khi phase này thêm tuỳ chọn mới vào
+    /// `OutputOptions`.
+    fn sample_options() -> OutputOptions {
+        OutputOptions {
+            audio: AudioOutput::Opus {
+                bitrate_kbps: Some(192),
+            },
+            video_container: VideoContainer::Mkv,
+            codec_preference: CodecPreference::Quality,
+            embed_metadata: !OutputOptions::default().embed_metadata,
+            ..OutputOptions::default()
+        }
+    }
+
+    #[test]
+    fn migration_0011_is_registered_and_is_what_creates_the_presets_table() {
+        // Đăng ký migration là bước âm thầm nhất trong cả tính năng: quên dòng
+        // `M::up` thì file .sql vẫn nằm đó, `cargo build` vẫn xanh, và lỗi chỉ
+        // lộ ra ở lần chạy thật đầu tiên dưới dạng "no such table: presets".
+        //
+        // Phải kiểm bằng `raw_conn_at_version(10)` chứ không phải `temp_db()`:
+        // chỉ ở phiên bản 10 mới khẳng định được rằng bảng CHƯA có, tức chính
+        // 0011 là thứ tạo ra nó chứ không phải một migration nào khác.
+        let mut conn = raw_conn_at_version(10);
+        assert_eq!(
+            table_count(&conn, "presets"),
+            0,
+            "presets không được tồn tại trước 0011 — nếu có, test này không kiểm chứng gì cả"
+        );
+
+        migrations().to_latest(&mut conn).expect("0011 applies");
+
+        assert_eq!(
+            table_count(&conn, "presets"),
+            1,
+            "0011 phải được đăng ký trong `migrations()`, không chỉ nằm trong thư mục"
+        );
+    }
+
+    fn table_count(conn: &Connection, name: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_preset_survives_a_round_trip_through_the_database() {
+        // FR-228: cấu hình đầu ra hiện tại lưu thành preset có tên và tồn tại
+        // qua các lần khởi động. Mọi lựa chọn phải quay về nguyên vẹn — kể cả
+        // bitrate nằm bên trong biến thể enum, chỗ mà một lược đồ tuần tự hoá
+        // sai sẽ đánh rơi âm thầm.
+        let db = temp_db();
+        let created = db.create_preset("  Nhạc chất lượng cao  ", &sample_options()).unwrap();
+
+        let listed = db.list_presets().unwrap();
+
+        assert_eq!(listed, vec![created.clone()]);
+        assert_eq!(listed[0].output_options, sample_options());
+        assert_eq!(
+            listed[0].name, "Nhạc chất lượng cao",
+            "khoảng trắng thừa bị cắt trước khi lưu, nếu không chỉ mục UNIQUE trên tên chẳng ngăn được gì"
+        );
+        assert!(
+            !listed[0].is_default,
+            "lưu một preset không phải là yêu cầu áp nó cho mọi liên kết mới"
+        );
+    }
+
+    #[test]
+    fn only_one_preset_stays_the_default_after_a_second_one_is_set() {
+        // FR-230. Chế độ hỏng cần chặn là một lần đặt mặc định mới mà cờ cũ
+        // còn nguyên: từ đó "preset mặc định" trở thành thứ phụ thuộc vào thứ
+        // tự dòng trả về.
+        let db = temp_db();
+        let first = db.create_preset("Đầu tiên", &OutputOptions::default()).unwrap();
+        let second = db.create_preset("Thứ hai", &sample_options()).unwrap();
+
+        db.set_default_preset(&first.id).unwrap();
+        let promoted = db.set_default_preset(&second.id).unwrap();
+
+        assert!(promoted.is_default, "bản ghi trả về phải phản ánh trạng thái vừa ghi");
+        let defaults: Vec<String> = db
+            .list_presets()
+            .unwrap()
+            .into_iter()
+            .filter(|preset| preset.is_default)
+            .map(|preset| preset.id)
+            .collect();
+        assert_eq!(
+            defaults,
+            vec![second.id],
+            "chỉ preset được đặt sau cùng còn giữ cờ mặc định"
+        );
+    }
+
+    #[test]
+    fn the_database_itself_refuses_two_defaults() {
+        // Cùng bất biến với test trên, nhưng ở tầng khác: kiểm rằng nó được
+        // CSDL bảo đảm chứ không phải do `set_default_preset` cư xử tử tế. Câu
+        // UPDATE thô dưới đây là đúng cái mà một chỗ gọi cẩu thả (hoặc một
+        // migration tương lai) sẽ viết.
+        let db = temp_db();
+        db.create_preset("Đầu tiên", &OutputOptions::default()).unwrap();
+        db.create_preset("Thứ hai", &OutputOptions::default()).unwrap();
+
+        let forced = db
+            .conn()
+            .execute("UPDATE presets SET is_default = 1", []);
+
+        assert!(
+            forced.is_err(),
+            "chỉ mục một phần phải làm 'hai preset cùng mặc định' trở thành trạng thái không ghi được"
+        );
+    }
+
+    #[test]
+    fn setting_a_preset_that_no_longer_exists_keeps_the_current_default() {
+        // Nửa còn lại của bất biến "đúng một mặc định": hỏng giữa chừng không
+        // được để lại KHÔNG cái nào. Bước xoá cờ cũ chạy trước bước bật cờ
+        // mới, nên nếu không có giao dịch cuộn ngược, một id sai sẽ xoá sạch
+        // mặc định rồi báo lỗi.
+        let db = temp_db();
+        let kept = db.create_preset("Đang là mặc định", &OutputOptions::default()).unwrap();
+        db.set_default_preset(&kept.id).unwrap();
+
+        let failed = db.set_default_preset("không-tồn-tại");
+
+        assert!(failed.is_err());
+        let defaults: Vec<String> = db
+            .list_presets()
+            .unwrap()
+            .into_iter()
+            .filter(|preset| preset.is_default)
+            .map(|preset| preset.id)
+            .collect();
+        assert_eq!(defaults, vec![kept.id], "mặc định cũ phải còn nguyên");
+    }
+
+    #[test]
+    fn deleting_the_default_preset_leaves_no_default_and_touches_nothing_else() {
+        // Trạng thái sau khi xoá preset mặc định phải xác định. Lựa chọn ở đây
+        // là "không còn preset mặc định" — đúng bằng trạng thái của một cài
+        // đặt mới — chứ KHÔNG đôn preset khác lên thay, vì làm vậy sẽ áp một
+        // bộ tuỳ chọn người dùng chưa bao giờ chọn cho mọi liên kết kế tiếp.
+        let db = temp_db();
+        let doomed = db.create_preset("Sắp bị xoá", &OutputOptions::default()).unwrap();
+        let survivor = db.create_preset("Còn lại", &sample_options()).unwrap();
+        db.set_default_preset(&doomed.id).unwrap();
+
+        db.delete_preset(&doomed.id).unwrap();
+
+        let remaining = db.list_presets().unwrap();
+        assert_eq!(remaining, vec![survivor], "preset còn lại không bị đụng tới");
+        assert!(
+            remaining.iter().all(|preset| !preset.is_default),
+            "không preset nào được tự nhận cờ mặc định thay cho cái vừa bị xoá"
+        );
+    }
+
+    #[test]
+    fn deleting_a_preset_that_no_longer_exists_is_an_error_not_a_silent_success() {
+        let db = temp_db();
+        let error = db.delete_preset("không-tồn-tại").unwrap_err();
+        assert_eq!(error.code, "NOT_FOUND");
+    }
+
+    #[test]
+    fn two_presets_cannot_share_a_name() {
+        // Quyết định: tên là duy nhất. Hai mục trùng tên trong danh sách chọn
+        // thì người dùng không còn cách nào nhắm đúng mục để sửa hay xoá.
+        let db = temp_db();
+        db.create_preset("Podcast", &OutputOptions::default()).unwrap();
+
+        let clash = db.create_preset(" Podcast ", &sample_options()).unwrap_err();
+
+        assert_eq!(
+            clash.code, "PRESET_NAME_TAKEN",
+            "phải là mã lỗi giao diện dịch được, không phải INTERNAL"
+        );
+        assert_eq!(db.list_presets().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn renaming_onto_an_existing_name_is_rejected_and_changes_nothing() {
+        let db = temp_db();
+        db.create_preset("Podcast", &OutputOptions::default()).unwrap();
+        let other = db.create_preset("Nhạc", &sample_options()).unwrap();
+
+        let clash = db.rename_preset(&other.id, "Podcast").unwrap_err();
+
+        assert_eq!(clash.code, "PRESET_NAME_TAKEN");
+        assert_eq!(
+            db.list_presets()
+                .unwrap()
+                .into_iter()
+                .map(|preset| preset.name)
+                .collect::<Vec<_>>(),
+            vec!["Nhạc".to_string(), "Podcast".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_empty_name_is_rejected_at_creation_and_at_rename() {
+        let db = temp_db();
+        let created = db.create_preset("Có tên", &OutputOptions::default()).unwrap();
+
+        assert_eq!(
+            db.create_preset("   ", &OutputOptions::default()).unwrap_err().code,
+            "PRESET_NAME_REQUIRED"
+        );
+        assert_eq!(
+            db.rename_preset(&created.id, "\t\n").unwrap_err().code,
+            "PRESET_NAME_REQUIRED"
+        );
+    }
+
+    #[test]
+    fn renaming_and_updating_keep_the_other_half_of_the_preset_intact() {
+        // FR-229: sửa và đổi tên là hai thao tác riêng. Đổi tên không được đụng
+        // tới tuỳ chọn, và ghi đè tuỳ chọn không được đụng tới tên hay cờ mặc
+        // định.
+        let db = temp_db();
+        let created = db.create_preset("Tên cũ", &sample_options()).unwrap();
+        db.set_default_preset(&created.id).unwrap();
+
+        let renamed = db.rename_preset(&created.id, "Tên mới").unwrap();
+        assert_eq!(renamed.name, "Tên mới");
+        assert_eq!(renamed.output_options, sample_options());
+        assert!(renamed.is_default);
+
+        let updated = db
+            .update_preset_options(&created.id, &OutputOptions::default())
+            .unwrap();
+        assert_eq!(updated.output_options, OutputOptions::default());
+        assert_eq!(updated.name, "Tên mới");
+        assert!(updated.is_default);
+    }
+
+    #[test]
+    fn a_preset_stored_by_an_older_version_loads_with_the_missing_option_defaulted() {
+        // FR-233. Blob được dựng bằng cách BỚT một khoá khỏi dạng tuần tự hoá
+        // hôm nay, chứ không gõ tay một chuỗi JSON: nhờ vậy test vẫn đúng khi
+        // phase này thêm tiếp tuỳ chọn, và không khoá tên trường nào vào đây.
+        let db = temp_db();
+        let defaults = serde_json::to_value(OutputOptions::default()).unwrap();
+        let mut older = serde_json::to_value(sample_options()).unwrap();
+
+        // Bỏ hẳn một khoá mà giá trị đã lưu KHÁC mặc định — đóng vai "tuỳ chọn
+        // được thêm vào sau khi preset này được lưu".
+        let dropped = older
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(key, value)| defaults.get(key.as_str()) != Some(*value))
+            .map(|(key, _)| key.clone())
+            .expect("bộ tuỳ chọn mẫu phải khác mặc định ở ít nhất hai chỗ");
+        older.as_object_mut().unwrap().remove(&dropped);
+
+        db.conn()
+            .execute(
+                "INSERT INTO presets (id, name, output_options, is_default, created_at, updated_at)
+                 VALUES ('p-old', 'Từ bản cũ', ?1, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                params![serde_json::to_string(&older).unwrap()],
+            )
+            .unwrap();
+
+        let loaded = db.list_presets().unwrap().remove(0);
+        let loaded_value = serde_json::to_value(&loaded.output_options).unwrap();
+
+        assert_eq!(
+            loaded_value.get(&dropped),
+            defaults.get(&dropped),
+            "tuỳ chọn vắng mặt phải nhận giá trị mặc định, không làm hỏng cả bản ghi"
+        );
+        for (key, value) in older.as_object().unwrap() {
+            assert_eq!(
+                loaded_value.get(key),
+                Some(value),
+                "tuỳ chọn mà bản cũ CÓ ghi phải về nguyên vẹn: {key}"
+            );
+        }
+        // Chốt chặn để test không rỗng nghĩa: một phép đọc kiểu "cứ trả
+        // `OutputOptions::default()`" vẫn qua được hai khẳng định trên nếu blob
+        // chỉ khác mặc định ở đúng khoá vừa bị bỏ.
+        assert_ne!(loaded.output_options, OutputOptions::default());
+    }
+
+    #[test]
+    fn a_corrupted_preset_blob_does_not_take_the_whole_list_down() {
+        // Cột JSON không có kiểm tra ở tầng SQL. Một blob hỏng (sửa tay CSDL)
+        // phải rơi về bộ mặc định, chứ không làm `list_presets` trả lỗi và
+        // khiến MỌI preset biến mất khỏi giao diện.
+        let db = temp_db();
+        db.create_preset("Lành lặn", &sample_options()).unwrap();
+        let broken = db.create_preset("Hỏng", &sample_options()).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE presets SET output_options = 'not json at all' WHERE id = ?1",
+                params![broken.id],
+            )
+            .unwrap();
+
+        let listed = db.list_presets().unwrap();
+
+        assert_eq!(listed.len(), 2);
+        let broken_row = listed.iter().find(|preset| preset.id == broken.id).unwrap();
+        assert_eq!(broken_row.output_options, OutputOptions::default());
     }
 }
