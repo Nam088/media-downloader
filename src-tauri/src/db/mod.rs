@@ -178,11 +178,6 @@ impl Db {
     }
 
     // ---- truy vấn điều phối hàng đợi ----------------------------------
-    //
-    // Cả nhóm dưới đây mang `#[allow(dead_code)]`: chúng là tầng truy vấn cho
-    // bộ điều phối, và bộ điều phối được thêm ở một bước sau. Tới lúc đó các
-    // attribute này phải được gỡ bỏ, không phải để lại — chúng chỉ tồn tại để
-    // tầng DB được ghép và kiểm thử trọn vẹn trước khi có người gọi.
 
     /// Job kế tiếp mà bộ điều phối được phép khởi chạy: đang `queued`, và
     /// không nằm trong khoảng chờ thử lại. `now_rfc3339` được truyền vào thay
@@ -191,7 +186,6 @@ impl Db {
     /// Thứ tự: `queue_position` trước, `created_at` sau. Vế thứ hai giữ cho
     /// các job cũ (đều mang `queue_position = 0` từ migration 0008) vẫn chạy
     /// đúng thứ tự chúng được tạo.
-    #[allow(dead_code)]
     pub fn next_dispatchable_job(
         &self,
         now_rfc3339: &str,
@@ -211,7 +205,6 @@ impl Db {
     }
 
     /// Vị trí cho job mới thêm vào cuối hàng đợi.
-    #[allow(dead_code)]
     pub fn next_queue_position(&self) -> Result<f64, AppError> {
         let conn = self.conn();
         let max: Option<f64> = conn.query_row(
@@ -222,6 +215,17 @@ impl Db {
         )?;
         Ok(position_between(max, None))
     }
+
+    // ---- sắp xếp lại thứ tự và thao tác hàng loạt ---------------------
+    //
+    // Nhóm này chưa có người gọi trong mã sản phẩm: người gọi chúng là các lệnh
+    // `reorder_queue` / `pause_all_jobs` / … được thêm ở bước sau (Task 7 của
+    // plan Phase 1), còn bộ điều phối ở Task 5 không dùng tới.
+    //
+    // Dùng `#[expect(dead_code)]` chứ không phải `#[allow(dead_code)]`: `expect`
+    // tự báo lỗi ngay khi mục được chú thích *bắt đầu* có người gọi, nên tới
+    // Task 7 trình biên dịch sẽ bắt phải gỡ nó ra. `allow` thì im lặng mãi mãi
+    // và sẽ che luôn mã chết thật sự về sau.
 
     /// Đặt một job vào giữa hai hàng xóm (`None` nghĩa là đầu hoặc cuối danh
     /// sách) — thao tác đằng sau một lần kéo-thả (FR-117).
@@ -238,7 +242,7 @@ impl Db {
     /// ghi tách rời nhau thì một lần enqueue hay một lần kéo khác chen vào giữa
     /// sẽ khiến điểm giữa vừa tính trở thành số cũ — đúng loại tranh chấp mà
     /// hàm này tự nhận là tránh được.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code, reason = "người gọi là lệnh `reorder_queue`, thêm ở Task 7"))]
     pub fn move_job_between(
         &self,
         job_id: &str,
@@ -288,23 +292,10 @@ impl Db {
         Ok(())
     }
 
-    /// Đánh số lại các job chưa kết thúc thành 1.0, 2.0, 3.0… giữ nguyên thứ tự
-    /// hiện tại. Chỉ chạy khi khe hở đã hẹp tới ngưỡng — trong sử dụng bình
-    /// thường gần như không bao giờ xảy ra.
-    #[allow(dead_code)]
-    pub fn renormalize_queue_positions(&self) -> Result<(), AppError> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        renormalize_positions_within(&tx)?;
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Gọi một lần lúc khởi động: job còn ghi `downloading`/`fetching_metadata`
     /// là tàn dư của một phiên bị đóng đột ngột — tiến trình tải của chúng đã
     /// chết cùng ứng dụng. Chuyển về `paused` để người dùng tiếp tục hoặc huỷ
     /// (FR-115). Trả về số dòng đã đổi.
-    #[allow(dead_code)]
     pub fn reset_interrupted_jobs(&self) -> Result<usize, AppError> {
         let conn = self.conn();
         let changed = conn.execute(
@@ -317,7 +308,6 @@ impl Db {
 
     /// Đưa job về hàng chờ kèm mốc thời gian được phép thử lại (FR-121).
     /// `error_message` được giữ lại để giao diện hiển thị lý do đang chờ.
-    #[allow(dead_code)]
     pub fn mark_job_for_retry(
         &self,
         job_id: &str,
@@ -343,6 +333,23 @@ impl Db {
         Ok(())
     }
 
+    /// Xoá mốc chờ thử lại và đưa bộ đếm về 0 — dùng khi người dùng can thiệp
+    /// thủ công (tạm dừng, huỷ).
+    ///
+    /// Đưa `retry_count` về 0 chứ không chỉ xoá `next_retry_at`: một job từng
+    /// thất bại 3 lần vì mạng, được người dùng tạm dừng rồi tiếp tục, phải
+    /// được nhận lại đủ số lượt thử — nếu không, nó sẽ thất bại vĩnh viễn ngay
+    /// ở lần chạy đầu tiên sau khi tiếp tục (FR-123).
+    pub fn clear_retry_deadline(&self, job_id: &str) -> Result<(), AppError> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE download_jobs SET next_retry_at = NULL, retry_count = 0, updated_at = ?1
+             WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), job_id],
+        )?;
+        Ok(())
+    }
+
     /// Đổi trạng thái hàng loạt, trả về id của những job **khớp**
     /// `from_statuses` để tầng gọi biết cần phát sự kiện cho những job nào
     /// (FR-118).
@@ -351,7 +358,7 @@ impl Db {
     /// `from_statuses` thì các dòng vốn đã ở trạng thái đích vẫn được liệt kê,
     /// và phía gọi sẽ phát sự kiện thừa cho chúng. Phía gọi chịu trách nhiệm
     /// không truyền vào tổ hợp đó.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code, reason = "người gọi là các lệnh hàng loạt, thêm ở Task 7"))]
     pub fn bulk_update_status(
         &self,
         from_statuses: &[JobStatus],
@@ -506,21 +513,17 @@ impl Db {
     }
 }
 
-// Ba mục dưới đây cũng chỉ được gọi từ test cho tới khi bộ điều phối xuất
-// hiện — xem ghi chú ở đầu nhóm truy vấn điều phối trong `impl Db`.
-
 /// Khe hở hẹp nhất còn chấp nhận được giữa hai vị trí liền kề.
 ///
 /// `f64` có 52 bit phần định trị, nên trên lý thuyết còn chia đôi được sâu hơn
 /// ngưỡng này rất nhiều. Đặt ngưỡng cao hơn giới hạn thật nhiều bậc để không
 /// bao giờ chạm tới vùng mà phép lấy điểm giữa trả về đúng bằng một trong hai
 /// đầu mút — lúc đó thứ tự sẽ hỏng một cách âm thầm.
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code, reason = "chỉ dùng bởi `needs_renormalize` — xem Task 7"))]
 const MIN_POSITION_GAP: f64 = 1e-6;
 
 /// Vị trí nằm giữa hai hàng xóm. `None` nghĩa là không có hàng xóm ở phía đó,
 /// tức là đang thả vào đầu hoặc cuối danh sách.
-#[allow(dead_code)]
 pub fn position_between(before: Option<f64>, after: Option<f64>) -> f64 {
     match (before, after) {
         (None, None) => 1.0,
@@ -534,7 +537,7 @@ pub fn position_between(before: Option<f64>, after: Option<f64>) -> f64 {
 ///
 /// Chỉ đúng khi có cả hai hàng xóm: ở đầu hoặc cuối danh sách thì luôn còn chỗ
 /// vì ta cộng/trừ hẳn 1.0 chứ không chia đôi.
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code, reason = "chỉ dùng bởi `move_job_between` — xem Task 7"))]
 pub fn needs_renormalize(before: Option<f64>, after: Option<f64>) -> bool {
     match (before, after) {
         (Some(before), Some(after)) => (after - before).abs() < MIN_POSITION_GAP,
@@ -549,7 +552,7 @@ pub fn needs_renormalize(before: Option<f64>, after: Option<f64>) -> bool {
 /// dòng nào thì đó là lỗi, không phải "đầu danh sách" — hàng xóm có thể vừa
 /// hoàn tất và biến khỏi danh sách trong lúc người dùng đang kéo, và đặt nhầm
 /// job vào một chỗ tuỳ tiện tệ hơn nhiều so với báo lỗi.
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code, reason = "chỉ dùng bởi `move_job_between` — xem Task 7"))]
 fn position_of(conn: &Connection, job_id: Option<&str>) -> Result<Option<f64>, AppError> {
     let Some(job_id) = job_id else {
         return Ok(None);
@@ -572,7 +575,7 @@ fn position_of(conn: &Connection, job_id: Option<&str>) -> Result<Option<f64>, A
 /// Tách ra để `move_job_between` chuẩn hoá được *bên trong* transaction của
 /// chính nó thay vì mở một transaction thứ hai — nếu không, khoảng giữa hai
 /// transaction là chỗ một thao tác khác chen vào và làm hỏng giá trị vừa đọc.
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code, reason = "chỉ dùng bởi `move_job_between` — xem Task 7"))]
 fn renormalize_positions_within(conn: &Connection) -> Result<(), AppError> {
     let ids: Vec<String> = {
         let mut stmt = conn.prepare(
@@ -1082,6 +1085,30 @@ mod tests {
         assert_eq!(loaded.retry_count, 1);
         assert_eq!(loaded.next_retry_at.as_deref(), Some("2026-07-26T00:00:30Z"));
         assert_eq!(loaded.error_message.as_deref(), Some("network timeout"));
+    }
+
+    #[test]
+    fn clear_retry_deadline_gives_back_the_full_retry_budget() {
+        // Người dùng tạm dừng một job đang đếm ngược để thử lại rồi tiếp tục
+        // nó. Nếu chỉ xoá `next_retry_at` mà giữ nguyên `retry_count = 3`, lần
+        // thất bại mạng kế tiếp sẽ bị coi là "đã hết lượt" và job chết ngay,
+        // dù người dùng chưa từng thấy nó thử lại lần nào.
+        let db = temp_db();
+        let mut waiting = sample_job("job-1");
+        waiting.retry_count = 3;
+        waiting.next_retry_at = Some("2026-07-26T00:10:00Z".to_string());
+        db.insert_job(&waiting).unwrap();
+
+        db.clear_retry_deadline("job-1").unwrap();
+
+        let loaded = db.get_job("job-1").unwrap().unwrap();
+        assert_eq!(loaded.next_retry_at, None);
+        assert_eq!(loaded.retry_count, 0);
+        assert_eq!(
+            loaded.status,
+            JobStatus::Queued,
+            "xoá mốc thử lại không được tự đổi trạng thái — phía gọi mới quyết định trạng thái cuối"
+        );
     }
 
     #[test]

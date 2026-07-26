@@ -1,20 +1,21 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use chrono::Utc;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::{watch, Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
 
 use crate::db::Db;
-use crate::error::AppError;
+use crate::error::{AppError, CANCELED_ERROR_CODE};
 use crate::logging::log_event;
 use crate::models::{DownloadJob, GalleryMode, JobStatus, MediaType};
 
 use super::gallery_dl;
+use super::retry::{decide_outcome, Outcome};
+use super::scheduler::{available_slots, TICK_INTERVAL_MS};
 use super::ytdlp;
 use super::ytdlp_binary;
-
-const MAX_CONCURRENT_DOWNLOADS: usize = 3;
 
 /// Upper bound on redownload attempts when the output has no audio track
 /// (see `ytdlp::output_has_audio_stream`). yt-dlp issue #15891: TikTok's CDN
@@ -22,7 +23,18 @@ const MAX_CONCURRENT_DOWNLOADS: usize = 3;
 /// metadata still claims `acodec=aac`; maintainers confirmed re-downloading
 /// commonly gets a different, correct file, so a couple of retries is a real
 /// fix here, not just a delay.
-const MAX_DOWNLOAD_ATTEMPTS: u32 = 3;
+///
+/// Đây là cơ chế riêng, KHÔNG phải retry vì lỗi tạm thời: lỗi ở đây là một
+/// lần tải "thành công" nhưng cho ra file thiếu tiếng, nên không có mã lỗi nào
+/// để bộ điều phối nhìn thấy. Retry vì lỗi mạng thuộc về `finish_job` +
+/// `downloader::retry`.
+const MAX_NO_AUDIO_ATTEMPTS: u32 = 3;
+
+/// Lỗi báo hiệu người dùng đã chủ động dừng. `finish_job` nhận ra mã này và
+/// không đụng gì tới job cả — `pause`/`cancel` đã đặt trạng thái cuối cùng.
+fn canceled(during: &str) -> AppError {
+    AppError::new(CANCELED_ERROR_CODE, format!("Job canceled during {during}"))
+}
 
 #[derive(Clone, serde::Serialize)]
 struct JobProgressEvent {
@@ -43,95 +55,157 @@ struct JobStatusChangedEvent {
     output_file_path: Option<String>,
 }
 
-/// Tracks the cancel signal for a job currently running (or paused) so
-/// `pause_job`/`cancel_job` (T034) can stop the underlying yt-dlp process.
-/// yt-dlp cannot be paused mid-flight in a cross-platform way (no portable
-/// SIGSTOP-equivalent on Windows), so "pause" is implemented as: stop the
-/// process, keep `status = paused`, and `resume_job` re-invokes yt-dlp with
-/// `--continue` against the same partial `.part` file.
+/// Một lần chạy cụ thể của một job, kèm tín hiệu huỷ để `pause_job`/
+/// `cancel_job` (T034) dừng được tiến trình yt-dlp bên dưới. yt-dlp không tạm
+/// dừng giữa chừng được theo cách chạy trên mọi hệ điều hành (Windows không có
+/// SIGSTOP), nên "tạm dừng" được hiện thực là: giết tiến trình, giữ
+/// `status = paused`, và `resume_job` gọi lại yt-dlp với `--continue` trên
+/// đúng file `.part` dang dở.
+///
+/// `run_id` tồn tại để sửa một lỗi tranh chấp thật: khi người dùng tạm dừng
+/// rồi tiếp tục rất nhanh, task của lần chạy cũ có thể kết thúc *sau* khi lần
+/// chạy mới đã đăng ký. Nếu nó dọn dẹp chỉ theo `job_id` thì sẽ xoá nhầm handle
+/// huỷ của lần chạy mới, và job đó không còn tạm dừng hay huỷ được nữa; tệ hơn,
+/// một lỗi của lần chạy cũ sẽ ghi đè trạng thái của lần chạy mới. Kết quả chỉ
+/// được thi hành khi `run_id` khớp với lần chạy đang đăng ký (FR-125).
 struct RunningJob {
     cancel_tx: watch::Sender<bool>,
+    run_id: u64,
 }
 
 pub struct DownloadQueue {
     db: Arc<Db>,
     app: AppHandle,
     running: Arc<AsyncMutex<HashMap<String, RunningJob>>>,
-    semaphore: Arc<Semaphore>,
+    /// Đọc lại mỗi vòng dispatch nên người dùng đổi số luồng là có hiệu lực
+    /// ngay, không cần dựng lại hàng đợi (FR-113).
+    max_concurrent: Arc<AtomicUsize>,
+    /// Đánh thức dispatcher khi có việc mới, để không phải đợi hết nhịp tick.
+    wake: Arc<Notify>,
+}
+
+/// Bản sao các handle dùng chung, để task nền không phải giữ `&DownloadQueue`.
+#[derive(Clone)]
+struct QueueHandles {
+    db: Arc<Db>,
+    app: AppHandle,
+    running: Arc<AsyncMutex<HashMap<String, RunningJob>>>,
+    max_concurrent: Arc<AtomicUsize>,
+    wake: Arc<Notify>,
 }
 
 impl DownloadQueue {
-    pub fn new(db: Arc<Db>, app: AppHandle) -> Self {
-        Self {
+    pub fn new(db: Arc<Db>, app: AppHandle, max_concurrent: usize) -> Self {
+        let queue = Self {
             db,
             app,
             running: Arc::new(AsyncMutex::new(HashMap::new())),
-            semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS)),
+            max_concurrent: Arc::new(AtomicUsize::new(max_concurrent.clamp(1, 8))),
+            wake: Arc::new(Notify::new()),
+        };
+        queue.spawn_dispatcher();
+        queue
+    }
+
+    /// Người dùng đổi số luồng trong Cài đặt. Đánh thức dispatcher ngay để
+    /// việc tăng số luồng có hiệu lực tức thì thay vì đợi hết nhịp tick.
+    pub fn set_max_concurrent(&self, value: usize) {
+        self.max_concurrent
+            .store(value.clamp(1, 8), Ordering::Relaxed);
+        self.wake.notify_one();
+    }
+
+    fn handles(&self) -> QueueHandles {
+        QueueHandles {
+            db: Arc::clone(&self.db),
+            app: self.app.clone(),
+            running: Arc::clone(&self.running),
+            max_concurrent: Arc::clone(&self.max_concurrent),
+            wake: Arc::clone(&self.wake),
         }
     }
 
-    /// Persists the job as `queued` and spawns its execution in the
-    /// background. Returns immediately; progress/completion are reported via
-    /// the `job:progress` / `job:status_changed` events (contracts/tauri-commands.md).
-    pub async fn enqueue(&self, job: DownloadJob) -> Result<(), AppError> {
-        self.db.insert_job(&job)?;
-        self.spawn_run(job).await;
-        Ok(())
-    }
-
-    async fn spawn_run(&self, job: DownloadJob) {
-        let db = Arc::clone(&self.db);
-        let app = self.app.clone();
-        let semaphore = Arc::clone(&self.semaphore);
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-
-        {
-            let mut running = self.running.lock().await;
-            running.insert(job.id.clone(), RunningJob { cancel_tx });
-        }
-
-        let job_id = job.id.clone();
-        let running_registry = Arc::clone(&self.running);
-
-        tokio::spawn(async move {
-            let _permit = semaphore.acquire().await;
-            let result = run_job(&app, &db, &job, cancel_rx).await;
-            if let Err(err) = result {
-                log_event(
-                    &app,
-                    "ERROR",
-                    format!(
-                        "Job {} failed ({} — {}): {}",
-                        job.id, job.platform, job.source_url, err.message
-                    ),
-                );
-                let _ = db.update_job_status(&job.id, JobStatus::Failed, Some(&err.message));
-                emit_status_changed(&app, &job.id, JobStatus::Failed, Some(err.message), None);
+    /// Task duy nhất quyết định job nào được chạy. Thức dậy theo nhịp tick
+    /// hoặc khi được đánh thức, rồi khởi chạy tối đa số job mà slot cho phép.
+    ///
+    /// Nhịp tick là bắt buộc chứ không thừa: job đang chờ thử lại đến hạn theo
+    /// đồng hồ và không có ai gọi `wake` hộ nó.
+    ///
+    /// Dùng `tauri::async_runtime::spawn` chứ không phải `tokio::spawn`: hàm
+    /// này được gọi từ `setup()` của Tauri, nơi không có runtime tokio nào
+    /// đang "vào ngữ cảnh" nên `tokio::spawn` sẽ panic.
+    fn spawn_dispatcher(&self) {
+        let handles = self.handles();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = handles.wake.notified() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(TICK_INTERVAL_MS)) => {}
+                }
+                if let Err(err) = dispatch_ready(&handles).await {
+                    log_event(
+                        &handles.app,
+                        "WARN",
+                        format!("Dispatcher tick failed: {err}"),
+                    );
+                }
             }
-            running_registry.lock().await.remove(&job_id);
         });
     }
 
-    pub async fn cancel(&self, job_id: &str) -> Result<(), AppError> {
-        let mut running = self.running.lock().await;
-        if let Some(handle) = running.remove(job_id) {
-            let _ = handle.cancel_tx.send(true);
-        }
-        self.db.update_job_status(job_id, JobStatus::Canceled, None)?;
-        emit_status_changed(&self.app, job_id, JobStatus::Canceled, None, None);
+    /// Ghi job vào cuối hàng đợi rồi đánh thức dispatcher. Không tự chạy gì
+    /// cả — việc quyết định khi nào chạy hoàn toàn thuộc về dispatcher.
+    ///
+    /// Nhận `&mut` để trả lại cho phía gọi đúng bản ghi đã được lưu: phía gọi
+    /// gửi thẳng job này về giao diện, nên `queue_position` mà nó thấy phải là
+    /// vị trí thật trong DB chứ không phải giá trị 0 lúc dựng job.
+    ///
+    /// Việc gán `next_queue_position()` ở đây là bất biến then chốt của cả cơ
+    /// chế sắp thứ tự: nếu job mới cứ nằm ở 0.0 thì mọi job mới đều hoà nhau và
+    /// đứng trước toàn bộ hàng đợi hiện có.
+    pub async fn enqueue(&self, job: &mut DownloadJob) -> Result<(), AppError> {
+        job.queue_position = self.db.next_queue_position()?;
+        job.status = JobStatus::Queued;
+        self.db.insert_job(job)?;
+        emit_status_changed(&self.app, &job.id, JobStatus::Queued, None, None);
+        self.wake.notify_one();
         Ok(())
+    }
+
+    /// Dừng một job đang chạy hoặc đang chờ. `to_status` là trạng thái cuối
+    /// cùng (`Paused` hay `Canceled`).
+    ///
+    /// Gửi tín hiệu huỷ khiến `tokio::select!` trong `run_job` thắng, tiến
+    /// trình con bị drop, và `kill_on_drop(true)` giết nó. Với job còn đang chờ
+    /// trong DB thì không có gì để giết — chỉ cần đổi trạng thái là dispatcher
+    /// sẽ không chọn nó nữa.
+    ///
+    /// Cố ý KHÔNG gỡ handle khỏi bảng `running`: chủ sở hữu duy nhất của một
+    /// entry là chính task của lần chạy đó (`finish_job`). Gỡ ở đây sẽ drop
+    /// `cancel_tx` và làm `run_job` mất luôn khả năng quan sát tín hiệu.
+    async fn stop_job(&self, job_id: &str, to_status: JobStatus) -> Result<(), AppError> {
+        if let Some(entry) = self.running.lock().await.get(job_id) {
+            let _ = entry.cancel_tx.send(true);
+        }
+        // Xoá mốc chờ thử lại: người dùng đã can thiệp thủ công nên vòng thử
+        // lại tự động phải dừng hẳn (FR-123).
+        self.db.clear_retry_deadline(job_id)?;
+        self.db.update_job_status(job_id, to_status.clone(), None)?;
+        emit_status_changed(&self.app, job_id, to_status, None, None);
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    pub async fn cancel(&self, job_id: &str) -> Result<(), AppError> {
+        self.stop_job(job_id, JobStatus::Canceled).await
     }
 
     pub async fn pause(&self, job_id: &str) -> Result<(), AppError> {
-        let mut running = self.running.lock().await;
-        if let Some(handle) = running.remove(job_id) {
-            let _ = handle.cancel_tx.send(true);
-        }
-        self.db.update_job_status(job_id, JobStatus::Paused, None)?;
-        emit_status_changed(&self.app, job_id, JobStatus::Paused, None, None);
-        Ok(())
+        self.stop_job(job_id, JobStatus::Paused).await
     }
 
+    /// Đưa job đã tạm dừng về lại hàng chờ. Không tự chạy — dispatcher lo.
+    /// Giữ nguyên `queue_position` nên job quay lại đúng chỗ cũ trong hàng đợi.
     pub async fn resume(&self, job_id: &str) -> Result<(), AppError> {
         let job = self
             .db
@@ -143,10 +217,9 @@ impl DownloadQueue {
                 "Only a paused job can be resumed",
             ));
         }
-        self.db
-            .update_job_status(job_id, JobStatus::Queued, None)?;
+        self.db.update_job_status(job_id, JobStatus::Queued, None)?;
         emit_status_changed(&self.app, job_id, JobStatus::Queued, None, None);
-        self.spawn_run(job).await;
+        self.wake.notify_one();
         Ok(())
     }
 
@@ -160,7 +233,7 @@ impl DownloadQueue {
             .ok_or_else(|| AppError::not_found("Job"))?;
 
         let now = Utc::now().to_rfc3339();
-        let retried = DownloadJob {
+        let mut retried = DownloadJob {
             id: uuid::Uuid::new_v4().to_string(),
             source_url: original.source_url,
             platform: original.platform,
@@ -183,6 +256,7 @@ impl DownloadQueue {
             updated_at: now,
             title: original.title,
             playlist_title: original.playlist_title,
+            // `enqueue` ghi đè bằng vị trí cuối hàng đợi thật sự.
             queue_position: 0.0,
             // Thử lại thủ công tạo ra một job MỚI chạy lại từ đầu, nên bộ đếm
             // tự-thử-lại bắt đầu lại từ 0 thay vì kế thừa của job cũ.
@@ -190,35 +264,213 @@ impl DownloadQueue {
             next_retry_at: None,
         };
 
-        self.enqueue(retried.clone()).await?;
+        self.enqueue(&mut retried).await?;
         Ok(retried)
     }
 }
 
+/// Khởi chạy job cho tới khi hết slot hoặc hết job đủ điều kiện.
+///
+/// Chạy tuần tự trong đúng một task nên không cần khoá gì thêm: giữa lúc chọn
+/// job và lúc đánh dấu nó `downloading` không có ai khác xen vào chọn trùng.
+async fn dispatch_ready(handles: &QueueHandles) -> Result<(), AppError> {
+    loop {
+        let running_count = handles.running.lock().await.len();
+        if available_slots(running_count, &handles.max_concurrent) == 0 {
+            return Ok(());
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let Some(job) = handles.db.next_dispatchable_job(&now)? else {
+            return Ok(());
+        };
+
+        start_job(handles, job).await?;
+    }
+}
+
+/// Chuyển một job từ hàng chờ sang đang chạy: đánh dấu trạng thái, đăng ký
+/// handle huỷ, rồi spawn task thực thi.
+async fn start_job(handles: &QueueHandles, job: DownloadJob) -> Result<(), AppError> {
+    let job_id = job.id.clone();
+    // Giữ lại nhãn để dòng log lúc thất bại vẫn nói được job đó là link nào —
+    // `job` bị chuyển quyền sở hữu vào task ngay bên dưới.
+    let log_label = format!("{} — {}", job.platform, job.source_url);
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let run_id = next_run_id();
+
+    // Đánh dấu `downloading` TRƯỚC khi spawn, vì `next_dispatchable_job` chỉ
+    // lọc theo `status = 'queued'` — nếu để task tự đánh dấu, vòng dispatch kế
+    // tiếp (cách đây tối đa một nhịp tick) sẽ chọn lại đúng job này và chạy nó
+    // lần thứ hai song song với chính nó.
+    //
+    // Truyền `None` cho `error_message` cũng là chủ ý: nó xoá thông báo lỗi mà
+    // `mark_job_for_retry` để lại, nên lần chạy mới không hiển thị lý do thất
+    // bại của lần trước.
+    handles
+        .db
+        .update_job_status(&job_id, JobStatus::Downloading, None)?;
+    emit_status_changed(&handles.app, &job_id, JobStatus::Downloading, None, None);
+
+    handles
+        .running
+        .lock()
+        .await
+        .insert(job_id.clone(), RunningJob { cancel_tx, run_id });
+
+    let task_handles = handles.clone();
+    let task_job_id = job_id.clone();
+    tokio::spawn(async move {
+        let outcome = run_job(&task_handles, job, cancel_rx).await;
+        finish_job(&task_handles, &task_job_id, run_id, &log_label, outcome).await;
+        // Slot vừa trống — báo dispatcher biết ngay thay vì đợi hết nhịp tick.
+        task_handles.wake.notify_one();
+    });
+
+    Ok(())
+}
+
+/// Bộ đếm lần chạy, chỉ dùng để phân biệt các lần chạy của cùng một job.
+fn next_run_id() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Kết quả của lần chạy `run_id` có còn được phép thi hành không, dựa trên
+/// `run_id` đang được đăng ký trong bảng `running` cho job đó.
+///
+/// `None` (không còn entry nào) nghĩa là chưa có lần chạy nào khác chiếm chỗ,
+/// nên kết quả vẫn còn giá trị. `Some(khác)` nghĩa là một lần chạy mới đã đăng
+/// ký trong lúc lần chạy này đang kết thúc: kết quả đã lỗi thời và thi hành nó
+/// sẽ ghi đè trạng thái của lần chạy đang thực sự diễn ra.
+fn is_current_run(registered_run_id: Option<u64>, run_id: u64) -> bool {
+    match registered_run_id {
+        Some(registered) => registered == run_id,
+        None => true,
+    }
+}
+
+/// Xử lý kết quả một lần chạy: hoàn tất, thất bại vĩnh viễn, hay xếp lại hàng
+/// để thử lại. Đây là nơi DUY NHẤT quyết định có thử lại hay không — `run_job`
+/// chỉ chạy đúng một lần rồi trả lỗi ra ngoài.
+async fn finish_job(
+    handles: &QueueHandles,
+    job_id: &str,
+    run_id: u64,
+    log_label: &str,
+    outcome: Result<(), AppError>,
+) {
+    let is_current = {
+        let mut running = handles.running.lock().await;
+        let registered = running.get(job_id).map(|entry| entry.run_id);
+        let is_current = is_current_run(registered, run_id);
+        if is_current {
+            running.remove(job_id);
+        }
+        is_current
+    };
+    if !is_current {
+        return;
+    }
+
+    let Err(err) = outcome else {
+        return; // `run_job` đã tự đánh dấu hoàn tất và phát sự kiện.
+    };
+
+    let max_retries = handles
+        .db
+        .get_settings()
+        .map(|settings| settings.max_retry_attempts as i64)
+        .unwrap_or(3);
+    let retry_count = handles
+        .db
+        .get_job(job_id)
+        .ok()
+        .flatten()
+        .map(|job| job.retry_count)
+        .unwrap_or(0);
+
+    match decide_outcome(&err.code, retry_count, max_retries) {
+        Outcome::Ignore => return,
+        Outcome::Retry { delay_seconds } => {
+            let next_retry_at =
+                (Utc::now() + chrono::Duration::seconds(delay_seconds as i64)).to_rfc3339();
+            log_event(
+                &handles.app,
+                "WARN",
+                format!(
+                    "Job {job_id} ({log_label}) failed with {}, retrying in {delay_seconds}s: {}",
+                    err.code, err.message
+                ),
+            );
+            if handles
+                .db
+                .mark_job_for_retry(job_id, &next_retry_at, &err.message)
+                .is_ok()
+            {
+                emit_status_changed(
+                    &handles.app,
+                    job_id,
+                    JobStatus::Queued,
+                    Some(err.message),
+                    None,
+                );
+                return;
+            }
+            // Không ghi được lịch thử lại thì rơi xuống nhánh thất bại bên
+            // dưới: bỏ qua sẽ để job kẹt ở `downloading` vĩnh viễn.
+        }
+        Outcome::Fail => {}
+    }
+
+    log_event(
+        &handles.app,
+        "ERROR",
+        format!(
+            "Job {job_id} failed ({log_label}) [{}]: {}",
+            err.code, err.message
+        ),
+    );
+    let _ = handles
+        .db
+        .update_job_status(job_id, JobStatus::Failed, Some(&err.message));
+    emit_status_changed(&handles.app, job_id, JobStatus::Failed, Some(err.message), None);
+}
+
+/// Chạy một job đúng MỘT lần. Thất bại được trả ra ngoài cho `finish_job`
+/// quyết định — không còn vòng `for attempt` nào ở đây, vì một job đang chờ
+/// thử lại phải là một dòng dữ liệu (huỷ được, hiển thị được, sống qua khởi
+/// động lại) chứ không phải một task đang ngủ.
+///
+/// Trạng thái `downloading` đã do `start_job` đặt trước khi spawn, nên hàm này
+/// không đặt lại.
 async fn run_job(
-    app: &AppHandle,
-    db: &Arc<Db>,
-    job: &DownloadJob,
+    handles: &QueueHandles,
+    job: DownloadJob,
     mut cancel_rx: watch::Receiver<bool>,
 ) -> Result<(), AppError> {
     if job.media_type == MediaType::Gallery {
-        return run_gallery_job(app, db, job, cancel_rx).await;
+        return run_gallery_job(handles, job, cancel_rx).await;
     }
 
-    db.update_job_status(&job.id, JobStatus::Downloading, None)?;
-    emit_status_changed(app, &job.id, JobStatus::Downloading, None, None);
-
     let output_template = format!("{}/%(title)s.%(ext)s", job.output_directory);
-    let extra_args = build_ytdlp_args(job)?;
+    // Đọc lại mỗi lần chạy chứ không cache lúc dựng hàng đợi: người dùng đổi
+    // giới hạn tốc độ thì job được khởi chạy sau đó phải dùng giá trị mới.
+    let rate_limit_kbps = handles
+        .db
+        .get_settings()
+        .map(|settings| settings.rate_limit_kbps)
+        .unwrap_or(0);
+    let extra_args = build_ytdlp_args(&job, rate_limit_kbps)?;
 
     let mut output_path: Option<String> = None;
-    for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
+    for attempt in 1..=MAX_NO_AUDIO_ATTEMPTS {
         let job_id_for_progress = job.id.clone();
-        let app_for_progress = app.clone();
-        let db_for_progress = Arc::clone(db);
+        let app_for_progress = handles.app.clone();
+        let db_for_progress = Arc::clone(&handles.db);
 
         let download_fut = ytdlp::run_download(
-            app,
+            &handles.app,
             &job.source_url,
             &output_template,
             extra_args.clone(),
@@ -235,46 +487,20 @@ async fn run_job(
 
         let download_result = tokio::select! {
             result = download_fut => result,
-            _ = cancel_rx.changed() => {
-                // Job was paused/canceled; the caller already updated status
-                // and emitted the event, so just stop here without treating
-                // this as a failure.
-                return Ok(());
-            }
+            _ = cancel_rx.changed() => return Err(canceled("download")),
         };
-
-        // TikTok's CDN can intermittently fail a request outright, not just
-        // silently drop audio (yt-dlp issue #15891/#15642 — confirmed by
-        // maintainers as server-side inconsistency, never fixed upstream).
-        // A fresh attempt often just works, same as a human hitting "retry".
-        let path = match download_result {
-            Ok(path) => path,
-            Err(err) => {
-                if attempt < MAX_DOWNLOAD_ATTEMPTS {
-                    log_event(
-                        app,
-                        "WARN",
-                        format!(
-                            "Job {} attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS} failed, retrying: {}",
-                            job.id, err.message
-                        ),
-                    );
-                    continue;
-                }
-                return Err(err);
-            }
-        };
+        let path = download_result?;
 
         // Only muxed video jobs are at risk of a *silent* audio loss: an
         // audio-only extraction (`-x`) fails loudly instead (ffmpeg can't
-        // extract a stream that isn't there), which the branch above already
-        // retries.
+        // extract a stream that isn't there), so it surfaces as a real error
+        // that `finish_job` gets to classify.
         if job.media_type == MediaType::Video && !ytdlp::output_has_audio_stream(&path).await {
-            if attempt < MAX_DOWNLOAD_ATTEMPTS {
+            if attempt < MAX_NO_AUDIO_ATTEMPTS {
                 log_event(
-                    app,
+                    &handles.app,
                     "WARN",
-                    format!("Job {} attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS}: downloaded video had no audio track, retrying", job.id),
+                    format!("Job {} attempt {attempt}/{MAX_NO_AUDIO_ATTEMPTS}: downloaded video had no audio track, retrying", job.id),
                 );
                 let _ = tokio::fs::remove_file(&path).await;
                 continue;
@@ -286,7 +512,7 @@ async fn run_job(
             // guaranteed to help): separately fetch just the best audio
             // track and mux it onto the otherwise-good video, rather than
             // discarding a mostly-fine download over its audio track alone.
-            match recover_missing_audio(app, &job.source_url, &path).await {
+            match recover_missing_audio(&handles.app, &job.source_url, &path).await {
                 Ok(fixed_path) => {
                     output_path = Some(fixed_path);
                     break;
@@ -314,11 +540,15 @@ async fn run_job(
         .unwrap_or("")
         .to_string();
 
-    db.insert_downloaded_file(&job.id, &output_path, &file_format, file_size)?;
-    db.set_job_output_file(&job.id, &output_path)?;
-    db.update_job_status(&job.id, JobStatus::Completed, None)?;
+    handles
+        .db
+        .insert_downloaded_file(&job.id, &output_path, &file_format, file_size)?;
+    handles.db.set_job_output_file(&job.id, &output_path)?;
+    handles
+        .db
+        .update_job_status(&job.id, JobStatus::Completed, None)?;
     emit_status_changed(
-        app,
+        &handles.app,
         &job.id,
         JobStatus::Completed,
         None,
@@ -346,14 +576,10 @@ const MAX_SLIDESHOW_IMAGE_DURATION_SECS: f64 = 8.0;
 /// user's chosen Downloads directory would otherwise mix unrelated files
 /// together), then applies `job.gallery_mode`.
 async fn run_gallery_job(
-    app: &AppHandle,
-    db: &Arc<Db>,
-    job: &DownloadJob,
+    handles: &QueueHandles,
+    job: DownloadJob,
     mut cancel_rx: watch::Receiver<bool>,
 ) -> Result<(), AppError> {
-    db.update_job_status(&job.id, JobStatus::Downloading, None)?;
-    emit_status_changed(app, &job.id, JobStatus::Downloading, None, None);
-
     let gallery_mode = job.gallery_mode.clone().ok_or_else(|| {
         AppError::new("MISSING_QUALITY", "gallery_mode is required for gallery downloads")
     })?;
@@ -363,56 +589,30 @@ async fn run_gallery_job(
     // human-readable folder name, using the exact same data the download
     // itself is about to act on.
     //
-    // Retried like the yt-dlp path (`MAX_DOWNLOAD_ATTEMPTS`): TikTok's
-    // bot-detection can 403 a gallery-dl request outright (confirmed live —
-    // same platform-side flakiness already documented for yt-dlp, issues
-    // #15891/#15642). Oddly, gallery-dl's `--dump-json` mode treats that as
-    // *non-fatal* — it logs the error but still exits 0 with an empty `[]`
-    // — while an actual download of the same blocked URL exits with a real
-    // error. So both an outright `Err` here AND a successful-but-empty dump
-    // are treated as a failed attempt worth retrying.
-    let mut dump: Option<gallery_dl::GalleryDump> = None;
-    let mut last_dump_err: Option<AppError> = None;
-    for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
-        match gallery_dl::dump_gallery_json(app, &job.source_url, |_child| {}).await {
-            Ok(d) if !d.entries.is_empty() => {
-                dump = Some(d);
-                break;
-            }
-            Ok(d) if attempt == MAX_DOWNLOAD_ATTEMPTS => dump = Some(d),
-            Ok(_) => {
-                log_event(
-                    app,
-                    "WARN",
-                    format!(
-                        "Gallery job {} dump attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS} found nothing, retrying",
-                        job.id
-                    ),
-                );
-                continue;
-            }
-            Err(err) if attempt == MAX_DOWNLOAD_ATTEMPTS => last_dump_err = Some(err),
-            Err(err) => {
-                log_event(
-                    app,
-                    "WARN",
-                    format!(
-                        "Gallery job {} dump attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS} errored, retrying: {}",
-                        job.id, err.message
-                    ),
-                );
-                continue;
-            }
-        }
+    // Giai đoạn này có thể mất vài giây với post nhiều ảnh. Không quan sát tín
+    // hiệu huỷ ở đây đồng nghĩa nút Huỷ không có tác dụng gì suốt quãng đó
+    // (FR-124) — bỏ future đi cũng drop luôn tiến trình con, và
+    // `kill_on_drop(true)` giết nó.
+    let dump_result = tokio::select! {
+        result = gallery_dl::dump_gallery_json(&handles.app, &job.source_url, |_child| {}) => result,
+        _ = cancel_rx.changed() => return Err(canceled("gallery listing")),
+    };
+    let dump = dump_result?;
+
+    // TikTok's bot-detection can 403 a gallery-dl request outright (confirmed
+    // live — same platform-side flakiness already documented for yt-dlp,
+    // issues #15891/#15642). Oddly, gallery-dl's `--dump-json` mode treats
+    // that as *non-fatal*: it logs the error but still exits 0 with an empty
+    // `[]`, while an actual download of the same blocked URL exits with a
+    // real error. Nên một dump rỗng phải được coi là lỗi đường truyền, không
+    // phải "post này không có gì": nó là đúng cái mà một lần thử lại có cơ hội
+    // vượt qua, và giờ lần thử lại đó do bộ điều phối lo — có khoảng chờ tăng
+    // dần, huỷ được, và hiện ra trong hàng đợi.
+    if dump.entries.is_empty() {
+        return Err(AppError::network_error(
+            "gallery-dl found nothing for this link — the source may be blocking automated requests",
+        ));
     }
-    let dump = dump.ok_or_else(|| {
-        last_dump_err.unwrap_or_else(|| {
-            AppError::new(
-                "DOWNLOAD_FAILED",
-                "gallery-dl found nothing for this link after multiple attempts — the source may be blocking automated requests. Please try again",
-            )
-        })
-    })?;
     // Narrow to the user's selection (checkbox grid in the gallery preview),
     // if one was made, via gallery-dl's own `--range` (item numbers in its
     // own 1-based crawl order). Matched by *ordinal position*, not URL — see
@@ -462,60 +662,36 @@ async fn run_gallery_job(
     );
     tokio::fs::create_dir_all(&job_dir).await.map_err(AppError::internal)?;
 
-    let mut downloaded_files: Option<Vec<String>> = None;
-    for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
-        let job_id_for_progress = job.id.clone();
-        let app_for_progress = app.clone();
-        let db_for_progress = Arc::clone(db);
+    let job_id_for_progress = job.id.clone();
+    let app_for_progress = handles.app.clone();
+    let db_for_progress = Arc::clone(&handles.db);
 
-        let download_fut = gallery_dl::run_gallery_download(
-            app,
-            &job.source_url,
-            range.as_deref(),
-            &job_dir,
-            total_files,
-            move |update| {
-                let percent = (update.completed_files as f64 / update.total_files as f64) * 100.0;
-                let _ = db_for_progress.update_job_progress(&job_id_for_progress, percent, None, None);
-                emit_progress(
-                    &app_for_progress,
-                    &job_id_for_progress,
-                    &ytdlp::ProgressUpdate {
-                        percent,
-                        speed_bytes_per_sec: None,
-                        eta_seconds: None,
-                    },
-                );
-            },
-        );
+    let download_fut = gallery_dl::run_gallery_download(
+        &handles.app,
+        &job.source_url,
+        range.as_deref(),
+        &job_dir,
+        total_files,
+        move |update| {
+            let percent = (update.completed_files as f64 / update.total_files as f64) * 100.0;
+            let _ = db_for_progress.update_job_progress(&job_id_for_progress, percent, None, None);
+            emit_progress(
+                &app_for_progress,
+                &job_id_for_progress,
+                &ytdlp::ProgressUpdate {
+                    percent,
+                    speed_bytes_per_sec: None,
+                    eta_seconds: None,
+                },
+            );
+        },
+    );
 
-        let download_result = tokio::select! {
-            result = download_fut => result,
-            _ = cancel_rx.changed() => return Ok(()),
-        };
-
-        match download_result {
-            Ok(files) => {
-                downloaded_files = Some(files);
-                break;
-            }
-            Err(err) => {
-                if attempt < MAX_DOWNLOAD_ATTEMPTS {
-                    log_event(
-                        app,
-                        "WARN",
-                        format!(
-                            "Gallery job {} attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS} failed, retrying: {}",
-                            job.id, err.message
-                        ),
-                    );
-                    continue;
-                }
-                return Err(err);
-            }
-        }
-    }
-    let downloaded_files = downloaded_files.expect("loop always returns via `?`/cancel or sets downloaded_files");
+    let download_result = tokio::select! {
+        result = download_fut => result,
+        _ = cancel_rx.changed() => return Err(canceled("gallery download")),
+    };
+    let downloaded_files = download_result?;
 
     let (audio_paths, image_paths): (Vec<String>, Vec<String>) =
         downloaded_files.into_iter().partition(|path| gallery_dl::is_audio_file_path(path));
@@ -575,10 +751,20 @@ async fn run_gallery_job(
         .unwrap_or("")
         .to_string();
 
-    db.insert_downloaded_file(&job.id, &output_path, &file_format, file_size)?;
-    db.set_job_output_file(&job.id, &output_path)?;
-    db.update_job_status(&job.id, JobStatus::Completed, None)?;
-    emit_status_changed(app, &job.id, JobStatus::Completed, None, Some(output_path));
+    handles
+        .db
+        .insert_downloaded_file(&job.id, &output_path, &file_format, file_size)?;
+    handles.db.set_job_output_file(&job.id, &output_path)?;
+    handles
+        .db
+        .update_job_status(&job.id, JobStatus::Completed, None)?;
+    emit_status_changed(
+        &handles.app,
+        &job.id,
+        JobStatus::Completed,
+        None,
+        Some(output_path),
+    );
 
     Ok(())
 }
@@ -907,7 +1093,11 @@ async fn recover_missing_audio(
     Ok(video_path.to_string())
 }
 
-fn build_ytdlp_args(job: &DownloadJob) -> Result<Vec<String>, AppError> {
+/// `rate_limit_kbps` bằng 0 nghĩa là không giới hạn. Giới hạn này áp cho từng
+/// tiến trình yt-dlp, không phải tổng băng thông của ứng dụng — với N job chạy
+/// song song, tổng thực tế có thể tới N lần mức này. Giao diện Cài đặt phải nói
+/// rõ điều đó.
+fn build_ytdlp_args(job: &DownloadJob, rate_limit_kbps: u32) -> Result<Vec<String>, AppError> {
     // `--no-playlist` on every single-item job (audio or video) is a
     // deliberate safety net for FR-013: a URL copied from inside a playlist
     // often still carries a `&list=...` param, and without this flag yt-dlp
@@ -986,6 +1176,11 @@ fn build_ytdlp_args(job: &DownloadJob) -> Result<Vec<String>, AppError> {
                 "build_ytdlp_args called for a MediaType::Gallery job",
             ))
         }
+    }
+
+    if rate_limit_kbps > 0 {
+        args.push("--limit-rate".into());
+        args.push(format!("{rate_limit_kbps}K"));
     }
 
     args.push("--continue".into());
@@ -1184,11 +1379,11 @@ mod tests {
     #[test]
     fn audio_args_use_selected_bitrate_not_a_hardcoded_constant() {
         let job = sample_job(MediaType::Audio, Some("128kbps"), None);
-        let args = build_ytdlp_args(&job).unwrap();
+        let args = build_ytdlp_args(&job, 0).unwrap();
         assert!(args.contains(&"128K".to_string()));
 
         let job_high = sample_job(MediaType::Audio, Some("320kbps"), None);
-        let args_high = build_ytdlp_args(&job_high).unwrap();
+        let args_high = build_ytdlp_args(&job_high, 0).unwrap();
         assert!(args_high.contains(&"320K".to_string()));
     }
 
@@ -1200,7 +1395,7 @@ mod tests {
         // audio, no dedicated audio-only stream) and merge them incorrectly,
         // producing a file with no audio track once `-x` extracts from it.
         let job = sample_job(MediaType::Audio, Some("128kbps"), None);
-        let args = build_ytdlp_args(&job).unwrap();
+        let args = build_ytdlp_args(&job, 0).unwrap();
         let f_index = args.iter().position(|a| a == "-f").expect("-f flag present");
         assert_eq!(args[f_index + 1], "bestaudio/best");
     }
@@ -1208,7 +1403,7 @@ mod tests {
     #[test]
     fn video_args_select_nearest_available_height_via_format_selector() {
         let job = sample_job(MediaType::Video, None, Some("1080p"));
-        let args = build_ytdlp_args(&job).unwrap();
+        let args = build_ytdlp_args(&job, 0).unwrap();
         let format_selector = args
             .iter()
             .find(|a| a.contains("bestvideo"))
@@ -1226,7 +1421,7 @@ mod tests {
         // fails to open in QuickTime, older Windows Media Player, and many
         // TVs when muxed into .mp4 — the file "downloads" but won't play.
         let job = sample_job(MediaType::Video, None, Some("1080p"));
-        let args = build_ytdlp_args(&job).unwrap();
+        let args = build_ytdlp_args(&job, 0).unwrap();
         let format_selector = args
             .iter()
             .find(|a| a.contains("bestvideo"))
@@ -1249,7 +1444,7 @@ mod tests {
         // tries avc1 first, but `--format-sort vcodec:avc` additionally
         // biases any tied fallback candidate towards h264 too.
         let job = sample_job(MediaType::Video, None, Some("1080p"));
-        let args = build_ytdlp_args(&job).unwrap();
+        let args = build_ytdlp_args(&job, 0).unwrap();
         let sort_index = args
             .iter()
             .position(|a| a == "--format-sort")
@@ -1263,11 +1458,11 @@ mod tests {
         // flat-playlist previews don't fetch per-video formats — `None`
         // means "let yt-dlp pick its best", not an error.
         let audio_job = sample_job(MediaType::Audio, None, None);
-        let audio_args = build_ytdlp_args(&audio_job).unwrap();
+        let audio_args = build_ytdlp_args(&audio_job, 0).unwrap();
         assert!(audio_args.contains(&"0".to_string()));
 
         let video_job = sample_job(MediaType::Video, None, None);
-        let video_args = build_ytdlp_args(&video_job).unwrap();
+        let video_args = build_ytdlp_args(&video_job, 0).unwrap();
         assert!(video_args
             .iter()
             .any(|a| a.ends_with("bestvideo+bestaudio/best")));
@@ -1276,8 +1471,46 @@ mod tests {
     #[test]
     fn every_single_item_job_disables_implicit_playlist_download() {
         let job = sample_job(MediaType::Audio, Some("128kbps"), None);
-        let args = build_ytdlp_args(&job).unwrap();
+        let args = build_ytdlp_args(&job, 0).unwrap();
         assert_eq!(args.first(), Some(&"--no-playlist".to_string()));
+    }
+
+    #[test]
+    fn adds_rate_limit_flag_when_configured() {
+        let job = sample_job(MediaType::Audio, Some("128kbps"), None);
+        let args = build_ytdlp_args(&job, 512).expect("args build");
+
+        let index = args
+            .iter()
+            .position(|a| a == "--limit-rate")
+            .expect("cờ giới hạn tốc độ phải có mặt");
+        // Đơn vị phải là K: yt-dlp hiểu `--limit-rate 512` là 512 **byte**/s,
+        // tức chậm hơn ý người dùng một nghìn lần.
+        assert_eq!(args[index + 1], "512K");
+    }
+
+    #[test]
+    fn omits_rate_limit_flag_when_unlimited() {
+        let job = sample_job(MediaType::Audio, Some("128kbps"), None);
+        let args = build_ytdlp_args(&job, 0).expect("args build");
+
+        assert!(
+            !args.iter().any(|a| a == "--limit-rate"),
+            "0 nghĩa là không giới hạn, không được truyền cờ"
+        );
+    }
+
+    #[test]
+    fn a_finished_run_is_only_acted_on_while_it_is_still_the_registered_one() {
+        // Người dùng tạm dừng rồi tiếp tục rất nhanh: lần chạy #1 kết thúc SAU
+        // khi lần chạy #2 đã đăng ký. Thi hành kết quả của #1 lúc đó sẽ gỡ mất
+        // handle huỷ của #2 (job không còn tạm dừng được nữa) và ghi đè trạng
+        // thái của #2 bằng lỗi của một lần chạy đã chết.
+        assert!(!is_current_run(Some(2), 1), "#2 đã chiếm chỗ, kết quả của #1 đã lỗi thời");
+        assert!(is_current_run(Some(1), 1));
+        // Không còn entry nào nghĩa là chưa ai chiếm chỗ, nên kết quả vẫn phải
+        // được thi hành — nếu không, một job thất bại sẽ kẹt ở `downloading`.
+        assert!(is_current_run(None, 1));
     }
 
     #[test]
@@ -1285,7 +1518,7 @@ mod tests {
         // run_job branches to run_gallery_job before this is ever reached in
         // practice — this just guards the invariant.
         let job = sample_job(MediaType::Gallery, None, None);
-        assert!(build_ytdlp_args(&job).is_err());
+        assert!(build_ytdlp_args(&job, 0).is_err());
     }
 
     #[test]

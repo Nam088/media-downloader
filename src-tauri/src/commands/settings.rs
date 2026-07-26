@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::db::Db;
+use crate::downloader::queue::DownloadQueue;
 use crate::error::AppError;
 use crate::models::AppSettings;
 
@@ -60,11 +61,17 @@ fn apply_patch(current: &mut AppSettings, patch: UpdateSettingsInput) {
 #[tauri::command]
 pub fn update_settings(
     db: State<Arc<Db>>,
+    queue: State<DownloadQueue>,
     patch: UpdateSettingsInput,
 ) -> Result<AppSettings, AppError> {
     let mut current = db.get_settings()?;
     apply_patch(&mut current, patch);
     db.update_settings(&current)?;
+    // Áp ngay lên bộ điều phối thay vì chỉ ghi vào DB: nó đọc số luồng từ một
+    // `AtomicUsize` chứ không đọc lại cài đặt mỗi vòng, nên nếu không đẩy giá
+    // trị mới vào đây thì thay đổi chỉ có hiệu lực ở lần khởi động sau
+    // (FR-113). Giá trị đã được `apply_patch` chặn trong khoảng 1..=8.
+    queue.set_max_concurrent(current.max_concurrent_downloads as usize);
     Ok(current)
 }
 

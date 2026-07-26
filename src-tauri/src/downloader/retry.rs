@@ -1,32 +1,22 @@
 //! Lỗi nào đáng thử lại, và chờ bao lâu trước khi thử.
 //!
 //! Module gom hai mảnh của cùng một quyết định: nhận ra stderr nào là sự cố
-//! đường truyền (`has_network_marker`, dùng bởi hai bộ phân loại lỗi), và mã
-//! lỗi nào thì đáng thử lại cùng khoảng chờ giữa các lần (`is_transient`,
-//! `backoff_seconds`, `should_retry`, dùng bởi bộ điều phối hàng đợi).
+//! đường truyền (`has_network_marker`, dùng bởi hai bộ phân loại lỗi), và một
+//! lần chạy thất bại thì phải làm gì (`decide_outcome`, dùng bởi bộ điều phối
+//! hàng đợi).
 //!
 //! Tách riêng khỏi `queue` để logic quyết định này kiểm thử được mà không cần
 //! dựng cả một hàng đợi, và để cả yt-dlp lẫn gallery-dl dùng chung một chính
 //! sách (FR-120, FR-121).
 
-use crate::error::NETWORK_ERROR_CODE;
-
-// Nhóm `MAX_BACKOFF_SECONDS`, `BASE_BACKOFF_SECONDS`, `is_transient`,
-// `backoff_seconds` và `should_retry` dưới đây mang `#[allow(dead_code)]`: đây
-// là chính sách thử lại, còn bộ điều phối gọi tới nó được thêm ở một bước sau.
-// Tới lúc đó các attribute này phải được gỡ bỏ, không phải để lại — chúng chỉ
-// tồn tại để chính sách được kiểm thử trọn vẹn trước khi có người gọi.
-// (`has_network_marker` đã có người dùng ngay: hai bộ phân loại lỗi của yt-dlp
-// và gallery-dl.)
+use crate::error::{CANCELED_ERROR_CODE, NETWORK_ERROR_CODE};
 
 /// Khoảng chờ tối đa giữa hai lần thử. Vượt quá mức này thì việc chờ tiếp
 /// không còn giúp gì mà chỉ làm người dùng tưởng ứng dụng bị treo.
-#[allow(dead_code)]
 const MAX_BACKOFF_SECONDS: u64 = 300;
 
 /// Khoảng chờ cho lần thử đầu tiên. Đủ dài để một lần chập mạng kịp hồi phục,
 /// đủ ngắn để không gây khó chịu.
-#[allow(dead_code)]
 const BASE_BACKOFF_SECONDS: u64 = 5;
 
 /// Các dấu hiệu cho thấy lỗi đến từ đường truyền chứ không từ nội dung. Thử
@@ -64,15 +54,13 @@ const NETWORK_ERROR_MARKERS: [&str; 15] = [
 /// Chỉ mã `NETWORK_ERROR` được coi là tạm thời. Mọi mã khác — kể cả
 /// `DOWNLOAD_FAILED` vốn là nhóm gom — đều bị coi là vĩnh viễn, vì thử lại một
 /// lỗi vĩnh viễn chỉ làm chậm phản hồi mà không đổi được kết quả.
-#[allow(dead_code)]
-pub fn is_transient(error_code: &str) -> bool {
+fn is_transient(error_code: &str) -> bool {
     error_code == NETWORK_ERROR_CODE
 }
 
 /// Số giây chờ trước lần thử thứ `retry_count + 1`. Tăng gấp đôi mỗi lần,
 /// chặn trên ở `MAX_BACKOFF_SECONDS`.
-#[allow(dead_code)]
-pub fn backoff_seconds(retry_count: i64) -> u64 {
+fn backoff_seconds(retry_count: i64) -> u64 {
     let exponent = retry_count.clamp(0, 16) as u32;
     BASE_BACKOFF_SECONDS
         .saturating_mul(2u64.saturating_pow(exponent))
@@ -80,9 +68,39 @@ pub fn backoff_seconds(retry_count: i64) -> u64 {
 }
 
 /// Có nên tự thử lại không: lỗi phải là tạm thời và chưa dùng hết số lượt.
-#[allow(dead_code)]
-pub fn should_retry(error_code: &str, retry_count: i64, max_retries: i64) -> bool {
+fn should_retry(error_code: &str, retry_count: i64, max_retries: i64) -> bool {
     is_transient(error_code) && retry_count < max_retries
+}
+
+/// Việc phải làm sau một lần chạy thất bại.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Xếp lại vào hàng chờ, chỉ được phép chạy lại sau `delay_seconds` giây.
+    Retry { delay_seconds: u64 },
+    /// Thất bại vĩnh viễn: đánh dấu `failed` và dừng hẳn.
+    Fail,
+    /// Không đụng gì tới job cả.
+    Ignore,
+}
+
+/// Quyết định duy nhất của chính sách thử lại, tách khỏi phần vào/ra để kiểm
+/// thử được: `queue::finish_job` chỉ còn là lớp bọc mỏng đọc `retry_count` từ
+/// DB, gọi hàm này, rồi thi hành kết quả.
+///
+/// `Ignore` dành riêng cho mã `CANCELED`: người dùng chủ động tạm dừng hoặc
+/// huỷ thì `pause`/`cancel` đã đặt trạng thái cuối cùng rồi. Ghi đè nó thành
+/// `failed` sẽ xoá mất lựa chọn của người dùng, còn thử lại thì lại càng
+/// ngược ý họ hơn (FR-123).
+pub fn decide_outcome(error_code: &str, retry_count: i64, max_retries: i64) -> Outcome {
+    if error_code == CANCELED_ERROR_CODE {
+        return Outcome::Ignore;
+    }
+    if should_retry(error_code, retry_count, max_retries) {
+        return Outcome::Retry {
+            delay_seconds: backoff_seconds(retry_count),
+        };
+    }
+    Outcome::Fail
 }
 
 /// Stderr có mang dấu hiệu lỗi đường truyền không. Nhận stderr thô, tự chuyển
@@ -221,5 +239,51 @@ mod tests {
         assert!(!should_retry("NETWORK_ERROR", 3, 3), "đã dùng hết lượt");
         assert!(!should_retry("ACCESS_DENIED", 0, 3), "lỗi vĩnh viễn không thử lại");
         assert!(!should_retry("NETWORK_ERROR", 0, 0), "người dùng tắt retry");
+    }
+
+    #[test]
+    fn a_transient_failure_is_scheduled_for_another_attempt() {
+        assert_eq!(
+            decide_outcome(NETWORK_ERROR_CODE, 0, 3),
+            Outcome::Retry { delay_seconds: 5 }
+        );
+        // Khoảng chờ phải lớn dần theo số lần đã thử, chứ không phải một hằng
+        // số: hai lần thử liên tiếp cách nhau đúng 5 giây thì lần thử thứ ba
+        // gần như chắc chắn gặp lại đúng sự cố mạng đó.
+        assert_eq!(
+            decide_outcome(NETWORK_ERROR_CODE, 2, 5),
+            Outcome::Retry { delay_seconds: 20 }
+        );
+    }
+
+    #[test]
+    fn a_transient_failure_becomes_permanent_once_the_attempts_run_out() {
+        assert_eq!(decide_outcome(NETWORK_ERROR_CODE, 3, 3), Outcome::Fail);
+        assert_eq!(
+            decide_outcome(NETWORK_ERROR_CODE, 0, 0),
+            Outcome::Fail,
+            "người dùng tắt hẳn tự thử lại"
+        );
+    }
+
+    #[test]
+    fn a_permanent_failure_never_waits_for_a_retry() {
+        // Bắt người dùng chờ 5 + 10 + 20 giây rồi mới báo "video riêng tư" là
+        // vô ích: kết quả không thể khác đi (SC-106).
+        assert_eq!(decide_outcome("ACCESS_DENIED", 0, 3), Outcome::Fail);
+        assert_eq!(decide_outcome("DOWNLOAD_FAILED", 0, 3), Outcome::Fail);
+    }
+
+    #[test]
+    fn a_user_cancellation_is_neither_retried_nor_marked_failed() {
+        // Người dùng bấm Tạm dừng/Huỷ: trạng thái cuối cùng đã do chính thao
+        // tác đó đặt. Thử lại sẽ khởi động lại thứ họ vừa dừng, còn đánh dấu
+        // thất bại sẽ hiện một lỗi mà không hề có lỗi nào (FR-123).
+        assert_eq!(decide_outcome(CANCELED_ERROR_CODE, 0, 3), Outcome::Ignore);
+        assert_eq!(
+            decide_outcome(CANCELED_ERROR_CODE, 9, 3),
+            Outcome::Ignore,
+            "đã hết lượt thử lại cũng không được biến thành thất bại"
+        );
     }
 }
