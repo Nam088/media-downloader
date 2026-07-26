@@ -12,6 +12,7 @@ import {
   BEST_AUDIO_QUALITY_VALUE,
   audioQualityValue,
 } from "@/lib/generic-quality-options";
+import { formatDuration } from "@/lib/format";
 import type {
   AppError,
   CreatePlaylistJobsInput,
@@ -19,13 +20,6 @@ import type {
   MediaSource,
   PlaylistItemJobInput,
 } from "@/types/download";
-
-function formatEntryDuration(seconds: number | null): string | null {
-  if (seconds == null) return null;
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return `${m}:${s.toString().padStart(2, "0")}`;
-}
 
 interface PlaylistDetailPanelProps {
   preview: MediaSource | null;
@@ -175,7 +169,7 @@ function PlaylistDetailPanelInner({
       <div className="flex max-h-80 flex-col gap-1.5 overflow-y-auto pr-1">
         {entries.map((entry, index) => {
           const isSelected = selected.has(index);
-          const duration = formatEntryDuration(entry.duration_seconds);
+          const duration = formatDuration(entry.duration_seconds);
           return (
             <div
               key={`${entry.url}-${index}`}

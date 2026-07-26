@@ -21,6 +21,7 @@ import {
   BEST_AUDIO_QUALITY_VALUE,
   audioQualityValue,
 } from "@/lib/generic-quality-options";
+import { formatDuration, formatFileSize } from "@/lib/format";
 import type {
   AppError,
   AudioFormatOption,
@@ -31,22 +32,6 @@ import type {
   MediaType,
   VideoQualityOption,
 } from "@/types/download";
-
-function formatDuration(seconds: number | null): string | null {
-  if (seconds == null) return null;
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
-  const pad = (n: number) => n.toString().padStart(2, "0");
-  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
-}
-
-function formatFileSize(bytes: number | null): string | null {
-  if (bytes == null) return null;
-  const mb = bytes / (1024 * 1024);
-  if (mb >= 1024) return `${(mb / 1024).toFixed(2)} GB`;
-  return `${mb.toFixed(1)} MB`;
-}
 
 const PLATFORM_DISPLAY_NAMES: Record<string, string> = {
   youtube: "YouTube",

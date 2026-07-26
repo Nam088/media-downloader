@@ -4,6 +4,7 @@ import { ChevronDown, ChevronRight, Pause, Play, X, RotateCcw } from "lucide-rea
 import { Progress } from "@/components/ui/progress";
 import { Button } from "@/components/ui/button";
 import { ensureQueueListeners, useQueueStore } from "@/stores/queue-store";
+import { formatSpeed } from "@/lib/format";
 import type { DownloadJob } from "@/types/download";
 
 const ACTIVE_STATUSES = new Set(["queued", "fetching_metadata", "downloading", "paused"]);
@@ -11,12 +12,6 @@ const ACTIVE_STATUSES = new Set(["queued", "fetching_metadata", "downloading", "
 // PlaylistGroup below). It only disappears once every one of its jobs
 // reaches one of these fully-resolved states.
 const RESOLVED_STATUSES = new Set(["completed", "canceled"]);
-
-function formatSpeed(bytesPerSec: number | null): string {
-  if (!bytesPerSec) return "";
-  const mb = bytesPerSec / (1024 * 1024);
-  return mb >= 1 ? `${mb.toFixed(1)} MB/s` : `${(bytesPerSec / 1024).toFixed(0)} KB/s`;
-}
 
 function JobControls({ job }: { job: DownloadJob }) {
   const { pauseJob, resumeJob, cancelJob, retryJob } = useQueueStore();
