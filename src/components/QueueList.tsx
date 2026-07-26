@@ -4,11 +4,15 @@ import { useTranslation } from "react-i18next";
 import { ChevronDown, ChevronRight, Pause, Play, X, RotateCcw } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { Button } from "@/components/ui/button";
+import { QueueToolbar } from "@/components/QueueToolbar";
 import { ensureQueueListeners, useQueueStore } from "@/stores/queue-store";
 import { formatSpeed } from "@/lib/format";
 import type { DownloadJob } from "@/types/download";
 
 const ACTIVE_STATUSES = new Set(["queued", "fetching_metadata", "downloading", "paused"]);
+/** What "Pause all" would act on. `paused` is counted separately. */
+const RUNNING_STATUSES = new Set(["queued", "fetching_metadata", "downloading"]);
+const FINISHED_STATUSES = new Set(["completed", "failed", "canceled"]);
 // A playlist group keeps showing a finished item instead of dropping it (see
 // PlaylistGroup below). It only disappears once every one of its jobs
 // reaches one of these fully-resolved states.
@@ -54,18 +58,53 @@ function JobControls({ job }: { job: DownloadJob }) {
   return null;
 }
 
+/**
+ * Seconds left until this job's next retry, or `null` when it is not waiting
+ * for one. A job between attempts has no status of its own: it is `queued`
+ * with `next_retry_at` in the future, and the dispatcher skips it until then.
+ *
+ * Ticks once a second so the number actually counts down (FR-122), and only
+ * while there is something to count — an interval per queued job would
+ * otherwise wake the app up forever.
+ */
+function useRetryCountdown(job: DownloadJob): number | null {
+  const [now, setNow] = useState(() => Date.now());
+  const waiting = job.status === "queued" && job.next_retry_at !== null;
+
+  useEffect(() => {
+    if (!waiting) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+    // Deliberately not keyed on `next_retry_at`: if the deadline moves while
+    // the job is still waiting, the running interval already reports it.
+  }, [waiting]);
+
+  if (!waiting || !job.next_retry_at) return null;
+  const remaining = Math.ceil((new Date(job.next_retry_at).getTime() - now) / 1000);
+  // A deadline in the past means the dispatcher is about to pick the job up:
+  // showing "in -3s" would be worse than showing the plain "Queued" status.
+  return remaining > 0 ? remaining : null;
+}
+
 /** One job's row, shared by standalone jobs and playlist-group children.
  * `title` falls back to `source_url` for jobs created before that field
  * existed, or paths where the backend never had a title to begin with. */
 function JobRow({ job }: { job: DownloadJob }) {
   const { t } = useTranslation();
+  const retryCountdown = useRetryCountdown(job);
   return (
     <div className="rounded-md border border-border/80 bg-card p-3 shadow-2xs transition-all">
       <div className="flex items-center justify-between gap-3">
         <span className="truncate text-sm font-medium text-foreground">{job.title ?? job.source_url}</span>
         <div className="flex shrink-0 items-center gap-2">
           <span className="rounded-sm bg-muted/80 px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground capitalize">
-            {t(`queue.status.${job.status}`)}
+            {retryCountdown === null
+              ? t(`queue.status.${job.status}`)
+              : t("queue.retry_countdown", {
+                  defaultValue: "Retrying in {{seconds}}s (attempt {{attempt}})",
+                  seconds: retryCountdown,
+                  attempt: job.retry_count + 1,
+                })}
           </span>
           <JobControls job={job} />
         </div>
@@ -140,7 +179,9 @@ export function QueueList() {
   // call, and an unwrapped selector would hand `useSyncExternalStore` a new
   // reference each time and re-render forever.
   const allJobs = useQueueStore(useShallow((state) => state.orderedJobs()));
+  const moveJob = useQueueStore((state) => state.moveJob);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  const [draggingId, setDraggingId] = useState<string | null>(null);
 
   useEffect(() => {
     ensureQueueListeners();
@@ -163,10 +204,6 @@ export function QueueList() {
     (job) => !(job.is_playlist_item && job.parent_playlist_id) && ACTIVE_STATUSES.has(job.status),
   );
 
-  if (visibleGroups.length === 0 && standaloneJobs.length === 0) {
-    return <p className="text-sm text-muted-foreground">{t("queue.empty")}</p>;
-  }
-
   function toggleGroup(playlistId: string) {
     setCollapsedGroups((prev) => {
       const next = new Set(prev);
@@ -176,19 +213,84 @@ export function QueueList() {
     });
   }
 
+  /** Only jobs that have not started yet can be reordered — a running job has
+   * already taken its slot, so moving it in the queue would change nothing
+   * (FR-119). */
+  function isDraggable(job: DownloadJob) {
+    return job.status === "queued" || job.status === "paused";
+  }
+
+  function handleDrop(targetId: string) {
+    if (!draggingId || draggingId === targetId) return;
+
+    // Work out the list as it will look after the drop, purely to read off the
+    // dragged job's two new neighbours. Only those three ids are sent — the
+    // backend writes one row from them, so a job enqueued mid-drag keeps its
+    // place instead of being renumbered from a stale snapshot.
+    const ids = standaloneJobs.map((job) => job.id);
+    const from = ids.indexOf(draggingId);
+    const to = ids.indexOf(targetId);
+    if (from === -1 || to === -1) return;
+
+    ids.splice(to, 0, ids.splice(from, 1)[0]);
+    const landed = ids.indexOf(draggingId);
+
+    setDraggingId(null);
+    void moveJob(draggingId, ids[landed - 1] ?? null, ids[landed + 1] ?? null);
+  }
+
   return (
     <div className="flex flex-col gap-2">
-      {visibleGroups.map(([playlistId, children]) => (
-        <PlaylistGroup
-          key={playlistId}
-          jobs={children}
-          collapsed={collapsedGroups.has(playlistId)}
-          onToggle={() => toggleGroup(playlistId)}
-        />
-      ))}
-      {standaloneJobs.map((job) => (
-        <JobRow key={job.id} job={job} />
-      ))}
+      <QueueToolbar
+        activeCount={allJobs.filter((job) => RUNNING_STATUSES.has(job.status)).length}
+        pausedCount={allJobs.filter((job) => job.status === "paused").length}
+        finishedCount={allJobs.filter((job) => FINISHED_STATUSES.has(job.status)).length}
+      />
+      {visibleGroups.length === 0 && standaloneJobs.length === 0 ? (
+        <p className="text-sm text-muted-foreground">{t("queue.empty")}</p>
+      ) : (
+        <>
+          {visibleGroups.map(([playlistId, children]) => (
+            <PlaylistGroup
+              key={playlistId}
+              jobs={children}
+              collapsed={collapsedGroups.has(playlistId)}
+              onToggle={() => toggleGroup(playlistId)}
+            />
+          ))}
+          <ul className="flex list-none flex-col gap-2 p-0">
+            {standaloneJobs.map((job) => (
+              <li
+                key={job.id}
+                draggable={isDraggable(job)}
+                onDragStart={(event) => {
+                  setDraggingId(job.id);
+                  // Firefox refuses to start a drag without payload; the id is
+                  // also what a drop from outside the list would carry.
+                  event.dataTransfer?.setData("text/plain", job.id);
+                }}
+                onDragEnd={() => setDraggingId(null)}
+                onDragOver={(event) => {
+                  // Preventing the default is what marks this row as a valid
+                  // drop target at all.
+                  if (draggingId) event.preventDefault();
+                }}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  handleDrop(job.id);
+                }}
+                className={
+                  isDraggable(job)
+                    ? `cursor-grab ${draggingId === job.id ? "opacity-50" : ""}`
+                    : undefined
+                }
+              >
+                <JobRow job={job} />
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
     </div>
   );
 }
