@@ -53,3 +53,14 @@ coverage
 # `tauri icon` also emits mobile icon sets; this app is desktop-only.
 src-tauri/icons/android/
 src-tauri/icons/ios/
+
+# Python build artefacts. The PyInstaller onedir bundles for yt-dlp,
+# gallery-dl and spotiflac are built by scripts/, which leaves these behind.
+# The build/dist rules are scoped to scripts/ on purpose: bare `build/` would
+# quietly swallow an unrelated directory later, and `dist` is already ignored
+# above for the Vite output.
+__pycache__/
+*.py[cod]
+scripts/build/
+scripts/dist/
+scripts/*.spec
