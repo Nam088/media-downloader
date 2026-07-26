@@ -37,7 +37,12 @@ case "$(uname -s)" in
   *) VENV_BIN="$BUILD_ROOT/venv/bin" ;;
 esac
 
-"$VENV_BIN/pip" install --quiet --upgrade pip
+# `python -m pip`, never `pip` directly: on Windows the console script is
+# pip.exe, and Windows will not let a running executable replace itself, so
+# `pip install --upgrade pip` fails outright with "To modify pip, please run
+# the following command". It works on macOS and Linux, which is exactly why
+# this only ever broke on the Windows CI runner.
+"$VENV_BIN/python" -m pip install --quiet --upgrade pip
 # `nodriver` is installed explicitly on purpose: SpotiFLAC's own
 # requirements.txt lists nodriver>=0.36, but its published wheel metadata
 # omits it, so `pip install SpotiFLAC` alone leaves it out — and
@@ -45,7 +50,7 @@ esac
 # `import SpotiFLAC` fail outright. It is also what the automated Cloudflare
 # solver runs on (research.md R4, layer 1), so it is a real dependency here,
 # not just an import-time formality.
-"$VENV_BIN/pip" install --quiet "SpotiFLAC==$SPOTIFLAC_VERSION" "nodriver>=0.36" pyinstaller
+"$VENV_BIN/python" -m pip install --quiet "SpotiFLAC==$SPOTIFLAC_VERSION" "nodriver>=0.36" pyinstaller
 
 # SpotiFLAC imports its providers/extensions dynamically in places; collect
 # the whole package (code + any data files) so PyInstaller's static analysis
