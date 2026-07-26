@@ -1,5 +1,6 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
+import userEvent, { type UserEvent } from "@testing-library/user-event";
 import { invoke } from "@tauri-apps/api/core";
 import { QueueList } from "@/components/QueueList";
 import { useQueueStore } from "@/stores/queue-store";
@@ -53,6 +54,65 @@ function seedThreeQueuedJobs() {
 
 function rowTitles() {
   return screen.getAllByRole("listitem").map((row) => row.querySelector("span")?.textContent);
+}
+
+/**
+ * Reordering is driven by pointer events and hit-tests rows by geometry, but
+ * jsdom lays nothing out — every `getBoundingClientRect()` returns zeros, so
+ * every row would occupy the same point. Give the rows the stacked boxes a
+ * real list has: row `i` spans y = i*ROW_HEIGHT … (i+1)*ROW_HEIGHT.
+ */
+const ROW_HEIGHT = 100;
+
+function layoutRows(rows: HTMLElement[]) {
+  rows.forEach((row, index) => {
+    const top = index * ROW_HEIGHT;
+    row.getBoundingClientRect = () =>
+      ({
+        top,
+        bottom: top + ROW_HEIGHT,
+        height: ROW_HEIGHT,
+        left: 0,
+        right: 320,
+        width: 320,
+        x: 0,
+        y: top,
+        toJSON: () => ({}),
+      }) as DOMRect;
+  });
+}
+
+/** Vertical centre of the row at `index`, in the layout `layoutRows` sets up. */
+const rowCenterY = (index: number) => index * ROW_HEIGHT + ROW_HEIGHT / 2;
+
+function dragHandle(row: HTMLElement) {
+  return within(row).getByRole("button", { name: /^reorder/i });
+}
+
+/**
+ * Presses the drag handle of the row at `fromIndex` and drags the pointer to
+ * `toY` (a viewport coordinate — use `rowCenterY(i)` for "over row i").
+ * Leaves the button held down when `release` is false, so a test can inspect
+ * the drop indicator mid-drag or interrupt the gesture. `fromY` overrides
+ * where the press lands, which is what decides how far the pointer travelled.
+ */
+async function dragRow(
+  user: UserEvent,
+  fromIndex: number,
+  toY: number,
+  { release = true, fromY = rowCenterY(fromIndex) } = {},
+) {
+  const rows = screen.getAllByRole("listitem");
+  layoutRows(rows);
+  const handle = dragHandle(rows[fromIndex]);
+  await user.pointer([
+    { keys: "[MouseLeft>]", target: handle, coords: { clientX: 8, clientY: fromY } },
+    { target: handle, coords: { clientX: 8, clientY: toY } },
+  ]);
+  if (release) {
+    await user.pointer({ keys: "[/MouseLeft]", target: handle, coords: { clientX: 8, clientY: toY } });
+  }
+  return handle;
 }
 
 describe("QueueList", () => {
@@ -195,16 +255,14 @@ describe("QueueList", () => {
     expect(rowTitles()).toEqual(["Job A", "Job B", "Job C"]);
   });
 
-  it("sends only the dropped job and its new neighbours (FR-117)", () => {
+  it("sends only the dragged job and its new neighbours (FR-117)", async () => {
+    const user = userEvent.setup();
     seedThreeQueuedJobs();
     render(<QueueList />);
 
-    const rows = screen.getAllByRole("listitem");
     // Drag the last row to the top: it ends up with no neighbour before it,
     // and "a" — the row it displaced — after it.
-    fireEvent.dragStart(rows[2]);
-    fireEvent.dragOver(rows[0]);
-    fireEvent.drop(rows[0]);
+    await dragRow(user, 2, rowCenterY(0));
 
     expect(invoke).toHaveBeenCalledWith("reorder_queue", {
       jobId: "c",
@@ -213,16 +271,14 @@ describe("QueueList", () => {
     });
   });
 
-  it("passes both neighbours when dropping into the middle", () => {
+  it("passes both neighbours when dropping into the middle", async () => {
+    const user = userEvent.setup();
     seedThreeQueuedJobs();
     render(<QueueList />);
 
-    const rows = screen.getAllByRole("listitem");
     // Drag "a" down onto "b": it lands between "b" and "c", so neither
     // neighbour is null.
-    fireEvent.dragStart(rows[0]);
-    fireEvent.dragOver(rows[1]);
-    fireEvent.drop(rows[1]);
+    await dragRow(user, 0, rowCenterY(1));
 
     expect(invoke).toHaveBeenCalledWith("reorder_queue", {
       jobId: "a",
@@ -231,17 +287,31 @@ describe("QueueList", () => {
     });
   });
 
-  it("moves the row immediately instead of waiting for the backend", () => {
+  it("drops onto the nearest row when the pointer is released past the end of the list", async () => {
+    const user = userEvent.setup();
+    seedThreeQueuedJobs();
+    render(<QueueList />);
+
+    // Well below the last row: the drag still resolves to "c" rather than
+    // being thrown away for landing on empty space.
+    await dragRow(user, 0, rowCenterY(2) + 400);
+
+    expect(invoke).toHaveBeenCalledWith("reorder_queue", {
+      jobId: "a",
+      beforeJobId: "c",
+      afterJobId: null,
+    });
+  });
+
+  it("moves the row immediately instead of waiting for the backend", async () => {
+    const user = userEvent.setup();
     seedThreeQueuedJobs();
     // Never resolves: the row must have moved on the strength of the local
     // guess alone, not because the command came back.
     vi.mocked(invoke).mockImplementation(() => new Promise(() => {}));
     render(<QueueList />);
 
-    const rows = screen.getAllByRole("listitem");
-    fireEvent.dragStart(rows[2]);
-    fireEvent.dragOver(rows[0]);
-    fireEvent.drop(rows[0]);
+    await dragRow(user, 2, rowCenterY(0));
 
     expect(rowTitles()).toEqual(["Job C", "Job A", "Job B"]);
     // Head of the queue: one below the job it now sits in front of, the same
@@ -249,48 +319,124 @@ describe("QueueList", () => {
     expect(useQueueStore.getState().jobs.c.queue_position).toBe(0);
   });
 
-  it("gives a job dropped between two others the midpoint position", () => {
+  it("gives a job dropped between two others the midpoint position", async () => {
+    const user = userEvent.setup();
     seedThreeQueuedJobs();
     vi.mocked(invoke).mockImplementation(() => new Promise(() => {}));
     render(<QueueList />);
 
-    const rows = screen.getAllByRole("listitem");
-    fireEvent.dragStart(rows[0]);
-    fireEvent.dragOver(rows[1]);
-    fireEvent.drop(rows[1]);
+    await dragRow(user, 0, rowCenterY(1));
 
     expect(useQueueStore.getState().jobs.a.queue_position).toBe(2.5);
     expect(rowTitles()).toEqual(["Job B", "Job A", "Job C"]);
   });
 
-  it("does nothing when a job is dropped on itself", () => {
+  it("marks a row being dragged downwards as landing after the row under the pointer", async () => {
+    const user = userEvent.setup();
     seedThreeQueuedJobs();
     render(<QueueList />);
 
+    await dragRow(user, 0, rowCenterY(1), { release: false });
+
     const rows = screen.getAllByRole("listitem");
-    fireEvent.dragStart(rows[1]);
-    fireEvent.drop(rows[1]);
+    expect(rows[0]).toHaveAttribute("data-dragging", "true");
+    expect(rows[1]).toHaveAttribute("data-drop-position", "after");
+    expect(rows[2]).not.toHaveAttribute("data-drop-position");
+    // Nothing is committed until the pointer comes up.
+    expect(invoke).not.toHaveBeenCalledWith("reorder_queue", expect.anything());
+  });
+
+  it("marks a row being dragged upwards as landing before the row under the pointer", async () => {
+    const user = userEvent.setup();
+    seedThreeQueuedJobs();
+    render(<QueueList />);
+
+    await dragRow(user, 2, rowCenterY(0), { release: false });
+
+    const rows = screen.getAllByRole("listitem");
+    expect(rows[0]).toHaveAttribute("data-drop-position", "before");
+    expect(rows[1]).not.toHaveAttribute("data-drop-position");
+    expect(rows[2]).toHaveAttribute("data-dragging", "true");
+  });
+
+  it("does nothing when a row is dropped back onto itself", async () => {
+    const user = userEvent.setup();
+    seedThreeQueuedJobs();
+    render(<QueueList />);
+
+    // A real drag by any measure — well past the threshold — but it never
+    // leaves the row it started on.
+    await dragRow(user, 1, rowCenterY(1) + 30);
 
     expect(invoke).not.toHaveBeenCalledWith("reorder_queue", expect.anything());
     expect(rowTitles()).toEqual(["Job A", "Job B", "Job C"]);
   });
 
-  it("does not let a running job be dragged", () => {
+  it("ignores a press that never travels far enough to be a drag", async () => {
+    const user = userEvent.setup();
+    seedThreeQueuedJobs();
+    render(<QueueList />);
+
+    // Two pixels of jitter, but across the boundary between "b" and "c": far
+    // enough to change the row under the pointer, not far enough to be a drag.
+    await dragRow(user, 1, 2 * ROW_HEIGHT + 1, { fromY: 2 * ROW_HEIGHT - 1 });
+
+    expect(invoke).not.toHaveBeenCalledWith("reorder_queue", expect.anything());
+    expect(rowTitles()).toEqual(["Job A", "Job B", "Job C"]);
+  });
+
+  it("abandons a drag when Escape is pressed before the pointer comes up", async () => {
+    const user = userEvent.setup();
+    seedThreeQueuedJobs();
+    render(<QueueList />);
+
+    const handle = await dragRow(user, 2, rowCenterY(0), { release: false });
+    expect(screen.getAllByRole("listitem")[0]).toHaveAttribute("data-drop-position", "before");
+
+    await user.keyboard("{Escape}");
+    await user.pointer({ keys: "[/MouseLeft]", target: handle, coords: { clientX: 8, clientY: rowCenterY(0) } });
+
+    expect(invoke).not.toHaveBeenCalledWith("reorder_queue", expect.anything());
+    expect(rowTitles()).toEqual(["Job A", "Job B", "Job C"]);
+    expect(screen.getAllByRole("listitem")[0]).not.toHaveAttribute("data-drop-position");
+  });
+
+  it("gives only reorderable rows a drag handle", () => {
     useQueueStore.setState({
       jobs: {
-        a: makeJob({ id: "a", status: "downloading", queue_position: 1 }),
-        b: makeJob({ id: "b", status: "paused", queue_position: 2 }),
+        a: makeJob({ id: "a", title: "Running", status: "downloading", queue_position: 1 }),
+        b: makeJob({ id: "b", title: "Waiting", status: "paused", queue_position: 2 }),
       },
     });
     render(<QueueList />);
 
     const rows = screen.getAllByRole("listitem");
-    expect(rows[0]).toHaveAttribute("draggable", "false");
+    // A running job has already taken its slot, so it has nowhere to move to
+    // (FR-119) — and the missing handle is what tells the user that, rather
+    // than leaving them to guess whether dragging is broken.
+    expect(within(rows[0]).queryByRole("button", { name: /^reorder/i })).not.toBeInTheDocument();
     // A paused job has not taken its slot yet, so it still moves.
-    expect(rows[1]).toHaveAttribute("draggable", "true");
+    expect(within(rows[1]).getByRole("button", { name: /^reorder/i })).toBeInTheDocument();
+  });
+
+  it("still lets a row's own buttons be clicked", async () => {
+    const user = userEvent.setup();
+    seedThreeQueuedJobs();
+    render(<QueueList />);
+
+    // The press that starts a drag must not swallow the controls inside the
+    // row: pausing a job is a click, not a gesture.
+    const rows = screen.getAllByRole("listitem");
+    const buttons = within(rows[0]).getAllByRole("button");
+    // [0] is the drag handle; the pause and cancel controls follow it.
+    expect(buttons).toHaveLength(3);
+    await user.click(buttons[1]);
+
+    expect(invoke).toHaveBeenCalledWith("pause_job", { jobId: "a" });
   });
 
   it("re-reads the queue when the backend rejects the move", async () => {
+    const user = userEvent.setup();
     seedThreeQueuedJobs();
     vi.mocked(invoke).mockImplementation((cmd: string) => {
       if (cmd === "reorder_queue") return Promise.reject(new Error("NOT_FOUND"));
@@ -302,11 +448,8 @@ describe("QueueList", () => {
     });
     render(<QueueList />);
 
-    const rows = screen.getAllByRole("listitem");
-    fireEvent.dragStart(rows[2]);
-    fireEvent.dragOver(rows[0]);
     await act(async () => {
-      fireEvent.drop(rows[0]);
+      await dragRow(user, 2, rowCenterY(0));
     });
 
     // The optimistic 0 has been replaced by what the database actually holds,
