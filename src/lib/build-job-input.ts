@@ -1,5 +1,11 @@
 import { BEST_AUDIO_QUALITY_VALUE } from "@/lib/generic-quality-options";
-import type { CreateJobInput, GalleryMode, MediaSource, MediaType } from "@/types/download";
+import type {
+  CreateJobInput,
+  GalleryMode,
+  MediaSource,
+  MediaType,
+  OutputOptions,
+} from "@/types/download";
 
 export interface BuildJobInputArgs {
   preview: MediaSource;
@@ -15,6 +21,13 @@ export interface BuildJobInputArgs {
   selectedGalleryIndices?: number[];
   /** Only consulted when `preview.is_playlist`; defaults to `single_item`. */
   playlistScope?: "single_item" | "entire_playlist";
+  /** The output choices from `OutputOptionsPicker`. Omitting it is a supported
+   * call that yields the pre-Phase-2 behaviour exactly (see
+   * `CreateJobInput.output_options`), which is what the batch flow — with no
+   * picker of its own — still does. Never attached to a gallery job: those run
+   * through gallery-dl, which reads none of these fields (FR-234), so sending
+   * them would record a choice that was silently ignored. */
+  outputOptions?: OutputOptions;
 }
 
 /**
@@ -35,6 +48,7 @@ export function buildJobInput(args: BuildJobInputArgs): CreateJobInput {
     galleryMode,
     selectedGalleryIndices,
     playlistScope,
+    outputOptions,
   } = args;
 
   if (preview.is_gallery) {
@@ -79,5 +93,6 @@ export function buildJobInput(args: BuildJobInputArgs): CreateJobInput {
     output_directory: outputDirectory,
     playlist_scope: preview.is_playlist ? (playlistScope ?? "single_item") : undefined,
     title: preview.title,
+    ...(outputOptions ? { output_options: outputOptions } : {}),
   };
 }
