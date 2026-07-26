@@ -118,9 +118,14 @@ export interface AppError {
 export interface CreateJobInput {
   source_url: string;
   media_type: MediaType;
-  audio_quality?: string;
-  video_quality?: string;
+  /** `null` (or omitted) means "whatever the source actually has" — sent
+   * instead of a made-up number when the source published no bitrate at all,
+   * and for any job where the field doesn't apply. */
+  audio_quality?: string | null;
+  video_quality?: string | null;
   gallery_mode?: GalleryMode;
+  /** Omitted means "everything", which is deliberately not the same as a full
+   * list — see `DownloadJob.selected_gallery_indices`. */
   selected_gallery_indices?: number[];
   output_directory: string;
   playlist_scope?: "single_item" | "entire_playlist";

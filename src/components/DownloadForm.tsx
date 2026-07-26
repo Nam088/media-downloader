@@ -18,9 +18,9 @@ import { useQueueStore } from "@/stores/queue-store";
 import {
   GENERIC_PLAYLIST_AUDIO_QUALITIES,
   GENERIC_PLAYLIST_VIDEO_QUALITIES,
-  BEST_AUDIO_QUALITY_VALUE,
   audioQualityValue,
 } from "@/lib/generic-quality-options";
+import { buildJobInput } from "@/lib/build-job-input";
 import { formatDuration, formatFileSize } from "@/lib/format";
 import { extractUrlsFromText } from "@/lib/url-parsing";
 import type {
@@ -298,33 +298,16 @@ export function DownloadForm() {
     setSubmitting(true);
     setError(null);
     try {
-      const input: CreateJobInput =
-        mediaType === "gallery"
-          ? {
-              source_url: preview.source_url,
-              media_type: "gallery",
-              gallery_mode: galleryMode,
-              // Omit entirely (rather than an empty array) when every image
-              // is selected — semantically "everything", and keeps a
-              // wholesale "select all" job identical to how it behaved
-              // before per-image selection existed.
-              selected_gallery_indices:
-                selectedGalleryIndices.size === preview.gallery_items.filter((item) => !item.is_audio).length
-                  ? undefined
-                  : Array.from(selectedGalleryIndices),
-              output_directory: effectiveOutputDirectory,
-              title: preview.title,
-            }
-          : {
-              source_url: preview.source_url,
-              media_type: mediaType,
-              audio_quality:
-                mediaType === "audio" && audioQuality !== BEST_AUDIO_QUALITY_VALUE ? audioQuality : undefined,
-              video_quality: mediaType === "video" ? videoQuality : undefined,
-              output_directory: effectiveOutputDirectory,
-              playlist_scope: preview.is_playlist ? (scope ?? "single_item") : undefined,
-              title: preview.title,
-            };
+      const input: CreateJobInput = buildJobInput({
+        preview,
+        mediaType,
+        audioQuality,
+        videoQuality,
+        outputDirectory: effectiveOutputDirectory,
+        galleryMode,
+        selectedGalleryIndices: Array.from(selectedGalleryIndices),
+        playlistScope: scope,
+      });
       const createdJobs = await invoke<DownloadJob[]>("create_download_job", { input });
       useQueueStore.getState().upsertJobs(createdJobs);
       toast.success(t("downloadForm.added_to_queue"));
@@ -363,26 +346,20 @@ export function DownloadForm() {
         // per-item decisions" — for a gallery-backed link (no audio/video
         // quality concept at all), the closest equivalent is "keep just the
         // audio track", not a plain audio download that link doesn't have.
-        const input: CreateJobInput = previewResult.is_gallery
-          ? {
-              source_url: previewResult.source_url,
-              media_type: "gallery",
-              gallery_mode: "audio_only",
-              output_directory: effectiveOutputDirectory,
-              title: previewResult.title,
-            }
-          : {
-              source_url: previewResult.source_url,
-              media_type: "audio",
-              audio_quality: (() => {
-                if (previewResult.available_audio_formats.length === 0) return undefined;
-                const value = audioQualityValue(previewResult.available_audio_formats[0].bitrate_kbps);
-                return value === BEST_AUDIO_QUALITY_VALUE ? undefined : value;
-              })(),
-              output_directory: effectiveOutputDirectory,
-              playlist_scope: previewResult.is_playlist ? "single_item" : undefined,
-              title: previewResult.title,
-            };
+        const input: CreateJobInput = buildJobInput({
+          preview: previewResult,
+          mediaType: "audio",
+          audioQuality:
+            previewResult.available_audio_formats.length > 0
+              ? audioQualityValue(previewResult.available_audio_formats[0].bitrate_kbps)
+              : null,
+          videoQuality: null,
+          outputDirectory: effectiveOutputDirectory,
+          // Only consulted for a gallery-backed link, which has no
+          // audio/video quality concept at all — "keep just the audio track"
+          // is the closest equivalent to batch mode's plain audio download.
+          galleryMode: "audio_only",
+        });
         const createdJobs = await invoke<DownloadJob[]>("create_download_job", { input });
         useQueueStore.getState().upsertJobs(createdJobs);
       } catch (err) {
