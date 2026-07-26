@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Source of truth for every app icon. Regenerate the PNG/ICNS/ICO set with:
+         pnpm tauri icon src-tauri/icons/app-icon.svg
+
+       Design notes, so the next edit keeps what matters:
+
+       - One mark, two readings: a play triangle that is also an arrowhead.
+         The disc ring around it says "media", the tray under it says "saved
+         to disk". Each part is legible on its own, so none of them has to be
+         understood for the icon to work.
+       - The smallest target is 32x32, and that is the constraint the whole
+         design answers. Every element is a solid fill with generous weight;
+         the ring is 46px thick on a 1024 grid, which is still over one pixel
+         at 32. Thin strokes or a fourth element would turn to mush there.
+       - The green is the app's own primary token, oklch(0.55 0.17 162),
+         converted to sRGB. The tile gradient runs light-to-dark top-to-bottom
+         so the icon holds its shape on both light and dark desktops, and the
+         soft highlight at the top keeps it from reading as a flat sticker.
+       - Corner radius is 22% of the side, the squircle ratio macOS and iOS
+         use. Windows crops its own shape from this and is unaffected. -->
+  <defs>
+    <linearGradient id="tile" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#00C48F"/>
+      <stop offset="0.55" stop-color="#009159"/>
+      <stop offset="1" stop-color="#00572A"/>
+    </linearGradient>
+
+    <!-- Light falling from above. Kept very soft: at 32x32 it should read as
+         "this shape has volume", never as a visible second colour. -->
+    <radialGradient id="sheen" cx="0.5" cy="0.08" r="0.85">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.30"/>
+      <stop offset="0.55" stop-color="#FFFFFF" stop-opacity="0.06"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Grounds the white mark against the tile. Without it the mark looks
+         pasted on at large sizes; the blur is wide enough that it disappears
+         entirely at small ones rather than muddying the edges. -->
+    <filter id="lift" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#00301A" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+
+  <rect x="96" y="96" width="832" height="832" rx="186" fill="url(#tile)"/>
+  <rect x="96" y="96" width="832" height="832" rx="186" fill="url(#sheen)"/>
+
+  <g filter="url(#lift)">
+    <!-- Shaft and head are one arrow, drawn as two shapes that overlap by
+         60px so they never separate into "a bar above a triangle" at any
+         size. The head is deliberately wide — 400px against a 144px shaft —
+         because a timid arrowhead is what makes a download glyph look like
+         clip-art. -->
+    <rect x="440" y="228" width="144" height="300" rx="72" fill="#FFFFFF"/>
+    <path d="M 312 468 L 712 468 L 512 748 Z"
+          fill="#FFFFFF" stroke="#FFFFFF" stroke-width="40" stroke-linejoin="round"/>
+
+    <!-- The tray the arrow lands in. Narrower than the arrowhead on purpose:
+         equal widths read as two stacked bars, while a shorter base reads as
+         the arrow arriving somewhere. -->
+    <rect x="352" y="812" width="320" height="86" rx="43" fill="#FFFFFF"/>
+  </g>
+</svg>

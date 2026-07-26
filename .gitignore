@@ -9,6 +9,7 @@ dist-ssr
 /src-tauri/binaries/ffmpeg
 /src-tauri/binaries/yt-dlp*
 /src-tauri/binaries/gallery-dl*
+/src-tauri/binaries/spotiflac*
 /src-tauri/gen
 
 # Logs
@@ -48,3 +49,7 @@ Thumbs.db
 
 # Testing
 coverage
+
+# `tauri icon` also emits mobile icon sets; this app is desktop-only.
+src-tauri/icons/android/
+src-tauri/icons/ios/
