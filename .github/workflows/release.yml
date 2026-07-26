@@ -65,9 +65,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Node 20 broke the build: with no `packageManager` field in
+      # package.json, corepack resolved pnpm to whatever was newest — 11.17.0 —
+      # which imports `node:sqlite`, a builtin that only exists from Node 22.5.
+      # Every run died before installing a single dependency.
+      #
+      # The real fix is the `packageManager` pin in package.json, so CI runs
+      # the exact pnpm the developer runs instead of drifting to latest on some
+      # unrelated upstream release day. This bump is the second half: even a
+      # pinned pnpm needs an interpreter new enough for it.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
       - run: corepack enable
 
       - uses: dtolnay/rust-toolchain@stable
