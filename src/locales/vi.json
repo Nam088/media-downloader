@@ -19,7 +19,13 @@
     "language_label": "Ngôn ngữ",
     "default_output_directory_label": "Thư mục lưu mặc định",
     "show_logs_tab_label": "Hiện tab Nhật ký",
-    "show_logs_tab_hint": "Thêm tab Nhật ký hiển thị hoạt động gần đây của backend — hữu ích khi cần debug lượt tải bị lỗi"
+    "show_logs_tab_hint": "Thêm tab Nhật ký hiển thị hoạt động gần đây của backend — hữu ích khi cần debug lượt tải bị lỗi",
+    "max_concurrent_label": "Số lượt tải song song",
+    "max_concurrent_hint": "Số lượt tải chạy cùng lúc ({{min}}–{{max}}). Nhiều hơn không hẳn là nhanh hơn — trang nguồn cũng giới hạn tốc độ.",
+    "rate_limit_label": "Giới hạn tốc độ (KB/s)",
+    "rate_limit_hint": "0 nghĩa là không giới hạn. Giới hạn này áp dụng cho từng lượt tải, không phải cho tổng của cả ứng dụng — khi có {{concurrency}} lượt tải chạy cùng lúc, tốc độ cộng lại có thể lên tới {{concurrency}}× con số này.",
+    "background_label": "Tiếp tục chạy nền",
+    "background_hint": "Đóng cửa sổ sẽ thu nhỏ ứng dụng xuống khay hệ thống và các lượt tải vẫn chạy tiếp."
   },
   "theme": {
     "toggle_label": "Đổi giao diện",
@@ -68,6 +74,13 @@
     "playlist_progress": "{{completed}}/{{total}} hoàn tất",
     "collapse_group": "Thu gọn",
     "expand_group": "Mở rộng",
+    "pause_all": "Tạm dừng tất cả",
+    "resume_all": "Tiếp tục tất cả",
+    "cancel_all": "Huỷ tất cả",
+    "confirm_cancel_all": "Xác nhận huỷ tất cả",
+    "clear_finished": "Xoá lượt tải đã xong",
+    "retry_countdown": "Thử lại sau {{seconds}}s (lần {{attempt}})",
+    "reorder_failed": "Không thể sắp xếp lại hàng đợi.",
     "status": {
       "queued": "Đang chờ",
       "fetching_metadata": "Đang lấy thông tin…",
@@ -103,6 +116,7 @@
     "download_gallery_button": "Tải xuống",
     "added_to_queue": "Đã thêm vào hàng đợi tải",
     "gallery_item_count_other": "Tìm thấy {{count}} tệp",
+    "gallery_item_label": "Ảnh {{number}}",
     "gallery_selected_count": "Đã chọn {{selected}}/{{total}} ảnh",
     "gallery_select_all": "Chọn tất cả",
     "gallery_select_none": "Bỏ chọn hết",

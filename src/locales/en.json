@@ -19,7 +19,13 @@
     "language_label": "Language",
     "default_output_directory_label": "Default save folder",
     "show_logs_tab_label": "Show Logs tab",
-    "show_logs_tab_hint": "Adds a Logs tab with recent backend activity — useful for debugging a failed download"
+    "show_logs_tab_hint": "Adds a Logs tab with recent backend activity — useful for debugging a failed download",
+    "max_concurrent_label": "Concurrent downloads",
+    "max_concurrent_hint": "How many downloads run at the same time ({{min}}–{{max}}). More is not always faster — sources rate-limit too.",
+    "rate_limit_label": "Speed limit (KB/s)",
+    "rate_limit_hint": "0 means unlimited. The limit applies per download, not to the app total — with {{concurrency}} running at once the combined speed can reach {{concurrency}}× this number.",
+    "background_label": "Keep running in the background",
+    "background_hint": "Closing the window minimises to the system tray and downloads keep going."
   },
   "theme": {
     "toggle_label": "Change theme",
@@ -68,6 +74,13 @@
     "playlist_progress": "{{completed}}/{{total}} completed",
     "collapse_group": "Collapse",
     "expand_group": "Expand",
+    "pause_all": "Pause all",
+    "resume_all": "Resume all",
+    "cancel_all": "Cancel all",
+    "confirm_cancel_all": "Confirm cancel all",
+    "clear_finished": "Clear finished",
+    "retry_countdown": "Retrying in {{seconds}}s (attempt {{attempt}})",
+    "reorder_failed": "Could not reorder the queue.",
     "status": {
       "queued": "Queued",
       "fetching_metadata": "Fetching info…",
@@ -104,6 +117,7 @@
     "added_to_queue": "Added to the download queue",
     "gallery_item_count_one": "{{count}} file found",
     "gallery_item_count_other": "{{count}} files found",
+    "gallery_item_label": "Image {{number}}",
     "gallery_selected_count": "{{selected}} of {{total}} images selected",
     "gallery_select_all": "Select all",
     "gallery_select_none": "Select none",
