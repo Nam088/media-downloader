@@ -1,7 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
+  ChevronLeft,
+  ChevronRight,
   FileAudio,
   FileVideo,
   FolderOpen,
@@ -18,8 +20,9 @@ import {
 
 import { Button } from "@/components/ui/button";
 import { formatDuration, formatFileSize, formatPlatformLabel } from "@/lib/format";
+import { pageNumbers, totalPagesOf } from "@/lib/pagination";
 import { cn } from "@/lib/utils";
-import { hasActiveFilters, useLibraryStore } from "@/stores/library-store";
+import { LIBRARY_PAGE_SIZES, hasActiveFilters, useLibraryStore } from "@/stores/library-store";
 import type { MediaType } from "@/types/download";
 import type { LibraryItem } from "@/types/library";
 
@@ -41,10 +44,10 @@ interface LibraryGridProps {
 /**
  * FR-306 + FR-310 + FR-311 — lưới ảnh, danh sách gọn, và hai trạng thái rỗng.
  *
- * Về quy mô: mỗi lần chỉ có `LIBRARY_PAGE_SIZE` mục đi qua IPC, và trang kế
- * tiếp chỉ được xin khi người dùng thật sự cuộn tới đáy. Ảnh đại diện mang
- * `loading="lazy"`, nên trình duyệt chỉ tải ảnh của những ô đang ở gần khung
- * nhìn — điều kiện "không nạp toàn bộ ảnh cùng lúc" của FR-310.
+ * Về quy mô: mỗi lần chỉ có một trang mục đi qua IPC, và trang kế tiếp chỉ được
+ * xin khi người dùng bấm sang nó. Ảnh đại diện mang `loading="lazy"`, nên trình
+ * duyệt chỉ tải ảnh của những ô đang ở gần khung nhìn — điều kiện "không nạp
+ * toàn bộ ảnh cùng lúc" của FR-310.
  *
  * Về dữ liệu thật: trong CSDL hiện tại KHÔNG mục nào có ảnh đại diện và KHÔNG
  * mục nào có thời lượng — cả hai chỉ được ghi lại từ Phase 3 trở đi. Nên hai
@@ -57,32 +60,12 @@ export function LibraryGrid({ onPreview, onRequest }: LibraryGridProps) {
   const items = useLibraryStore((state) => state.items);
   const viewMode = useLibraryStore((state) => state.viewMode);
   const loading = useLibraryStore((state) => state.loading);
-  const loadingMore = useLibraryStore((state) => state.loadingMore);
-  const hasMore = useLibraryStore((state) => state.hasMore);
-  const loadMore = useLibraryStore((state) => state.loadMore);
   const filters = useLibraryStore((state) => state.filters);
   const clearFilters = useLibraryStore((state) => state.clearFilters);
   const selectedIds = useLibraryStore((state) => state.selectedIds);
   const toggleSelected = useLibraryStore((state) => state.toggleSelected);
   const redownloadItem = useLibraryStore((state) => state.redownloadItem);
   const revealItem = useLibraryStore((state) => state.revealItem);
-
-  const sentinelRef = useRef<HTMLDivElement | null>(null);
-
-  // Cuộn tới đáy thì xin trang tiếp theo. Nút bấm bên dưới vẫn ở đó và làm
-  // đúng việc ấy — `IntersectionObserver` chỉ là đường tắt cho chuột, không
-  // phải điều kiện để tính năng hoạt động.
-  useEffect(() => {
-    const sentinel = sentinelRef.current;
-    if (!sentinel || !hasMore) return;
-    if (typeof IntersectionObserver === "undefined") return;
-
-    const observer = new IntersectionObserver((entries) => {
-      if (entries.some((entry) => entry.isIntersecting)) void loadMore();
-    });
-    observer.observe(sentinel);
-    return () => observer.disconnect();
-  }, [hasMore, loadMore, items.length]);
 
   if (loading && items.length === 0) {
     return (
@@ -161,20 +144,103 @@ export function LibraryGrid({ onPreview, onRequest }: LibraryGridProps) {
         )}
       </ul>
 
-      <div ref={sentinelRef} />
+      <LibraryPagination />
+    </div>
+  );
+}
 
-      {hasMore && (
+/**
+ * Thanh phân trang — cùng ngôn ngữ hình ảnh với trang Lịch sử: chọn cỡ trang ở
+ * trái, `‹ 1 … 4 5 6 … 20 ›` ở phải, trang đang xem là nút đặc.
+ *
+ * Phần thuật toán (`pageNumbers`, `totalPagesOf`) nằm ở `@/lib/pagination` để
+ * hai danh sách không thể gấp khác nhau; phần đánh dấu ở lại đây vì hai trang
+ * có `data-testid` riêng và nhịp bố cục riêng.
+ */
+function LibraryPagination() {
+  const { t } = useTranslation();
+  const page = useLibraryStore((state) => state.page);
+  const pageSize = useLibraryStore((state) => state.pageSize);
+  const totalItems = useLibraryStore((state) => state.totalItems);
+  const setPage = useLibraryStore((state) => state.setPage);
+  const setPageSize = useLibraryStore((state) => state.setPageSize);
+
+  const totalPages = totalPagesOf(totalItems, pageSize);
+
+  return (
+    <div
+      className="flex flex-wrap items-center justify-between gap-3 pt-1"
+      data-testid="library-pagination"
+    >
+      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+        <label className="sr-only" htmlFor="library-page-size">
+          {t("library.page_size_label")}
+        </label>
+        <select
+          id="library-page-size"
+          value={pageSize}
+          onChange={(event) => void setPageSize(Number(event.target.value))}
+          data-testid="library-page-size"
+          className="h-8 rounded-lg border border-border/80 bg-card px-2 text-xs shadow-2xs"
+        >
+          {LIBRARY_PAGE_SIZES.map((size) => (
+            <option key={size} value={size}>
+              {size}
+            </option>
+          ))}
+        </select>
+        <span data-testid="library-page-label">
+          {t("library.page_label", { current: page, total: totalPages })}
+        </span>
+      </div>
+
+      <div className="flex items-center gap-1">
         <Button
           variant="outline"
-          size="sm"
-          className="mx-auto"
-          disabled={loadingMore}
-          onClick={() => void loadMore()}
-          data-testid="library-load-more"
+          size="icon"
+          className="h-8 w-8"
+          disabled={page <= 1}
+          onClick={() => void setPage(page - 1)}
+          aria-label={t("library.prev_page")}
+          data-testid="library-prev-page"
         >
-          {loadingMore ? t("common.loading") : t("library.load_more")}
+          <ChevronLeft className="h-4 w-4" />
         </Button>
-      )}
+        {pageNumbers(page, totalPages).map((token, index) =>
+          token === "ellipsis" ? (
+            <span
+              key={`ellipsis-${index}`}
+              aria-hidden
+              className="px-1 text-xs text-muted-foreground"
+            >
+              …
+            </span>
+          ) : (
+            <Button
+              key={token}
+              variant={token === page ? "default" : "outline"}
+              size="icon"
+              className="h-8 w-8 text-xs"
+              aria-current={token === page ? "page" : undefined}
+              onClick={() => void setPage(token)}
+              data-testid={`library-page-${token}`}
+            >
+              {token}
+            </Button>
+          ),
+        )}
+        <Button
+          variant="outline"
+          size="icon"
+          className="h-8 w-8"
+          disabled={page >= totalPages}
+          onClick={() => void setPage(page + 1)}
+          aria-label={t("library.next_page")}
+          data-testid="library-next-page"
+        >
+          <ChevronRight className="h-4 w-4" />
+        </Button>
+      </div>
     </div>
   );
 }

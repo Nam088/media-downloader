@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 use crate::models::{
-    AppSettings, DownloadJob, GalleryMode, JobStatus, LibraryBreakdownEntry, LibraryItem,
-    LibraryQuery, LibraryStats, MediaType, NewLibraryFile, OutputOptions,
+    AppSettings, DownloadJob, GalleryMode, HistoryQuery, JobStatus, LibraryBreakdownEntry,
+    LibraryItem, LibraryQuery, LibraryStats, MediaType, NewLibraryFile, OutputOptions,
 };
 
 fn migrations() -> Migrations<'static> {
@@ -247,6 +247,53 @@ impl Db {
             jobs.push(row?);
         }
         Ok(jobs)
+    }
+
+    /// Một trang Lịch sử: mới nhất trước (`updated_at DESC`), lọc ở backend
+    /// (trạng thái tab + tìm kiếm) nên số trang từ `count_history` luôn khớp
+    /// với đúng tập đang hiển thị (SC tương tự FR-328 của Library) — thay cho
+    /// cách cũ nạp cả bảng rồi lọc trong bộ nhớ giao diện.
+    pub fn list_history_page(&self, query: &HistoryQuery) -> Result<Vec<DownloadJob>, AppError> {
+        let conn = self.conn();
+        let filter = HistoryFilterSql::build(query);
+        let sql = format!(
+            "SELECT * FROM download_jobs {} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+            filter.where_clause
+        );
+        let mut params = filter.params;
+        params.push(Box::new(query.limit));
+        params.push(Box::new(query.offset));
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), row_to_job)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(AppError::from)
+    }
+
+    /// Tổng số dòng khớp CÙNG bộ lọc mà `list_history_page` vừa dùng — cố ý
+    /// KHÔNG áp `limit`/`offset`, vì số trang mô tả cả tập kết quả chứ không
+    /// phải một trang riêng lẻ.
+    pub fn count_history(&self, query: &HistoryQuery) -> Result<i64, AppError> {
+        let conn = self.conn();
+        let filter = HistoryFilterSql::build(query);
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM download_jobs {}", filter.where_clause),
+            rusqlite::params_from_iter(filter.params.iter()),
+            |row| row.get(0),
+        )
+        .map_err(AppError::from)
+    }
+
+    /// Xoá mọi tác vụ đang ở một trong các trạng thái đã cho, trả về số dòng
+    /// bị xoá. Dùng cho "Xoá lịch sử" — chỉ động tới bản ghi tác vụ, KHÔNG
+    /// đụng tới file đã tải hay bảng `downloaded_files` (đó là việc của
+    /// Library, một khái niệm khác).
+    pub fn delete_jobs_by_statuses(&self, statuses: &[JobStatus]) -> Result<usize, AppError> {
+        let conn = self.conn();
+        let placeholders = statuses.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("DELETE FROM download_jobs WHERE status IN ({placeholders})");
+        let status_strs: Vec<&str> = statuses.iter().map(|s| s.as_str()).collect();
+        let count = conn.execute(&sql, rusqlite::params_from_iter(status_strs))?;
+        Ok(count)
     }
 
     // ---- truy vấn điều phối hàng đợi ----------------------------------
@@ -1422,6 +1469,48 @@ pub struct LibraryFileState {
     pub file_size_bytes: i64,
 }
 
+/// Mệnh đề `WHERE` cùng tham số của nó, dựng từ [`HistoryQuery`]. Luôn ép
+/// thêm điều kiện thuộc ba trạng thái kết thúc — Lịch sử không bao giờ trả về
+/// một tác vụ đang chạy hay đang chờ, bất kể `query.status` là gì.
+struct HistoryFilterSql {
+    where_clause: String,
+    params: Vec<Box<dyn rusqlite::ToSql>>,
+}
+
+impl HistoryFilterSql {
+    fn build(query: &HistoryQuery) -> Self {
+        let mut clauses = vec!["status IN (?, ?, ?)".to_string()];
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(JobStatus::Completed.as_str().to_string()),
+            Box::new(JobStatus::Failed.as_str().to_string()),
+            Box::new(JobStatus::Canceled.as_str().to_string()),
+        ];
+
+        if let Some(status) = &query.status {
+            clauses.push("status = ?".to_string());
+            params.push(Box::new(status.as_str().to_string()));
+        }
+
+        if let Some(search) = query.search.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let needle = format!("%{}%", escape_like(&search.to_lowercase()));
+            clauses.push(
+                "(LOWER(source_url) LIKE ? ESCAPE '\\'
+                  OR LOWER(COALESCE(output_file_path, '')) LIKE ? ESCAPE '\\'
+                  OR LOWER(platform) LIKE ? ESCAPE '\\')"
+                    .to_string(),
+            );
+            params.push(Box::new(needle.clone()));
+            params.push(Box::new(needle.clone()));
+            params.push(Box::new(needle));
+        }
+
+        HistoryFilterSql {
+            where_clause: format!("WHERE {}", clauses.join(" AND ")),
+            params,
+        }
+    }
+}
+
 /// Mệnh đề `WHERE` cùng tham số của nó, dựng từ [`LibraryQuery`].
 ///
 /// Mọi giá trị đều đi qua tham số bind (`?`), kể cả những chỗ trông như hằng —
@@ -1658,6 +1747,180 @@ mod tests {
         // một chỗ là ghi nhầm cột mà vẫn chạy trót lọt. So sánh nguyên cả bản
         // ghi canh giữ đủ 25 cột, chứ không riêng ba cột vừa thêm.
         assert_eq!(loaded, job);
+    }
+
+    fn job_with_status(id: &str, status: JobStatus, updated_at: &str) -> DownloadJob {
+        let mut job = sample_job(id);
+        job.status = status;
+        job.updated_at = updated_at.to_string();
+        job
+    }
+
+    fn history_query(limit: i64, offset: i64) -> HistoryQuery {
+        HistoryQuery {
+            limit,
+            offset,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn paginates_history_most_recent_first() {
+        let db = temp_db();
+        db.insert_job(&job_with_status(
+            "a",
+            JobStatus::Completed,
+            "2026-07-26T00:00:01Z",
+        ))
+        .unwrap();
+        db.insert_job(&job_with_status(
+            "b",
+            JobStatus::Completed,
+            "2026-07-26T00:00:03Z",
+        ))
+        .unwrap();
+        db.insert_job(&job_with_status(
+            "c",
+            JobStatus::Failed,
+            "2026-07-26T00:00:02Z",
+        ))
+        .unwrap();
+        // A still-active job must never leak into a history page.
+        db.insert_job(&job_with_status(
+            "d",
+            JobStatus::Downloading,
+            "2026-07-26T00:00:04Z",
+        ))
+        .unwrap();
+
+        let page1 = db.list_history_page(&history_query(2, 0)).unwrap();
+        assert_eq!(
+            page1.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            vec!["b", "c"]
+        );
+
+        let page2 = db.list_history_page(&history_query(2, 2)).unwrap();
+        assert_eq!(
+            page2.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            vec!["a"]
+        );
+    }
+
+    #[test]
+    fn counts_the_same_filter_the_page_uses_ignoring_limit_and_offset() {
+        let db = temp_db();
+        for i in 0..5 {
+            db.insert_job(&job_with_status(
+                &format!("job-{i}"),
+                JobStatus::Completed,
+                &format!("2026-07-26T00:00:0{i}Z"),
+            ))
+            .unwrap();
+        }
+        db.insert_job(&job_with_status(
+            "still-running",
+            JobStatus::Downloading,
+            "2026-07-26T00:00:09Z",
+        ))
+        .unwrap();
+
+        assert_eq!(db.count_history(&history_query(2, 0)).unwrap(), 5);
+    }
+
+    #[test]
+    fn filters_history_to_a_single_tab_status() {
+        let db = temp_db();
+        db.insert_job(&job_with_status(
+            "done",
+            JobStatus::Completed,
+            "2026-07-26T00:00:01Z",
+        ))
+        .unwrap();
+        db.insert_job(&job_with_status(
+            "broke",
+            JobStatus::Failed,
+            "2026-07-26T00:00:02Z",
+        ))
+        .unwrap();
+
+        let query = HistoryQuery {
+            status: Some(JobStatus::Failed),
+            ..history_query(10, 0)
+        };
+        let page = db.list_history_page(&query).unwrap();
+        assert_eq!(
+            page.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            vec!["broke"]
+        );
+        assert_eq!(db.count_history(&query).unwrap(), 1);
+    }
+
+    #[test]
+    fn filters_history_by_search_across_url_file_and_platform() {
+        let db = temp_db();
+        let mut matches_platform =
+            job_with_status("a", JobStatus::Completed, "2026-07-26T00:00:01Z");
+        matches_platform.platform = "tiktok".to_string();
+        db.insert_job(&matches_platform).unwrap();
+
+        let mut matches_file = job_with_status("b", JobStatus::Completed, "2026-07-26T00:00:02Z");
+        matches_file.output_file_path = Some("/out/My TikTok Clip.mp4".to_string());
+        db.insert_job(&matches_file).unwrap();
+
+        let mut no_match = job_with_status("c", JobStatus::Completed, "2026-07-26T00:00:03Z");
+        no_match.platform = "youtube".to_string();
+        db.insert_job(&no_match).unwrap();
+
+        let query = HistoryQuery {
+            search: Some("tiktok".to_string()),
+            ..history_query(10, 0)
+        };
+        let ids: Vec<String> = db
+            .list_history_page(&query)
+            .unwrap()
+            .into_iter()
+            .map(|j| j.id)
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"a".to_string()));
+        assert!(ids.contains(&"b".to_string()));
+        assert_eq!(db.count_history(&query).unwrap(), 2);
+    }
+
+    #[test]
+    fn deletes_only_the_requested_statuses() {
+        let db = temp_db();
+        db.insert_job(&job_with_status(
+            "a",
+            JobStatus::Completed,
+            "2026-07-26T00:00:01Z",
+        ))
+        .unwrap();
+        db.insert_job(&job_with_status(
+            "b",
+            JobStatus::Failed,
+            "2026-07-26T00:00:02Z",
+        ))
+        .unwrap();
+        db.insert_job(&job_with_status(
+            "c",
+            JobStatus::Downloading,
+            "2026-07-26T00:00:03Z",
+        ))
+        .unwrap();
+
+        let deleted = db
+            .delete_jobs_by_statuses(&[
+                JobStatus::Completed,
+                JobStatus::Failed,
+                JobStatus::Canceled,
+            ])
+            .unwrap();
+
+        assert_eq!(deleted, 2);
+        assert!(db.get_job("a").unwrap().is_none());
+        assert!(db.get_job("b").unwrap().is_none());
+        assert!(db.get_job("c").unwrap().is_some());
     }
 
     #[test]

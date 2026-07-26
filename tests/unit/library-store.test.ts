@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 
 import {
-  LIBRARY_PAGE_SIZE,
+  DEFAULT_LIBRARY_PAGE_SIZE,
   SEARCH_DEBOUNCE_MS,
   hasActiveFilters,
   useLibraryStore,
@@ -46,18 +46,54 @@ function makeItem(overrides: Partial<LibraryItem> = {}): LibraryItem {
   };
 }
 
-const STATS: LibraryStats = {
-  total_items: 3,
-  total_size_bytes: 3072,
-  missing_items: 1,
-  by_platform: [{ key: "youtube", item_count: 3, total_size_bytes: 3072 }],
-  by_media_type: [{ key: "audio", item_count: 3, total_size_bytes: 3072 }],
-  formats: ["mp3"],
-};
+/** Statistics the way the backend computes them: *through* the query it was
+ * handed. A fake that ignored the filter would make "the count describes the
+ * page" impossible to get wrong. */
+function statsFor(items: LibraryItem[]): LibraryStats {
+  const group = (pick: (item: LibraryItem) => string) => {
+    const totals = new Map<string, { item_count: number; total_size_bytes: number }>();
+    for (const item of items) {
+      const bucket = totals.get(pick(item)) ?? { item_count: 0, total_size_bytes: 0 };
+      bucket.item_count += 1;
+      bucket.total_size_bytes += item.file_size_bytes;
+      totals.set(pick(item), bucket);
+    }
+    return [...totals].map(([key, bucket]) => ({ key, ...bucket }));
+  };
+
+  return {
+    total_items: items.length,
+    total_size_bytes: items.reduce((sum, item) => sum + item.file_size_bytes, 0),
+    missing_items: items.filter((item) => item.is_missing).length,
+    by_platform: group((item) => item.platform),
+    by_media_type: group((item) => item.media_type),
+    formats: [...new Set(items.map((item) => item.file_format))],
+  };
+}
+
+/** The rows a query selects, before paging. Only the filters these tests
+ * exercise are honoured — the rest is the backend's SQL and its own tests. */
+function matching(query: LibraryQuery): LibraryItem[] {
+  return backendItems.filter((item) => {
+    if (query.platforms?.length && !query.platforms.includes(item.platform)) return false;
+    if (query.media_types?.length && !query.media_types.includes(item.media_type)) return false;
+    if (query.search && !item.title.toLowerCase().includes(query.search.toLowerCase()))
+      return false;
+    return true;
+  });
+}
 
 /** `Array.prototype.at` is ES2022 and `tsconfig.json` targets ES2020. */
 function last<T>(values: T[]): T {
   return values[values.length - 1];
+}
+
+/** Waits for a reload the store kicked off without handing back a promise
+ * (`togglePlatform`, `setSort`, the debounced search). `loading` is set
+ * synchronously by the caller, so it is already `true` by the time we get here
+ * and this cannot pass on the *previous* load. */
+async function settled(): Promise<void> {
+  await vi.waitFor(() => expect(useLibraryStore.getState().loading).toBe(false));
 }
 
 function queriesFor(command: string): LibraryQuery[] {
@@ -86,8 +122,9 @@ function resetStore() {
     viewMode: "grid",
     selectedIds: [],
     loading: false,
-    loadingMore: false,
-    hasMore: false,
+    page: 1,
+    pageSize: DEFAULT_LIBRARY_PAGE_SIZE,
+    totalItems: 0,
     reconciling: false,
     error: null,
     initialized: false,
@@ -106,11 +143,21 @@ beforeEach(() => {
 
     if (command === "list_library") {
       const query = (parameters.query ?? {}) as LibraryQuery;
+      const rows = matching(query);
       const offset = query.offset ?? 0;
-      const limit = query.limit ?? backendItems.length;
-      return backendItems.slice(offset, offset + limit) as never;
+      const limit = query.limit ?? rows.length;
+      return rows.slice(offset, offset + limit) as never;
     }
-    if (command === "library_stats") return STATS as never;
+    if (command === "library_stats") {
+      return statsFor(matching((parameters.query ?? {}) as LibraryQuery)) as never;
+    }
+    if (command === "delete_library_items" || command === "remove_library_items") {
+      // A real delete makes the row stop existing; a fake that kept it would
+      // let a page reload quietly resurrect it.
+      const removed = new Set(parameters.itemIds as string[]);
+      backendItems = backendItems.filter((item) => !removed.has(item.id));
+      return removed.size as never;
+    }
     return undefined as never;
   });
 });
@@ -211,52 +258,186 @@ describe("library store — filters (FR-308)", () => {
   });
 
   it("measures the statistics through the same filters as the list (SC-307)", async () => {
+    const unfiltered = statsFor(backendItems).by_platform;
     // The unfiltered first load is where the filter choices come from.
     await useLibraryStore.getState().reload();
-    expect(useLibraryStore.getState().facets?.by_platform).toEqual(STATS.by_platform);
+    expect(useLibraryStore.getState().facets?.by_platform).toEqual(unfiltered);
 
     useLibraryStore.getState().togglePlatform("tiktok");
     await useLibraryStore.getState().reload();
 
     expect(last(queriesFor("library_stats")).platforms).toEqual(["tiktok"]);
+    // Nothing in the fixture is from TikTok, so the *measured* breakdown is
+    // now empty…
+    expect(useLibraryStore.getState().stats?.by_platform).toEqual([]);
     // …but the filter *choices* stay the unfiltered snapshot, or picking one
     // platform would delete every other platform from the filter itself.
-    expect(useLibraryStore.getState().facets?.by_platform).toEqual(STATS.by_platform);
+    expect(useLibraryStore.getState().facets?.by_platform).toEqual(unfiltered);
   });
 });
 
-describe("library store — paging (FR-310)", () => {
-  it("never asks for the whole library in one call", async () => {
-    backendItems = Array.from({ length: 10_000 }, (_unused, index) =>
-      makeItem({ id: `item-${index}` }),
+describe("library store — numbered paging (FR-310)", () => {
+  /** The user's real library, in the shape that makes the page bar interesting:
+   * 66 rows is four pages at the default size, not one and not twenty. */
+  function fillBackend(count: number) {
+    backendItems = Array.from({ length: count }, (_unused, index) =>
+      makeItem({ id: `i${index}`, title: `Track ${index}` }),
     );
+  }
+
+  it("never asks for the whole library in one call", async () => {
+    fillBackend(10_000);
 
     await useLibraryStore.getState().reload();
 
     const first = queriesFor("list_library")[0];
-    expect(first.limit).toBe(LIBRARY_PAGE_SIZE);
+    expect(first.limit).toBe(DEFAULT_LIBRARY_PAGE_SIZE);
     expect(first.offset).toBe(0);
-    expect(useLibraryStore.getState().items).toHaveLength(LIBRARY_PAGE_SIZE);
-    expect(useLibraryStore.getState().hasMore).toBe(true);
+    expect(useLibraryStore.getState().items).toHaveLength(DEFAULT_LIBRARY_PAGE_SIZE);
+    expect(useLibraryStore.getState().page).toBe(1);
+    // The whole point of a numbered bar: it knows how many pages there are
+    // before the user has walked to the end of them.
+    expect(useLibraryStore.getState().totalItems).toBe(10_000);
   });
 
-  it("asks for the next page from where the loaded rows end", async () => {
-    backendItems = Array.from({ length: 150 }, (_unused, index) => makeItem({ id: `i${index}` }));
+  it("asks page N for the rows page N covers, not for everything up to it", async () => {
+    fillBackend(66);
 
     await useLibraryStore.getState().reload();
-    await useLibraryStore.getState().loadMore();
+    await useLibraryStore.getState().setPage(4);
 
-    expect(last(queriesFor("list_library")).offset).toBe(LIBRARY_PAGE_SIZE);
-    expect(useLibraryStore.getState().items).toHaveLength(LIBRARY_PAGE_SIZE * 2);
-    expect(useLibraryStore.getState().items.map((item) => item.id)).toContain("i0");
+    const query = last(queriesFor("list_library"));
+    expect(query.offset).toBe(3 * DEFAULT_LIBRARY_PAGE_SIZE);
+    expect(query.limit).toBe(DEFAULT_LIBRARY_PAGE_SIZE);
+    // Page four of 66 rows is the leftover six, and it holds only those six —
+    // an infinite-scroll store would be sitting on all 66 by now.
+    expect(useLibraryStore.getState().items.map((item) => item.id)).toEqual([
+      "i60",
+      "i61",
+      "i62",
+      "i63",
+      "i64",
+      "i65",
+    ]);
+    expect(useLibraryStore.getState().page).toBe(4);
   });
 
-  it("stops paging once a short page proves the end was reached", async () => {
+  it("pages by the size the user picked", async () => {
+    fillBackend(66);
     await useLibraryStore.getState().reload();
-    expect(useLibraryStore.getState().hasMore).toBe(false);
 
-    await useLibraryStore.getState().loadMore();
-    expect(queriesFor("list_library")).toHaveLength(1);
+    await useLibraryStore.getState().setPageSize(10);
+    await useLibraryStore.getState().setPage(3);
+
+    const query = last(queriesFor("list_library"));
+    expect(query.limit).toBe(10);
+    expect(query.offset).toBe(20);
+    expect(useLibraryStore.getState().items.map((item) => item.id)[0]).toBe("i20");
+  });
+
+  it("takes the count from the same query it took the page from", async () => {
+    fillBackend(66);
+    backendItems.push(
+      makeItem({ id: "tt", title: "TikTok one", platform: "tiktok" }),
+      makeItem({ id: "tt2", title: "TikTok two", platform: "tiktok" }),
+    );
+    await useLibraryStore.getState().reload();
+
+    useLibraryStore.getState().togglePlatform("tiktok");
+    await settled();
+
+    const page = last(queriesFor("list_library"));
+    const count = last(queriesFor("library_stats"));
+    // Every filter that shaped the page also shaped the count: a total taken
+    // through a different question would promise pages the list cannot fill.
+    expect(count.platforms).toEqual(page.platforms);
+    expect(count.media_types).toEqual(page.media_types);
+    expect(count.search).toEqual(page.search);
+    expect(count.downloaded_from).toEqual(page.downloaded_from);
+    expect(count.downloaded_to).toEqual(page.downloaded_to);
+    expect(count.is_missing).toEqual(page.is_missing);
+    // …and only the window differs, because a limited count would count the
+    // window instead of the library.
+    expect(count.limit).toBeNull();
+    expect(count.offset).toBeNull();
+    // The filtered total is the two TikTok rows, not all 68.
+    expect(useLibraryStore.getState().totalItems).toBe(2);
+  });
+
+  it("starts over at page one when the question changes", async () => {
+    fillBackend(66);
+    await useLibraryStore.getState().reload();
+    await useLibraryStore.getState().setPage(3);
+    expect(useLibraryStore.getState().page).toBe(3);
+
+    useLibraryStore.getState().togglePlatform("youtube");
+    await settled();
+
+    expect(last(queriesFor("list_library")).platforms).toEqual(["youtube"]);
+    // "Page 3 of the previous question" points at nothing in particular.
+    expect(last(queriesFor("list_library")).offset).toBe(0);
+    expect(useLibraryStore.getState().page).toBe(1);
+  });
+
+  it("starts over at page one when the sort order changes", async () => {
+    fillBackend(66);
+    await useLibraryStore.getState().reload();
+    await useLibraryStore.getState().setPage(3);
+
+    useLibraryStore.getState().setSort("title", "asc");
+    await settled();
+
+    expect(last(queriesFor("list_library")).sort).toBe("title");
+    expect(last(queriesFor("list_library")).offset).toBe(0);
+    expect(useLibraryStore.getState().page).toBe(1);
+  });
+
+  it("falls back to the last page that still exists when the list shrinks underneath it", async () => {
+    fillBackend(66);
+    await useLibraryStore.getState().reload();
+    await useLibraryStore.getState().setPage(4);
+    expect(useLibraryStore.getState().page).toBe(4);
+
+    // Something else trimmed the library — another window, a cleanup, a
+    // reconcile that dropped rows. Page 4 no longer exists.
+    backendItems = backendItems.slice(0, 25);
+    await useLibraryStore.getState().reload();
+
+    expect(useLibraryStore.getState().page).toBe(2);
+    expect(last(queriesFor("list_library")).offset).toBe(DEFAULT_LIBRARY_PAGE_SIZE);
+    // And it landed on rows, not on the empty tail of a page that is gone.
+    expect(useLibraryStore.getState().items).toHaveLength(5);
+  });
+
+  it("keeps the last page filled after a delete instead of leaving a hole", async () => {
+    fillBackend(66);
+    await useLibraryStore.getState().reload();
+    await useLibraryStore.getState().setPage(2);
+
+    await useLibraryStore.getState().deleteItems(["i20", "i21"]);
+
+    // Still page 2, but refilled from what follows: 64 rows left, so a full
+    // page of 20 rather than the 18 that were on screen a moment ago.
+    expect(useLibraryStore.getState().page).toBe(2);
+    expect(useLibraryStore.getState().items).toHaveLength(DEFAULT_LIBRARY_PAGE_SIZE);
+    expect(useLibraryStore.getState().items.map((item) => item.id)).not.toContain("i20");
+    expect(useLibraryStore.getState().totalItems).toBe(64);
+  });
+
+  it("drops the selection when the page changes so a bulk action cannot reach off-screen rows", async () => {
+    fillBackend(66);
+    await useLibraryStore.getState().reload();
+    useLibraryStore.getState().toggleSelected("i0");
+
+    await useLibraryStore.getState().setPage(2);
+
+    expect(useLibraryStore.getState().selectedIds).toEqual([]);
+    expect(
+      useLibraryStore
+        .getState()
+        .selectionInDisplayOrder()
+        .map((item) => item.id),
+    ).not.toContain("i0");
   });
 });
 
