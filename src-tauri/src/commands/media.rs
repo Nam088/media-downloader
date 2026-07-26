@@ -186,7 +186,7 @@ pub async fn preview_media(
                         "INFO",
                         format!("preview_media: neither yt-dlp nor gallery-dl support {source_url}"),
                     );
-                    return Err(err);
+                    return Err(unsupported_after_all_engines(&source_url));
                 }
             }
         }
@@ -284,6 +284,75 @@ fn resolve_platform_label(source_url: &str, raw: &serde_json::Value) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Tên file suy ra từ URL, dùng khi nguồn không cung cấp tiêu đề — điển hình
+/// là link trỏ thẳng tới một file media hoặc một manifest HLS, nơi extractor
+/// generic của yt-dlp thường không trả về `title` nào cả (FR-130). Đọc từ
+/// *path* đã phân tích chứ không phải chuỗi thô, nên token trong query string
+/// hay fragment không bao giờ lọt vào tiêu đề.
+fn filename_from_url(source_url: &str) -> String {
+    url::Url::parse(source_url)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .path_segments()
+                .and_then(|mut segments| segments.next_back().map(decode_path_segment))
+        })
+        .filter(|segment| !segment.trim().is_empty())
+        .unwrap_or_else(|| "Untitled".to_string())
+}
+
+/// Giải mã percent-encoding của một path segment để hiển thị: `url` trả về
+/// segment vẫn còn mã hoá, nên `holiday%202026.mp4` sẽ hiện nguyên xi cho
+/// người dùng nếu không giải mã.
+///
+/// Giải mã là lựa chọn có chủ đích: chuỗi này chỉ dùng để *hiển thị* (nó
+/// thành `DownloadJob.title`, không bao giờ thành đường dẫn xuất — yt-dlp tự
+/// dựng tên file từ template `-o` của nó), nên lý do thường thấy để giữ
+/// nguyên escape (chống chèn dấu phân cách/đi ngược thư mục) không áp dụng ở
+/// đây. Rủi ro còn lại là escape giải mã ra thứ không in được, nên bản giải
+/// mã chỉ được dùng khi nó là UTF-8 hợp lệ và không chứa ký tự điều khiển;
+/// ngược lại giữ nguyên segment thô.
+fn decode_path_segment(segment: &str) -> String {
+    if !segment.contains('%') {
+        return segment.to_string();
+    }
+
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let high = (bytes[index + 1] as char).to_digit(16);
+            let low = (bytes[index + 2] as char).to_digit(16);
+            if let (Some(high), Some(low)) = (high, low) {
+                decoded.push((high * 16 + low) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+
+    match String::from_utf8(decoded) {
+        Ok(text) if !text.chars().any(char::is_control) => text,
+        _ => segment.to_string(),
+    }
+}
+
+/// Lỗi cuối cùng khi mọi engine đều bó tay. Liệt kê tên engine đã thử để
+/// người dùng biết vấn đề nằm ở link chứ không phải ở một cấu hình nào họ
+/// quên bật — thông báo "nền tảng không được hỗ trợ" cũ đọc như thể ứng dụng
+/// có một danh sách cho phép cố định, điều nó không hề có (FR-131).
+fn unsupported_after_all_engines(source_url: &str) -> AppError {
+    AppError::new(
+        "UNSUPPORTED_ALL_ENGINES",
+        format!(
+            "No engine could read {source_url}. Tried: yt-dlp (including its generic extractor for direct file and HLS links), then gallery-dl."
+        ),
+    )
+}
+
 fn build_media_source(source_url: &str, platform: &str, raw: &serde_json::Value) -> MediaSource {
     let is_playlist = raw.get("_type").and_then(|v| v.as_str()) == Some("playlist");
 
@@ -309,11 +378,14 @@ fn build_media_source(source_url: &str, platform: &str, raw: &serde_json::Value)
 
     MediaSource {
         source_url: source_url.to_string(),
+        // A whitespace-only title is exactly as useless as a missing one, so
+        // both fall through to the URL-derived name (FR-130).
         title: raw
             .get("title")
             .and_then(|v| v.as_str())
-            .unwrap_or("Untitled")
-            .to_string(),
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| filename_from_url(source_url)),
         thumbnail_url: raw.get("thumbnail").and_then(|v| v.as_str()).map(String::from),
         duration_seconds: raw.get("duration").and_then(|v| v.as_f64()).map(|d| d as i64),
         platform: platform.to_string(),
@@ -562,6 +634,168 @@ mod tests {
         assert_eq!(audio_formats.len(), 1);
         assert_eq!(audio_formats[0].bitrate_kbps, None);
         assert_eq!(audio_formats[0].codec, "aac");
+    }
+
+    /// Shorthand for the shape yt-dlp's generic extractor actually returns for
+    /// a link that points straight at a media file or an HLS manifest: a
+    /// `video` result with essentially no metadata attached — no `title`, no
+    /// `thumbnail`, no `duration`.
+    fn generic_dump_without_title(webpage_url: &str) -> serde_json::Value {
+        json!({
+            "_type": "video",
+            "webpage_url": webpage_url,
+        })
+    }
+
+    #[test]
+    fn direct_media_urls_get_a_title_from_the_filename() {
+        // yt-dlp trả về metadata rất nghèo cho link file trực tiếp: thường chỉ
+        // có `_type: video` và không có `title`. Rơi về "Untitled" cho toàn bộ
+        // nhóm này khiến hàng đợi thành một dãy mục không phân biệt được.
+        let url = "https://cdn.example.com/clips/holiday-2026.mp4";
+
+        let source = build_media_source(url, "generic", &generic_dump_without_title(url));
+
+        assert_eq!(source.title, "holiday-2026.mp4");
+    }
+
+    #[test]
+    fn hls_manifest_urls_get_a_title_from_the_manifest_filename() {
+        let url = "https://stream.example.com/live/session-42/master.m3u8";
+
+        let source = build_media_source(url, "generic", &generic_dump_without_title(url));
+
+        assert_eq!(source.title, "master.m3u8");
+    }
+
+    #[test]
+    fn a_query_string_never_leaks_into_the_derived_title() {
+        // CDN links routinely carry a signed token. Deriving the name from the
+        // raw string instead of the parsed path would put that token — often
+        // hundreds of characters of it — straight into the queue row.
+        let url = "https://cdn.example.com/clip.mp4?token=abc123&expires=1799999999";
+
+        let source = build_media_source(url, "generic", &generic_dump_without_title(url));
+
+        assert_eq!(source.title, "clip.mp4");
+    }
+
+    #[test]
+    fn a_fragment_never_leaks_into_the_derived_title() {
+        let url = "https://cdn.example.com/clip.mp4#t=30";
+
+        let source = build_media_source(url, "generic", &generic_dump_without_title(url));
+
+        assert_eq!(source.title, "clip.mp4");
+    }
+
+    #[test]
+    fn percent_escapes_in_the_filename_are_decoded_for_display() {
+        // `holiday%202026.mp4` is what the URL carries; showing that verbatim
+        // in the queue is needless noise when the real name is readable.
+        let url = "https://cdn.example.com/clips/holiday%202026%20%28final%29.mp4";
+
+        let source = build_media_source(url, "generic", &generic_dump_without_title(url));
+
+        assert_eq!(source.title, "holiday 2026 (final).mp4");
+    }
+
+    #[test]
+    fn multibyte_percent_escapes_survive_decoding_intact() {
+        // Three separate escapes that only mean anything when the decoded
+        // *bytes* are reassembled before being read back as UTF-8.
+        let url = "https://cdn.example.com/videos/ph%E1%BB%9F.mp4";
+
+        let source = build_media_source(url, "generic", &generic_dump_without_title(url));
+
+        assert_eq!(source.title, "phở.mp4");
+    }
+
+    #[test]
+    fn escapes_that_do_not_decode_to_clean_text_are_left_alone() {
+        // `%FF` is not valid UTF-8 on its own and `%0A` is a newline; neither
+        // belongs in a queue row, so the raw segment is kept rather than
+        // silently mangled into replacement characters or a line break.
+        assert_eq!(
+            filename_from_url("https://cdn.example.com/a/%FF.mp4"),
+            "%FF.mp4",
+            "invalid UTF-8 should leave the segment untouched"
+        );
+        assert_eq!(
+            filename_from_url("https://cdn.example.com/a/two%0Alines.mp4"),
+            "two%0Alines.mp4",
+            "a control character should leave the segment untouched"
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_falls_back_instead_of_producing_an_empty_title() {
+        let url = "https://example.com/videos/";
+
+        let source = build_media_source(url, "generic", &generic_dump_without_title(url));
+
+        assert_eq!(source.title, "Untitled");
+    }
+
+    #[test]
+    fn a_url_with_no_path_at_all_falls_back() {
+        assert_eq!(filename_from_url("https://example.com"), "Untitled");
+        assert_eq!(filename_from_url("https://example.com/"), "Untitled");
+        // Not a hierarchical URL at all — there are no path segments to read.
+        assert_eq!(filename_from_url("mailto:someone@example.com"), "Untitled");
+        assert_eq!(filename_from_url("not a url"), "Untitled");
+    }
+
+    #[test]
+    fn a_real_title_from_the_extractor_is_kept_as_is() {
+        // The fallback must stay invisible to ordinary platform links, which
+        // do carry a title — deriving from the URL there would replace a good
+        // name ("Never Gonna Give You Up") with a meaningless id.
+        let raw = json!({
+            "_type": "video",
+            "title": "Never Gonna Give You Up",
+            "webpage_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        });
+
+        let source = build_media_source("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "youtube", &raw);
+
+        assert_eq!(source.title, "Never Gonna Give You Up");
+    }
+
+    #[test]
+    fn a_blank_title_is_treated_the_same_as_a_missing_one() {
+        // A whitespace-only title is exactly as useless as no title, and some
+        // extractors do emit one.
+        let raw = json!({
+            "_type": "video",
+            "title": "   ",
+        });
+
+        let source = build_media_source("https://cdn.example.com/clips/beach.mp4", "generic", &raw);
+
+        assert_eq!(source.title, "beach.mp4");
+    }
+
+    #[test]
+    fn unrecognised_urls_report_every_engine_that_was_tried() {
+        let error = unsupported_after_all_engines("https://example.com/nope");
+
+        assert_eq!(error.code, "UNSUPPORTED_ALL_ENGINES");
+        assert!(
+            error.message.contains("yt-dlp"),
+            "message should name yt-dlp, got: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("gallery-dl"),
+            "message should name gallery-dl, got: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("https://example.com/nope"),
+            "message should quote the link that failed, got: {}",
+            error.message
+        );
     }
 
     #[test]
