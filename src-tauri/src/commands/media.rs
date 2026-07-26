@@ -36,7 +36,10 @@ impl ActivePreviews {
 }
 
 #[tauri::command]
-pub async fn cancel_preview_media(previews: State<'_, ActivePreviews>, source_url: String) -> Result<bool, AppError> {
+pub async fn cancel_preview_media(
+    previews: State<'_, ActivePreviews>,
+    source_url: String,
+) -> Result<bool, AppError> {
     match previews.kill(&source_url) {
         Some(child) => {
             let mut guard = child.lock().await;
@@ -85,7 +88,8 @@ impl PreviewCache {
 
     pub fn get_playlist_entry_urls(&self, source_url: &str) -> Option<Vec<String>> {
         let map = self.0.lock().expect("preview cache mutex poisoned");
-        map.get(source_url).map(|cached| cached.playlist_entry_urls.clone())
+        map.get(source_url)
+            .map(|cached| cached.playlist_entry_urls.clone())
     }
 }
 
@@ -146,7 +150,8 @@ pub async fn preview_media(
             // "playlist_count": 0"`, even though the link genuinely has
             // images gallery-dl can see just fine.
             let looks_empty_handed = yt_dlp_source.available_video_qualities.is_empty()
-                && (!yt_dlp_source.is_playlist || yt_dlp_source.playlist_item_count.unwrap_or(0) == 0);
+                && (!yt_dlp_source.is_playlist
+                    || yt_dlp_source.playlist_item_count.unwrap_or(0) == 0);
             if looks_empty_handed {
                 match try_gallery_dl_preview(&app, &previews, &source_url, &platform).await {
                     Some(gallery_source) => (gallery_source, Vec::new()),
@@ -184,7 +189,9 @@ pub async fn preview_media(
                     log_event(
                         &app,
                         "INFO",
-                        format!("preview_media: neither yt-dlp nor gallery-dl support {source_url}"),
+                        format!(
+                            "preview_media: neither yt-dlp nor gallery-dl support {source_url}"
+                        ),
                     );
                     return Err(unsupported_after_all_engines(&source_url));
                 }
@@ -359,7 +366,11 @@ fn build_media_source(source_url: &str, platform: &str, raw: &serde_json::Value)
     let playlist_item_count = if is_playlist {
         raw.get("playlist_count")
             .and_then(|v| v.as_i64())
-            .or_else(|| raw.get("entries").and_then(|e| e.as_array()).map(|a| a.len() as i64))
+            .or_else(|| {
+                raw.get("entries")
+                    .and_then(|e| e.as_array())
+                    .map(|a| a.len() as i64)
+            })
     } else {
         None
     };
@@ -374,7 +385,11 @@ fn build_media_source(source_url: &str, platform: &str, raw: &serde_json::Value)
         extract_format_options(raw)
     };
 
-    let playlist_entries = if is_playlist { extract_playlist_entries(raw) } else { Vec::new() };
+    let playlist_entries = if is_playlist {
+        extract_playlist_entries(raw)
+    } else {
+        Vec::new()
+    };
 
     MediaSource {
         source_url: source_url.to_string(),
@@ -386,8 +401,14 @@ fn build_media_source(source_url: &str, platform: &str, raw: &serde_json::Value)
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| filename_from_url(source_url)),
-        thumbnail_url: raw.get("thumbnail").and_then(|v| v.as_str()).map(String::from),
-        duration_seconds: raw.get("duration").and_then(|v| v.as_f64()).map(|d| d as i64),
+        thumbnail_url: raw
+            .get("thumbnail")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        duration_seconds: raw
+            .get("duration")
+            .and_then(|v| v.as_f64())
+            .map(|d| d as i64),
         platform: platform.to_string(),
         is_playlist,
         playlist_item_count,
@@ -437,7 +458,10 @@ fn extract_playlist_entries(raw: &serde_json::Value) -> Vec<crate::models::Playl
                             .and_then(|v| v.as_str())
                             .unwrap_or("Untitled")
                             .to_string(),
-                        duration_seconds: entry.get("duration").and_then(|v| v.as_f64()).map(|d| d as i64),
+                        duration_seconds: entry
+                            .get("duration")
+                            .and_then(|v| v.as_f64())
+                            .map(|d| d as i64),
                         thumbnail_url: extract_entry_thumbnail(entry),
                     })
                 })
@@ -464,14 +488,19 @@ fn build_gallery_media_source(source_url: &str, platform: &str, dump: &GalleryDu
         })
         .collect();
 
-    let thumbnail_url = gallery_items.iter().find(|item| !item.is_audio).map(|item| item.url.clone());
+    let thumbnail_url = gallery_items
+        .iter()
+        .find(|item| !item.is_audio)
+        .map(|item| item.url.clone());
 
     MediaSource {
         source_url: source_url.to_string(),
         title: dump.title.clone().unwrap_or_else(|| {
             format!(
                 "{} post",
-                dump.category.clone().unwrap_or_else(|| platform.to_string())
+                dump.category
+                    .clone()
+                    .unwrap_or_else(|| platform.to_string())
             )
         }),
         thumbnail_url,
@@ -497,7 +526,9 @@ fn format_filesize(format: &serde_json::Value) -> Option<u64> {
         .or_else(|| format.get("filesize_approx").and_then(|v| v.as_u64()))
 }
 
-fn extract_format_options(raw: &serde_json::Value) -> (Vec<VideoQualityOption>, Vec<AudioFormatOption>) {
+fn extract_format_options(
+    raw: &serde_json::Value,
+) -> (Vec<VideoQualityOption>, Vec<AudioFormatOption>) {
     let formats = raw
         .get("formats")
         .and_then(|v| v.as_array())
@@ -521,8 +552,14 @@ fn extract_format_options(raw: &serde_json::Value) -> (Vec<VideoQualityOption>, 
     let mut fallback_audio: Option<(String, Option<u64>)> = None;
 
     for format in &formats {
-        let vcodec = format.get("vcodec").and_then(|v| v.as_str()).unwrap_or("none");
-        let acodec = format.get("acodec").and_then(|v| v.as_str()).unwrap_or("none");
+        let vcodec = format
+            .get("vcodec")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none");
+        let acodec = format
+            .get("acodec")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none");
         let filesize = format_filesize(format);
 
         if vcodec != "none" {
@@ -538,7 +575,8 @@ fn extract_format_options(raw: &serde_json::Value) -> (Vec<VideoQualityOption>, 
             match format.get("abr").and_then(|v| v.as_f64()) {
                 Some(abr) => {
                     let bitrate_kbps = abr.round() as u32;
-                    if bitrate_kbps > 0 && !audio_options.iter().any(|(b, _, _)| *b == bitrate_kbps) {
+                    if bitrate_kbps > 0 && !audio_options.iter().any(|(b, _, _)| *b == bitrate_kbps)
+                    {
                         audio_options.push((bitrate_kbps, acodec.to_string(), filesize));
                     }
                     if abr > best_audio_bitrate {
@@ -757,7 +795,11 @@ mod tests {
             "webpage_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
         });
 
-        let source = build_media_source("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "youtube", &raw);
+        let source = build_media_source(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "youtube",
+            &raw,
+        );
 
         assert_eq!(source.title, "Never Gonna Give You Up");
     }
