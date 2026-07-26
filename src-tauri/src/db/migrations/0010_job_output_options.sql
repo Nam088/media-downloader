@@ -1,0 +1,32 @@
+-- Phase 2 (specs/003-media-output): lựa chọn đầu ra của người dùng — định dạng
+-- audio, container video, ưu tiên codec, nhúng metadata/ảnh bìa — được lưu
+-- cùng tác vụ để một lần thử lại tái tạo đúng cấu hình ban đầu (FR-235).
+--
+-- MỘT cột JSON chứ không phải mỗi lựa chọn một cột. Lý do, theo đúng thứ tự
+-- quan trọng:
+--
+--   1. Không có truy vấn nào đọc chúng. Những giá trị này chỉ được
+--      `downloader::queue::build_ytdlp_args` đọc, sau khi đã lấy nguyên cả
+--      dòng theo `id`. Không có WHERE, ORDER BY, GROUP BY hay index nào cần
+--      tới chúng, nên một cột riêng không đổi lấy được thứ gì từ SQLite —
+--      không kiểm tra kiểu, không tối ưu, không ràng buộc.
+--   2. Số lựa chọn còn tăng tiếp trong chính phase này: phụ đề (FR-217→221),
+--      cắt đoạn (FR-222→224), chapter (FR-225→227), preset (FR-228→233). Mỗi
+--      lựa chọn một cột nghĩa là mỗi lát cắt một migration, trên đúng cái bảng
+--      mà migration 0002/0003 đã phải rebuild bằng DROP + RENAME một lần rồi.
+--   3. Preset (FR-228) chính là cùng cấu trúc ấy nhưng có tên. Một dạng tuần
+--      tự hoá phục vụ được cả hai chỗ.
+--   4. `#[serde(default)]` trên struct và trên từng trường cho FR-233 gần như
+--      miễn phí: bản ghi lưu từ phiên bản cũ đọc được nguyên vẹn, tuỳ chọn mới
+--      nhận giá trị mặc định.
+--
+-- Cái giá phải trả là không có kiểm tra ở tầng SQL. Chấp nhận được vì
+-- `models::OutputOptions` là thứ duy nhất ghi và đọc cột này, và một giá trị
+-- hỏng (sửa tay) rơi về `OutputOptions::default()` — vốn đúng bằng hành vi
+-- đang chạy hôm nay, nên là chỗ rơi an toàn.
+--
+-- NULL là giá trị của mọi dòng có sẵn, và `db::row_to_job` dịch NULL thành
+-- `OutputOptions::default()`. KHÔNG backfill một chuỗi JSON vào các dòng cũ:
+-- "tác vụ này không nêu lựa chọn nào" và "tác vụ này đã chọn đúng bộ mặc định"
+-- là hai chuyện khác nhau, và chỉ cái đầu mới đúng với dữ liệu có trước.
+ALTER TABLE download_jobs ADD COLUMN output_options TEXT;

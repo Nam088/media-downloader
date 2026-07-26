@@ -9,7 +9,9 @@ use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
 use crate::db::Db;
 use crate::error::{AppError, CANCELED_ERROR_CODE};
 use crate::logging::log_event;
-use crate::models::{DownloadJob, GalleryMode, JobStatus, MediaType};
+use crate::models::{
+    AudioOutput, CodecPreference, DownloadJob, GalleryMode, JobStatus, MediaType, VideoContainer,
+};
 
 use super::gallery_dl;
 use super::retry::{decide_outcome, Outcome};
@@ -271,6 +273,9 @@ impl DownloadQueue {
             // tự-thử-lại bắt đầu lại từ 0 thay vì kế thừa của job cũ.
             retry_count: 0,
             next_retry_at: None,
+            // FR-235: thử lại phải tái tạo đúng cấu hình đầu ra của bản gốc,
+            // không phải cấu hình đang hiển thị trên màn hình lúc bấm.
+            output_options: original.output_options,
         };
 
         self.enqueue(&mut retried).await?;
@@ -632,7 +637,18 @@ async fn run_job(
         .get_settings()
         .map(|settings| settings.rate_limit_kbps)
         .unwrap_or(0);
-    let extra_args = build_ytdlp_args(&job, rate_limit_kbps)?;
+    let plan = build_ytdlp_args(&job, rate_limit_kbps)?;
+    // FR-210: bước hậu xử lý bị bỏ qua phải nói ra được lý do. Ghi TRƯỚC khi
+    // tải chứ không phải lúc kết thúc, để người dùng mở nhật ký giữa chừng vẫn
+    // thấy — và để lý do còn đó kể cả khi tác vụ sau đó thất bại vì chuyện khác.
+    for note in &plan.skipped {
+        log_event(
+            &handles.app,
+            "INFO",
+            format!("Job {} ({}): {note}", job.id, job.source_url),
+        );
+    }
+    let extra_args = plan.args;
 
     let mut output_path: Option<String> = None;
     for attempt in 1..=MAX_NO_AUDIO_ATTEMPTS {
@@ -1288,11 +1304,116 @@ async fn recover_missing_audio(
     Ok(video_path.to_string())
 }
 
+/// Kết quả của việc dựng tham số cho một lần chạy yt-dlp.
+///
+/// `skipped` tồn tại vì FR-210: khi định dạng đầu ra không chứa được ảnh bìa,
+/// bước nhúng phải bị **bỏ qua có ghi lý do**, và tuyệt đối không được làm tác
+/// vụ thất bại. Nếu cứ truyền `--embed-thumbnail` cho một container không hỗ
+/// trợ thì bộ hậu xử lý của yt-dlp ném lỗi và giết cả tác vụ — tức là đúng
+/// điều FR-210 cấm. Nên quyết định bỏ qua được đưa ra ngay ở đây, còn lý do
+/// thì đi ngược lên `run_job` để ghi vào nhật ký.
+#[derive(Debug, PartialEq, Eq)]
+struct YtdlpPlan {
+    args: Vec<String>,
+    skipped: Vec<String>,
+}
+
+/// Container đầu ra có chứa được ảnh bìa hay không (FR-209/FR-210).
+#[derive(Debug, PartialEq, Eq)]
+enum ThumbnailSupport {
+    Supported,
+    /// Kèm lý do đọc được cho người dùng, để nhật ký nói rõ vì sao thiếu ảnh
+    /// bìa thay vì im lặng.
+    Unsupported(String),
+}
+
+/// Bộ hậu xử lý `EmbedThumbnail` của yt-dlp chỉ nhận mp3, mkv/mka, ogg/opus,
+/// flac, m4a/mp4/mov. Danh sách này được đối chiếu với lựa chọn của người dùng
+/// *trước* khi truyền cờ, chứ không phải để yt-dlp tự ném lỗi.
+fn thumbnail_support(job: &DownloadJob) -> ThumbnailSupport {
+    // "Giữ nguyên định dạng gốc" là trường hợp thật sự không biết trước:
+    // container đích do nguồn quyết định tại thời điểm tải, và một nguồn WebM
+    // (không nằm trong danh sách trên) sẽ làm bước nhúng ném lỗi. Bỏ qua có
+    // ghi lý do là cách duy nhất giữ được lời hứa của FR-210 ở đây.
+    const SOURCE_REASON: &str =
+        "output keeps the source's own container, which yt-dlp cannot be guaranteed to \
+         support for cover art (e.g. WebM) — embedding would fail the job instead of \
+         degrading, so it is skipped";
+
+    match job.media_type {
+        MediaType::Audio => match job.output_options.audio {
+            AudioOutput::Mp3 { .. }
+            | AudioOutput::M4a { .. }
+            | AudioOutput::Opus { .. }
+            | AudioOutput::Flac => ThumbnailSupport::Supported,
+            AudioOutput::Wav => ThumbnailSupport::Unsupported(
+                "WAV has no tag container that can hold cover art".to_string(),
+            ),
+            AudioOutput::Source => ThumbnailSupport::Unsupported(SOURCE_REASON.to_string()),
+        },
+        MediaType::Video => match job.output_options.video_container {
+            VideoContainer::Mp4 | VideoContainer::Mkv => ThumbnailSupport::Supported,
+            VideoContainer::Source => ThumbnailSupport::Unsupported(SOURCE_REASON.to_string()),
+        },
+        // `build_ytdlp_args` đã từ chối job gallery trước khi tới đây.
+        MediaType::Gallery => ThumbnailSupport::Unsupported(
+            "gallery downloads do not go through yt-dlp".to_string(),
+        ),
+    }
+}
+
+/// Giá trị cho `--audio-quality`, hoặc `None` khi cờ đó không được phép xuất
+/// hiện.
+///
+/// Cửa chặn đầu tiên là FR-203 và nó nằm ở tầng kiểu dữ liệu: `bitrate_kbps()`
+/// trả `None` cho WAV/FLAC/Source vì các biến thể ấy **không có** trường
+/// bitrate. Nhưng chỉ vậy chưa đủ — nhãn chất lượng đã đối chiếu với nguồn
+/// (`DownloadJob.audio_quality`) vẫn tồn tại độc lập, và người dùng hoàn toàn
+/// có thể đã chọn "320kbps" ở bước xem trước rồi mới đổi định dạng sang FLAC.
+/// Nên hàm này thoát sớm cho mọi định dạng không mất dữ liệu: nhãn kia thậm chí
+/// không được đọc tới.
+///
+/// Thứ tự ưu tiên khi định dạng *có* mất dữ liệu:
+///   1. bitrate người dùng chọn thẳng trong lựa chọn đầu ra;
+///   2. nhãn chất lượng đã đối chiếu với danh sách format thật của nguồn
+///      (FR-019) — đây là đường đi của toàn bộ tác vụ hiện có, nên mặc định
+///      giữ nguyên hành vi cũ;
+///   3. `0`, tức để yt-dlp tự chọn mức VBR tốt nhất (mục playlist fan-out
+///      không qua bước đối chiếu nên không có nhãn nào).
+fn audio_quality_arg(
+    audio: &AudioOutput,
+    validated_label: Option<&str>,
+) -> Result<Option<String>, AppError> {
+    if !audio.is_lossy() {
+        return Ok(None);
+    }
+    if let Some(bitrate_kbps) = audio.bitrate_kbps() {
+        return Ok(Some(format!("{bitrate_kbps}K")));
+    }
+    Ok(Some(match validated_label {
+        Some(quality) => {
+            let bitrate_kbps = parse_leading_number(quality).ok_or_else(|| {
+                AppError::new(
+                    "INVALID_QUALITY_OPTION",
+                    format!("Cannot parse audio quality: {quality}"),
+                )
+            })?;
+            format!("{bitrate_kbps}K")
+        }
+        None => "0".to_string(),
+    }))
+}
+
 /// `rate_limit_kbps` bằng 0 nghĩa là không giới hạn. Giới hạn này áp cho từng
 /// tiến trình yt-dlp, không phải tổng băng thông của ứng dụng — với N job chạy
 /// song song, tổng thực tế có thể tới N lần mức này. Giao diện Cài đặt phải nói
 /// rõ điều đó.
-fn build_ytdlp_args(job: &DownloadJob, rate_limit_kbps: u32) -> Result<Vec<String>, AppError> {
+///
+/// Một job không nêu lựa chọn đầu ra nào (`OutputOptions::default()`, tức mọi
+/// dòng có trước Phase 2) phải cho ra danh sách tham số **giống hệt từng chuỗi
+/// một** với thứ đang chạy hôm nay — xem test
+/// `default_options_reproduce_todays_arguments_byte_for_byte`.
+fn build_ytdlp_args(job: &DownloadJob, rate_limit_kbps: u32) -> Result<YtdlpPlan, AppError> {
     // `--no-playlist` on every single-item job (audio or video) is a
     // deliberate safety net for FR-013: a URL copied from inside a playlist
     // often still carries a `&list=...` param, and without this flag yt-dlp
@@ -1300,6 +1421,8 @@ fn build_ytdlp_args(job: &DownloadJob, rate_limit_kbps: u32) -> Result<Vec<Strin
     // Jobs created for a confirmed `entire_playlist` fan-out (T033) are each
     // their own per-entry URL, so this flag has no effect on them either way.
     let mut args = vec!["--no-playlist".to_string()];
+    let mut skipped: Vec<String> = Vec::new();
+    let options = &job.output_options;
 
     match job.media_type {
         MediaType::Audio => {
@@ -1316,26 +1439,26 @@ fn build_ytdlp_args(job: &DownloadJob, rate_limit_kbps: u32) -> Result<Vec<Strin
             // of attempting an unnecessary — and here, broken — merge.
             args.push("-f".into());
             args.push("bestaudio/best".into());
-            args.push("-x".into());
-            args.push("--audio-format".into());
-            args.push("mp3".into());
-            args.push("--audio-quality".into());
-            args.push(match job.audio_quality.as_deref() {
-                Some(quality) => {
-                    let bitrate_kbps = parse_leading_number(quality).ok_or_else(|| {
-                        AppError::new(
-                            "INVALID_QUALITY_OPTION",
-                            format!("Cannot parse audio quality: {quality}"),
-                        )
-                    })?;
-                    format!("{bitrate_kbps}K")
+
+            // `None` ở đây là "giữ nguyên định dạng gốc" (FR-202): không `-x`,
+            // không `--audio-format`, không `--audio-quality`. Đây là điều kiện
+            // đủ để KHÔNG có bước chuyển mã nào chạy — yt-dlp chỉ tải xuống
+            // luồng audio tốt nhất và ghi thẳng ra đĩa, ffmpeg không hề được
+            // gọi tới, nên cũng là lý do SC-202 nói cách này nhanh hơn hẳn.
+            if let Some(audio_format) = options.audio.ytdlp_audio_format() {
+                args.push("-x".into());
+                args.push("--audio-format".into());
+                args.push(audio_format.into());
+                // Bitrate chỉ đi kèm định dạng nén mất dữ liệu (FR-203) — với
+                // WAV/FLAC hàm này trả `None` và cờ biến mất hoàn toàn, chứ
+                // không phải được truyền một giá trị vô hại nào đó.
+                if let Some(quality) =
+                    audio_quality_arg(&options.audio, job.audio_quality.as_deref())?
+                {
+                    args.push("--audio-quality".into());
+                    args.push(quality);
                 }
-                // No quality was validated against a real format list (playlist
-                // fan-out items skip that step — see download.rs), so ask
-                // yt-dlp for its own best available VBR encoding instead of
-                // guessing a bitrate.
-                None => "0".to_string(),
-            });
+            }
         }
         MediaType::Video => {
             let height = job
@@ -1351,16 +1474,30 @@ fn build_ytdlp_args(job: &DownloadJob, rate_limit_kbps: u32) -> Result<Vec<Strin
                 })
                 .transpose()?;
             args.push("-f".into());
-            args.push(video_format_selector(height));
-            args.push("--merge-output-format".into());
-            args.push("mp4".into());
-            // TikTok's audio-loss bug (yt-dlp issues #15891/#15642) was
-            // reported far more often on `bytevc1`/h265 formats than h264 —
-            // this is the community-confirmed mitigation (`-S "vcodec:avc"`)
-            // layered on top of `video_format_selector`'s own avc1-first `-f`
-            // chain, so a tied fallback still leans h264 instead of h265.
-            args.push("--format-sort".into());
-            args.push("vcodec:avc".into());
+            args.push(video_format_selector(height, options.codec_preference));
+            // `None` = giữ nguyên container gốc (FR-204): không ép yt-dlp
+            // remux sang thứ gì cả.
+            if let Some(container) = options.video_container.merge_output_format() {
+                args.push("--merge-output-format".into());
+                args.push(container.into());
+            }
+            match options.codec_preference {
+                // TikTok's audio-loss bug (yt-dlp issues #15891/#15642) was
+                // reported far more often on `bytevc1`/h265 formats than h264 —
+                // this is the community-confirmed mitigation (`-S "vcodec:avc"`)
+                // layered on top of `video_format_selector`'s own avc1-first `-f`
+                // chain, so a tied fallback still leans h264 instead of h265.
+                CodecPreference::Compatibility => {
+                    args.push("--format-sort".into());
+                    args.push("vcodec:avc".into());
+                }
+                // Ưu tiên chất lượng thì cố tình BỎ luôn `--format-sort`: giữ
+                // nó lại sẽ kéo mọi lựa chọn hoà nhau về h264 và làm rỗng ý
+                // nghĩa của chính lựa chọn này (FR-205). Không có sắp xếp nào
+                // thay thế — thứ tự mặc định của yt-dlp vốn đã ưu tiên chất
+                // lượng, và đó chính xác là thứ người dùng vừa yêu cầu.
+                CodecPreference::Quality => {}
+            }
         }
         // `run_job` branches to `run_gallery_job` (a completely separate,
         // gallery-dl-backed code path) before this function is ever called
@@ -1373,13 +1510,32 @@ fn build_ytdlp_args(job: &DownloadJob, rate_limit_kbps: u32) -> Result<Vec<Strin
         }
     }
 
+    // FR-208. yt-dlp lấy các trường này thẳng từ metadata nguồn, nên trường nào
+    // nguồn không có thì đơn giản là không được ghi — không có giá trị suy đoán
+    // nào được điền vào (FR-211).
+    if options.embed_metadata {
+        args.push("--embed-metadata".into());
+    }
+
+    // FR-209/FR-210: chỉ truyền cờ khi container đích thật sự chứa được ảnh
+    // bìa. Khi không, ghi lý do lại và đi tiếp — tác vụ vẫn thành công, chỉ là
+    // không có ảnh bìa.
+    if options.embed_thumbnail {
+        match thumbnail_support(job) {
+            ThumbnailSupport::Supported => args.push("--embed-thumbnail".into()),
+            ThumbnailSupport::Unsupported(reason) => {
+                skipped.push(format!("skipped embedding the cover art: {reason}"));
+            }
+        }
+    }
+
     if rate_limit_kbps > 0 {
         args.push("--limit-rate".into());
         args.push(format!("{rate_limit_kbps}K"));
     }
 
     args.push("--continue".into());
-    Ok(args)
+    Ok(YtdlpPlan { args, skipped })
 }
 
 /// Builds a `-f` format selector that prioritizes H.264 video (`avc1`) +
@@ -1392,16 +1548,28 @@ fn build_ytdlp_args(job: &DownloadJob, rate_limit_kbps: u32) -> Result<Vec<Strin
 /// whatever's best if this exact quality has no H.264 rendition (rare, e.g.
 /// some 4K/8K sources are AV1-only) so the download still succeeds instead
 /// of failing outright — just not with the compatibility guarantee.
-fn video_format_selector(height: Option<u32>) -> String {
-    match height {
-        Some(h) => format!(
+///
+/// `CodecPreference::Quality` bỏ toàn bộ ràng buộc codec ở trên và lấy đúng
+/// thứ tốt nhất nguồn có, kể cả VP9/AV1 (FR-205). Chuỗi kết quả khi đó chỉ còn
+/// vế dự phòng cuối cùng của nhánh tương thích — vốn đã là "tốt nhất, bất kể
+/// codec" — nên hai chế độ dùng chung một đáy và chỉ khác nhau ở phần ưu tiên
+/// đặt phía trước.
+fn video_format_selector(height: Option<u32>, codec_preference: CodecPreference) -> String {
+    match (codec_preference, height) {
+        (CodecPreference::Compatibility, Some(h)) => format!(
             "bestvideo[vcodec^=avc1][height<={h}]+bestaudio[acodec^=mp4a]/\
              best[vcodec^=avc1][height<={h}]/\
              bestvideo[height<={h}]+bestaudio/best[height<={h}]"
         ),
-        None => "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/\
-                 best[vcodec^=avc1]/bestvideo+bestaudio/best"
-            .to_string(),
+        (CodecPreference::Compatibility, None) => {
+            "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/\
+             best[vcodec^=avc1]/bestvideo+bestaudio/best"
+                .to_string()
+        }
+        (CodecPreference::Quality, Some(h)) => {
+            format!("bestvideo[height<={h}]+bestaudio/best[height<={h}]")
+        }
+        (CodecPreference::Quality, None) => "bestvideo+bestaudio/best".to_string(),
     }
 }
 
@@ -1445,6 +1613,7 @@ fn emit_status_changed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::OutputOptions;
 
     #[test]
     fn parses_a_real_ffmpeg_duration_banner() {
@@ -1569,18 +1738,22 @@ mod tests {
             queue_position: 0.0,
             retry_count: 0,
             next_retry_at: None,
+            output_options: OutputOptions::default(),
         }
+    }
+
+    /// Chỉ lấy phần tham số, cho những test không quan tâm tới ghi chú bỏ qua.
+    fn args_of(job: &DownloadJob) -> Vec<String> {
+        build_ytdlp_args(job, 0).unwrap().args
     }
 
     #[test]
     fn audio_args_use_selected_bitrate_not_a_hardcoded_constant() {
         let job = sample_job(MediaType::Audio, Some("128kbps"), None);
-        let args = build_ytdlp_args(&job, 0).unwrap();
-        assert!(args.contains(&"128K".to_string()));
+        assert!(args_of(&job).contains(&"128K".to_string()));
 
         let job_high = sample_job(MediaType::Audio, Some("320kbps"), None);
-        let args_high = build_ytdlp_args(&job_high, 0).unwrap();
-        assert!(args_high.contains(&"320K".to_string()));
+        assert!(args_of(&job_high).contains(&"320K".to_string()));
     }
 
     #[test]
@@ -1591,7 +1764,7 @@ mod tests {
         // audio, no dedicated audio-only stream) and merge them incorrectly,
         // producing a file with no audio track once `-x` extracts from it.
         let job = sample_job(MediaType::Audio, Some("128kbps"), None);
-        let args = build_ytdlp_args(&job, 0).unwrap();
+        let args = args_of(&job);
         let f_index = args.iter().position(|a| a == "-f").expect("-f flag present");
         assert_eq!(args[f_index + 1], "bestaudio/best");
     }
@@ -1599,7 +1772,7 @@ mod tests {
     #[test]
     fn video_args_select_nearest_available_height_via_format_selector() {
         let job = sample_job(MediaType::Video, None, Some("1080p"));
-        let args = build_ytdlp_args(&job, 0).unwrap();
+        let args = args_of(&job);
         let format_selector = args
             .iter()
             .find(|a| a.contains("bestvideo"))
@@ -1617,7 +1790,7 @@ mod tests {
         // fails to open in QuickTime, older Windows Media Player, and many
         // TVs when muxed into .mp4 — the file "downloads" but won't play.
         let job = sample_job(MediaType::Video, None, Some("1080p"));
-        let args = build_ytdlp_args(&job, 0).unwrap();
+        let args = args_of(&job);
         let format_selector = args
             .iter()
             .find(|a| a.contains("bestvideo"))
@@ -1640,7 +1813,7 @@ mod tests {
         // tries avc1 first, but `--format-sort vcodec:avc` additionally
         // biases any tied fallback candidate towards h264 too.
         let job = sample_job(MediaType::Video, None, Some("1080p"));
-        let args = build_ytdlp_args(&job, 0).unwrap();
+        let args = args_of(&job);
         let sort_index = args
             .iter()
             .position(|a| a == "--format-sort")
@@ -1654,11 +1827,11 @@ mod tests {
         // flat-playlist previews don't fetch per-video formats — `None`
         // means "let yt-dlp pick its best", not an error.
         let audio_job = sample_job(MediaType::Audio, None, None);
-        let audio_args = build_ytdlp_args(&audio_job, 0).unwrap();
+        let audio_args = args_of(&audio_job);
         assert!(audio_args.contains(&"0".to_string()));
 
         let video_job = sample_job(MediaType::Video, None, None);
-        let video_args = build_ytdlp_args(&video_job, 0).unwrap();
+        let video_args = args_of(&video_job);
         assert!(video_args
             .iter()
             .any(|a| a.ends_with("bestvideo+bestaudio/best")));
@@ -1667,14 +1840,13 @@ mod tests {
     #[test]
     fn every_single_item_job_disables_implicit_playlist_download() {
         let job = sample_job(MediaType::Audio, Some("128kbps"), None);
-        let args = build_ytdlp_args(&job, 0).unwrap();
-        assert_eq!(args.first(), Some(&"--no-playlist".to_string()));
+        assert_eq!(args_of(&job).first(), Some(&"--no-playlist".to_string()));
     }
 
     #[test]
     fn adds_rate_limit_flag_when_configured() {
         let job = sample_job(MediaType::Audio, Some("128kbps"), None);
-        let args = build_ytdlp_args(&job, 512).expect("args build");
+        let args = build_ytdlp_args(&job, 512).expect("args build").args;
 
         let index = args
             .iter()
@@ -1688,7 +1860,7 @@ mod tests {
     #[test]
     fn omits_rate_limit_flag_when_unlimited() {
         let job = sample_job(MediaType::Audio, Some("128kbps"), None);
-        let args = build_ytdlp_args(&job, 0).expect("args build");
+        let args = build_ytdlp_args(&job, 0).expect("args build").args;
 
         assert!(
             !args.iter().any(|a| a == "--limit-rate"),
@@ -1707,6 +1879,263 @@ mod tests {
         // Không còn entry nào nghĩa là chưa ai chiếm chỗ, nên kết quả vẫn phải
         // được thi hành — nếu không, một job thất bại sẽ kẹt ở `downloading`.
         assert!(is_current_run(None, 1));
+    }
+
+    // ---- specs/003-media-output: định dạng đầu ra và metadata -------------
+
+    /// Job audio kèm một bộ lựa chọn đầu ra cụ thể. `audio_quality` luôn được
+    /// đặt sẵn 320kbps: nhãn ấy là thứ *phải* bị bỏ qua với định dạng không
+    /// mất dữ liệu, nên để nó có mặt trong mọi ca thì test mới nói được điều
+    /// gì về FR-203.
+    fn audio_job_with(audio: AudioOutput) -> DownloadJob {
+        let mut job = sample_job(MediaType::Audio, Some("320kbps"), None);
+        job.output_options = OutputOptions {
+            audio,
+            ..OutputOptions::default()
+        };
+        job
+    }
+
+    fn video_job_with(options: OutputOptions) -> DownloadJob {
+        let mut job = sample_job(MediaType::Video, None, Some("1080p"));
+        job.output_options = options;
+        job
+    }
+
+    /// Giá trị đi ngay sau một cờ, hoặc `None` khi cờ đó không có mặt.
+    fn value_after(args: &[String], flag: &str) -> Option<String> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|index| args.get(index + 1))
+            .cloned()
+    }
+
+    #[test]
+    fn default_options_reproduce_todays_arguments_byte_for_byte() {
+        // Đây là lời hứa tương thích ngược của cả lát cắt này: một tác vụ
+        // không nêu lựa chọn đầu ra nào — tức mọi dòng có trước Phase 2, và
+        // mọi lời gọi từ giao diện chưa cập nhật — phải sinh ra ĐÚNG danh sách
+        // tham số mà bản đang phát hành sinh ra.
+        //
+        // So sánh nguyên cả vector với một hằng số viết tay, chứ không phải
+        // `contains`: chỉ có cách này mới bắt được việc một cờ MỚI lặng lẽ
+        // được thêm vào (ví dụ `--embed-metadata` bật sẵn), vốn là kiểu hồi
+        // quy mà mọi assert kiểu "có chứa" đều cho đi lọt.
+        let audio = sample_job(MediaType::Audio, Some("128kbps"), None);
+        assert_eq!(
+            args_of(&audio),
+            vec![
+                "--no-playlist",
+                "-f",
+                "bestaudio/best",
+                "-x",
+                "--audio-format",
+                "mp3",
+                "--audio-quality",
+                "128K",
+                "--continue",
+            ]
+        );
+
+        let video = sample_job(MediaType::Video, None, Some("1080p"));
+        assert_eq!(
+            args_of(&video),
+            vec![
+                "--no-playlist",
+                "-f",
+                "bestvideo[vcodec^=avc1][height<=1080]+bestaudio[acodec^=mp4a]/\
+                 best[vcodec^=avc1][height<=1080]/\
+                 bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+                "--merge-output-format",
+                "mp4",
+                "--format-sort",
+                "vcodec:avc",
+                "--continue",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_audio_format_reaches_ytdlp_as_its_own_format_name() {
+        // FR-201: năm định dạng, năm giá trị `--audio-format` khác nhau. Một
+        // bảng ánh xạ viết sai (hai định dạng cùng trỏ về "mp3") là lỗi lặng
+        // lẽ nhất có thể có ở đây — người dùng chọn FLAC và nhận MP3.
+        for (audio, expected) in [
+            (AudioOutput::Mp3 { bitrate_kbps: None }, "mp3"),
+            (AudioOutput::M4a { bitrate_kbps: None }, "m4a"),
+            (AudioOutput::Opus { bitrate_kbps: None }, "opus"),
+            (AudioOutput::Wav, "wav"),
+            (AudioOutput::Flac, "flac"),
+        ] {
+            let args = args_of(&audio_job_with(audio.clone()));
+            assert_eq!(
+                value_after(&args, "--audio-format").as_deref(),
+                Some(expected),
+                "{audio:?} phải yêu cầu đúng định dạng của chính nó"
+            );
+            assert!(args.contains(&"-x".to_string()), "{audio:?} vẫn phải tách audio");
+        }
+    }
+
+    #[test]
+    fn keeping_the_source_format_runs_no_transcoding_step_at_all() {
+        // FR-202/SC-202. Cả ba cờ dưới đây đều kéo ffmpeg vào cuộc: `-x` bật
+        // bộ tách audio, `--audio-format` ép chuyển mã, `--audio-quality` chỉ
+        // có nghĩa khi đang mã hoá lại. Còn bất kỳ cái nào thì lời hứa "không
+        // có bước chuyển mã nào chạy" là sai.
+        let args = args_of(&audio_job_with(AudioOutput::Source));
+
+        for forbidden in ["-x", "--audio-format", "--audio-quality"] {
+            assert!(
+                !args.iter().any(|a| a == forbidden),
+                "giữ nguyên định dạng gốc không được truyền {forbidden}, nhận được {args:?}"
+            );
+        }
+        // ...nhưng vẫn phải tải đúng luồng audio tốt nhất, chứ không phải rơi
+        // về bộ chọn mặc định vốn có thể merge nhầm hai luồng pre-muxed.
+        assert_eq!(value_after(&args, "-f").as_deref(), Some("bestaudio/best"));
+    }
+
+    #[test]
+    fn a_lossless_format_never_carries_a_bitrate_even_when_one_was_picked() {
+        // FR-203. `audio_job_with` cố tình đặt sẵn `audio_quality =
+        // "320kbps"` — đúng tình huống thật: người dùng chọn 320kbps ở bước
+        // xem trước rồi mới đổi định dạng sang FLAC. Nhãn ấy vẫn nằm nguyên
+        // trên job, và nếu bộ dựng tham số đọc nó vô điều kiện thì `-q 320K`
+        // sẽ đi kèm một lần mã hoá không mất dữ liệu, nơi nó vô nghĩa.
+        for lossless in [AudioOutput::Wav, AudioOutput::Flac] {
+            let args = args_of(&audio_job_with(lossless.clone()));
+            assert!(
+                !args.iter().any(|a| a == "--audio-quality"),
+                "{lossless:?} không được kèm bitrate, nhận được {args:?}"
+            );
+            assert!(
+                !args.iter().any(|a| a == "320K"),
+                "{lossless:?} không được để nhãn chất lượng lọt xuống, nhận được {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicitly_chosen_bitrate_wins_over_the_preview_label() {
+        // Hai nguồn số liệu cùng tồn tại: nhãn đã đối chiếu với format thật
+        // của nguồn (320kbps) và bitrate người dùng chọn thẳng ở bộ chọn định
+        // dạng (128). Cái sau là lựa chọn mới hơn và cụ thể hơn nên phải thắng.
+        let args = args_of(&audio_job_with(AudioOutput::Mp3 {
+            bitrate_kbps: Some(128),
+        }));
+
+        assert_eq!(value_after(&args, "--audio-quality").as_deref(), Some("128K"));
+    }
+
+    #[test]
+    fn quality_preference_drops_the_h264_constraints_and_the_avc_sort() {
+        // FR-205. Hai nửa của cùng một lựa chọn, và bỏ sót nửa nào cũng làm
+        // lựa chọn ấy vô nghĩa: bộ chọn `-f` phải thôi đòi avc1, VÀ
+        // `--format-sort vcodec:avc` phải biến mất — giữ lại nó sẽ kéo mọi
+        // ứng viên hoà nhau về h264 dù `-f` đã mở.
+        let args = args_of(&video_job_with(OutputOptions {
+            codec_preference: CodecPreference::Quality,
+            ..OutputOptions::default()
+        }));
+
+        let selector = value_after(&args, "-f").expect("format selector present");
+        assert!(
+            !selector.contains("avc1") && !selector.contains("mp4a"),
+            "ưu tiên chất lượng không được ràng buộc codec: {selector}"
+        );
+        assert_eq!(selector, "bestvideo[height<=1080]+bestaudio/best[height<=1080]");
+        assert!(
+            !args.iter().any(|a| a == "--format-sort"),
+            "ưu tiên chất lượng không được giữ lại sắp xếp thiên vị h264: {args:?}"
+        );
+    }
+
+    #[test]
+    fn compatibility_preference_is_the_default_and_keeps_todays_behaviour() {
+        // Mặc định phải là "ưu tiên tương thích" (FR-205), nếu không người
+        // dùng sẵn có bỗng nhận VP9/AV1 sau một lần cập nhật.
+        assert_eq!(CodecPreference::default(), CodecPreference::Compatibility);
+        let args = args_of(&video_job_with(OutputOptions::default()));
+        assert_eq!(value_after(&args, "--format-sort").as_deref(), Some("vcodec:avc"));
+    }
+
+    #[test]
+    fn the_video_container_is_the_one_the_user_asked_for() {
+        // FR-204.
+        let mkv = args_of(&video_job_with(OutputOptions {
+            video_container: VideoContainer::Mkv,
+            ..OutputOptions::default()
+        }));
+        assert_eq!(value_after(&mkv, "--merge-output-format").as_deref(), Some("mkv"));
+
+        // Giữ nguyên gốc thì không được ép remux sang bất cứ thứ gì — cờ phải
+        // vắng mặt hẳn, chứ không phải mang một giá trị "trung tính" nào đó.
+        let source = args_of(&video_job_with(OutputOptions {
+            video_container: VideoContainer::Source,
+            ..OutputOptions::default()
+        }));
+        assert!(
+            !source.iter().any(|a| a == "--merge-output-format"),
+            "giữ nguyên container gốc không được truyền cờ remux: {source:?}"
+        );
+    }
+
+    #[test]
+    fn metadata_and_cover_art_flags_appear_only_when_asked_for() {
+        // FR-208/FR-209.
+        let job = video_job_with(OutputOptions {
+            embed_metadata: true,
+            embed_thumbnail: true,
+            ..OutputOptions::default()
+        });
+        let plan = build_ytdlp_args(&job, 0).unwrap();
+
+        assert!(plan.args.contains(&"--embed-metadata".to_string()));
+        assert!(plan.args.contains(&"--embed-thumbnail".to_string()));
+        assert!(plan.skipped.is_empty(), "MP4 chứa được ảnh bìa, không có gì để bỏ qua");
+    }
+
+    #[test]
+    fn cover_art_is_skipped_with_a_reason_instead_of_failing_the_job() {
+        // FR-210, và là điểm dễ hỏng nhất của cả tính năng: truyền
+        // `--embed-thumbnail` cho một container không chứa được ảnh bìa khiến
+        // bộ hậu xử lý của yt-dlp ném lỗi và GIẾT tác vụ. Người dùng chọn WAV
+        // rồi mất luôn cả file, chỉ vì một lựa chọn phụ không áp dụng được.
+        for (label, job) in [
+            ("WAV", {
+                let mut job = audio_job_with(AudioOutput::Wav);
+                job.output_options.embed_thumbnail = true;
+                job
+            }),
+            ("giữ nguyên định dạng gốc", {
+                let mut job = audio_job_with(AudioOutput::Source);
+                job.output_options.embed_thumbnail = true;
+                job
+            }),
+        ] {
+            let plan = build_ytdlp_args(&job, 0).expect("{label}: vẫn phải dựng được tham số");
+
+            assert!(
+                !plan.args.contains(&"--embed-thumbnail".to_string()),
+                "{label}: không được truyền cờ nhúng ảnh bìa"
+            );
+            assert_eq!(plan.skipped.len(), 1, "{label}: phải ghi lại đúng một lý do");
+            assert!(
+                plan.skipped[0].contains("cover art"),
+                "{label}: lý do phải nói rõ chuyện gì bị bỏ qua, nhận được {:?}",
+                plan.skipped[0]
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_reported_as_skipped_when_cover_art_was_never_requested() {
+        // Mặt còn lại: nếu người dùng không bật nhúng ảnh bìa thì WAV cũng
+        // không có gì để "bỏ qua" — một dòng nhật ký giải thích thứ chưa ai
+        // yêu cầu chỉ làm nhiễu.
+        let plan = build_ytdlp_args(&audio_job_with(AudioOutput::Wav), 0).unwrap();
+        assert!(plan.skipped.is_empty());
     }
 
     #[test]

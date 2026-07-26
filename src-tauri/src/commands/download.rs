@@ -5,7 +5,7 @@ use tauri::State;
 use crate::commands::media::PreviewCache;
 use crate::downloader::queue::DownloadQueue;
 use crate::error::AppError;
-use crate::models::{DownloadJob, GalleryMode, JobStatus, MediaType};
+use crate::models::{DownloadJob, GalleryMode, JobStatus, MediaType, OutputOptions};
 use crate::platform::detect_platform;
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -53,6 +53,12 @@ pub struct CreateJobInput {
     /// `models::DownloadJob.title`.
     #[serde(default)]
     pub title: Option<String>,
+    /// Output format/metadata choices (`specs/003-media-output`). Optional on
+    /// purpose: a caller that omits it gets `OutputOptions::default()`, which
+    /// is byte-for-byte today's behaviour, so the frontend can adopt the
+    /// picker without a lockstep change.
+    #[serde(default)]
+    pub output_options: Option<OutputOptions>,
 }
 
 /// Validates the requested quality against the most recent `preview_media`
@@ -155,6 +161,7 @@ struct NewJobArgs {
     parent_playlist_id: Option<String>,
     title: Option<String>,
     playlist_title: Option<String>,
+    output_options: OutputOptions,
 }
 
 fn new_job(args: NewJobArgs) -> DownloadJob {
@@ -197,6 +204,7 @@ fn new_job(args: NewJobArgs) -> DownloadJob {
         queue_position: 0.0,
         retry_count: 0,
         next_retry_at: None,
+        output_options: args.output_options,
     }
 }
 
@@ -259,6 +267,8 @@ pub async fn create_download_job(
                 // fanned-out entry as the group header.
                 title: None,
                 playlist_title: Some(preview.title.clone()),
+                // FR-232: một bộ lựa chọn đầu ra áp cho toàn bộ lô fan-out.
+                output_options: input.output_options.clone().unwrap_or_default(),
             });
             queue.enqueue(&mut job).await?;
             jobs.push(job);
@@ -285,6 +295,9 @@ pub async fn create_download_job(
         parent_playlist_id: None,
         title: input.title,
         playlist_title: None,
+        // Bỏ trống nghĩa là "không nêu lựa chọn nào", và `default()` đúng bằng
+        // hành vi hiện tại — nên giao diện chưa cập nhật vẫn chạy y như cũ.
+        output_options: input.output_options.unwrap_or_default(),
     });
     queue.enqueue(&mut job).await?;
     Ok(vec![job])
@@ -311,6 +324,10 @@ pub struct CreatePlaylistJobsInput {
     /// job created from this submission as the queue's group header.
     #[serde(default)]
     pub playlist_title: Option<String>,
+    /// One set of output choices applied to every picked video (FR-232).
+    /// Omitted means `OutputOptions::default()`, i.e. today's behaviour.
+    #[serde(default)]
+    pub output_options: Option<OutputOptions>,
 }
 
 /// The detailed playlist download flow: one job per user-picked video, each
@@ -357,6 +374,7 @@ pub async fn create_playlist_download_jobs(
             parent_playlist_id: Some(parent_playlist_id.clone()),
             title: item.title,
             playlist_title: input.playlist_title.clone(),
+            output_options: input.output_options.clone().unwrap_or_default(),
         });
         queue.enqueue(&mut job).await?;
         jobs.push(job);

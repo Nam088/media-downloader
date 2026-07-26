@@ -4,6 +4,107 @@ export type MediaType = "audio" | "video" | "gallery";
  * the reference implementation offered for a TikTok slideshow post. */
 export type GalleryMode = "files" | "audio_only" | "images_only" | "slideshow";
 
+/** The audio output format the user picked (FR-201).
+ *
+ * A discriminated union on `format`, not a `{ format, bitrate }` pair, and
+ * that is the whole point: FR-203 says a bitrate only means anything for a
+ * lossy codec, so `bitrate_kbps` exists **only** on the lossy members. TypeScript
+ * then rejects `{ format: "flac", bitrate_kbps: 320 }` outright — the invalid
+ * combination cannot be built, rather than being built and then hidden by the
+ * picker. The Rust enum (`models::AudioOutput`) has exactly this shape, so the
+ * guarantee holds on both sides of the bridge.
+ *
+ * `bitrate_kbps` omitted/null on a lossy format means "no specific bitrate
+ * chosen": the backend falls back to the quality label already validated
+ * against the source's real format list (`DownloadJob.audio_quality`), and
+ * failing that, lets yt-dlp pick its own best.
+ *
+ * `"source"` means keep the source's format untouched — no transcoding step
+ * runs at all (FR-202). */
+export type AudioOutput =
+  | { format: "mp3"; bitrate_kbps?: number | null }
+  | { format: "m4a"; bitrate_kbps?: number | null }
+  | { format: "opus"; bitrate_kbps?: number | null }
+  | { format: "wav" }
+  | { format: "flac" }
+  | { format: "source" };
+
+/** Output container for video jobs (FR-204). `"source"` keeps whatever the
+ * source served — no remux is forced. */
+export type VideoContainer = "mp4" | "mkv" | "source";
+
+/** FR-205. `"compatibility"` is today's H.264/AAC behaviour, playable
+ * essentially everywhere, and stays the default. `"quality"` takes the best
+ * the source offers including VP9/AV1 — better compression, but older players
+ * and many TVs cannot decode it. */
+export type CodecPreference = "compatibility" | "quality";
+
+/** Every output choice attached to one job, stored with it so a retry
+ * reproduces the original configuration (FR-235). */
+export interface OutputOptions {
+  audio: AudioOutput;
+  video_container: VideoContainer;
+  codec_preference: CodecPreference;
+  /** FR-208 — embed title/artist/source/upload date into the file. */
+  embed_metadata: boolean;
+  /** FR-209 — embed the thumbnail as cover art. Silently skipped, with the
+   * reason written to the log, when the target container cannot hold cover
+   * art (WAV, or "keep source format" where the container is unknown ahead of
+   * time). That is never a job failure (FR-210). */
+  embed_thumbnail: boolean;
+}
+
+/** What a **new** job's picker should start on: metadata and cover art on, per
+ * FR-208/FR-209.
+ *
+ * Deliberately NOT the same as Rust's `OutputOptions::default()`, which has
+ * both embed flags off. The two answer different questions. Rust's default
+ * answers "what did a job that predates this feature mean?" — and the only
+ * correct answer is "exactly what it did when it ran", which is no embedding.
+ * This constant answers "what should a new job start as?", which FR-208/209
+ * govern. Collapsing them into one value is how a default change silently
+ * rewrites the meaning of old rows: every previously-finished job would
+ * retroactively claim it had asked for embedded metadata, and retrying it
+ * would produce a different file than the original (FR-235).
+ *
+ * Send this explicitly from the picker; omitting `output_options` entirely
+ * gets the legacy no-embed behaviour. */
+export const NEW_JOB_OUTPUT_OPTIONS: OutputOptions = {
+  audio: { format: "mp3" },
+  video_container: "mp4",
+  codec_preference: "compatibility",
+  embed_metadata: true,
+  embed_thumbnail: true,
+};
+
+/** Whether a bitrate control should be shown at all for this format (FR-203).
+ * Lossless formats and "keep source" have no bitrate to set — the type has no
+ * field for one either. */
+export function supportsBitrate(audio: AudioOutput): boolean {
+  return audio.format === "mp3" || audio.format === "m4a" || audio.format === "opus";
+}
+
+/** Whether the chosen output can hold embedded cover art (FR-209/FR-210), so
+ * the UI can explain why the control is unavailable instead of silently
+ * dropping the request (SC-209). Mirrors `queue::thumbnail_support` — keep the
+ * two in step.
+ *
+ * `"source"` reports `false` on purpose: the real container is decided by the
+ * source at download time and may be one yt-dlp cannot embed into (WebM), so
+ * the backend skips embedding rather than risk failing the job. */
+export function supportsCoverArt(
+  mediaType: MediaType,
+  options: OutputOptions,
+): boolean {
+  if (mediaType === "audio") {
+    return options.audio.format !== "wav" && options.audio.format !== "source";
+  }
+  if (mediaType === "video") {
+    return options.video_container !== "source";
+  }
+  return false;
+}
+
 export type JobStatus =
   | "queued"
   | "fetching_metadata"
@@ -108,6 +209,14 @@ export interface DownloadJob {
   /** When non-null and in the future, this job is waiting for its retry turn
    * and the dispatcher skips it until then. */
   next_retry_at: string | null;
+  /** The output choices this job was created with (FR-235), so the queue can
+   * show what a job will actually produce and a retry reproduces it exactly.
+   *
+   * Optional on the read side only: the backend always serialises it, but
+   * jobs stored before this feature existed carry no choices of their own and
+   * come back as the Rust default (MP3/MP4, compatibility, no embedding) —
+   * which is precisely the behaviour they ran with. */
+  output_options?: OutputOptions;
 }
 
 export interface AppError {
@@ -131,6 +240,11 @@ export interface CreateJobInput {
   playlist_scope?: "single_item" | "entire_playlist";
   /** This job's own display title (e.g. `MediaSource.title`). */
   title?: string;
+  /** Output format/metadata choices. Omitting it is a valid, supported call
+   * and yields today's behaviour exactly (MP3/MP4, compatibility codecs, no
+   * embedding) — so the picker can be adopted incrementally. Send
+   * `NEW_JOB_OUTPUT_OPTIONS` as the starting point for a new job. */
+  output_options?: OutputOptions;
 }
 
 /** One entry submitted to `create_playlist_download_jobs` — lets each video
@@ -151,6 +265,9 @@ export interface CreatePlaylistJobsInput {
   /** The playlist's own title (`MediaSource.title`), shared across every job
    * created from this submission as the queue's group header. */
   playlist_title?: string;
+  /** One set of output choices applied to every picked video (FR-232).
+   * Omitted means today's behaviour. */
+  output_options?: OutputOptions;
 }
 
 export interface JobProgressEvent {
