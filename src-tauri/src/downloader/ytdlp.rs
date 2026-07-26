@@ -242,14 +242,11 @@ fn classify_ytdlp_error(stderr: &str) -> AppError {
         AppError::access_denied(stderr.lines().last().unwrap_or(stderr).to_string())
     } else if lower.contains("unsupported url") || lower.contains("no extractor") {
         AppError::unsupported_platform(stderr.lines().last().unwrap_or(stderr))
-    } else if crate::downloader::retry::has_network_marker(&lower) {
+    } else if crate::downloader::retry::has_network_marker(stderr) {
         // Kiểm tra lỗi mạng SAU các lỗi nội dung: một thông báo "private video"
-        // đôi khi cũng chứa từ "connection", và lỗi nội dung phải thắng để không
-        // bị thử lại vô ích.
-        AppError::new(
-            "NETWORK_ERROR",
-            stderr.lines().last().unwrap_or(stderr).to_string(),
-        )
+        // đôi khi cũng chứa từ "connection reset", và lỗi nội dung phải thắng
+        // để không bị thử lại vô ích.
+        AppError::network_error(stderr.lines().last().unwrap_or(stderr).to_string())
     } else {
         AppError::new(
             "DOWNLOAD_FAILED",
@@ -316,12 +313,12 @@ mod tests {
 
     #[test]
     fn classifies_network_failures_separately() {
+        // Danh sách dấu hiệu đầy đủ được ghim từng cái một trong
+        // `downloader::retry`; ở đây chỉ cần chứng minh nhánh mạng của bộ phân
+        // loại có nối dây tới đó.
         for stderr in [
-            "ERROR: network timeout",
             "ERROR: [Errno 110] Connection timed out",
-            "ERROR: unable to download video data: <urlopen error [Errno -3] Temporary failure in name resolution>",
             "ERROR: Unable to download webpage: HTTP Error 503: Service Unavailable",
-            "ERROR: HTTP Error 429: Too Many Requests",
             "ERROR: Connection reset by peer",
         ] {
             assert_eq!(
@@ -333,18 +330,65 @@ mod tests {
     }
 
     #[test]
-    fn content_failures_do_not_become_network_errors() {
+    fn content_failures_win_over_network_markers_in_the_same_message() {
+        // Đây là test duy nhất ghim THỨ TỰ các nhánh: cả hai chuỗi dưới đây
+        // mang đồng thời dấu hiệu nội dung lẫn dấu hiệu mạng. Nếu ai đó đẩy
+        // nhánh mạng lên trước, chúng sẽ ra NETWORK_ERROR và một video riêng tư
+        // vĩnh viễn sẽ bị thử lại hết vòng này tới vòng khác.
         assert_eq!(
-            classify_ytdlp_error("ERROR: Private video. Sign in if you've been granted access").code,
-            "ACCESS_DENIED"
+            classify_ytdlp_error("ERROR: Private video. Sign in — connection reset while checking").code,
+            "ACCESS_DENIED",
+            "content failure must win over a network marker in the same message"
         );
         assert_eq!(
-            classify_ytdlp_error("ERROR: Unsupported URL: https://example.com").code,
-            "UNSUPPORTED_PLATFORM"
+            classify_ytdlp_error("ERROR: Unsupported URL: https://example.com (connection timed out)").code,
+            "UNSUPPORTED_PLATFORM",
+            "content failure must win over a network marker in the same message"
         );
+    }
+
+    #[test]
+    fn classifies_unknown_errors_as_generic_download_failed() {
         assert_eq!(
             classify_ytdlp_error("ERROR: something unusual happened").code,
             "DOWNLOAD_FAILED"
+        );
+        // "Network Ten" là tên một đài truyền hình, không phải sự cố đường
+        // truyền. Thông báo này là chặn theo bản quyền — vĩnh viễn — nên nó rơi
+        // vào nhóm gom và thất bại ngay, thay vì bắt người dùng chờ hết chuỗi
+        // backoff cho đúng cái ca mà SC-106 đòi phải hỏng nhanh.
+        assert_eq!(
+            classify_ytdlp_error(
+                "ERROR: Video unavailable. This video contains content from Network Ten, who has blocked it"
+            )
+            .code,
+            "DOWNLOAD_FAILED",
+            "tên đài có chữ Network không được biến lỗi bản quyền thành lỗi mạng"
+        );
+    }
+
+    #[test]
+    fn only_the_last_stderr_line_reaches_the_message() {
+        // yt-dlp in cả loạt cảnh báo trước dòng ERROR thật. Nếu nhét nguyên
+        // khối stderr vào `message` thì banner lỗi trên giao diện ngập rác, nên
+        // mỗi nhánh chỉ lấy dòng cuối — kiểm cả bốn vì mỗi nhánh tự lấy một lần.
+        let err = classify_ytdlp_error("WARNING: noise\nERROR: Connection reset by peer");
+        assert_eq!(
+            err.message, "ERROR: Connection reset by peer",
+            "only the last line reaches the UI"
+        );
+
+        let err = classify_ytdlp_error("WARNING: noise\nERROR: Private video. Sign in to view");
+        assert_eq!(err.message, "ERROR: Private video. Sign in to view");
+
+        let err = classify_ytdlp_error("WARNING: noise\nERROR: something unusual happened");
+        assert_eq!(err.message, "ERROR: something unusual happened");
+
+        let err = classify_ytdlp_error("WARNING: noise\nERROR: Unsupported URL: https://example.com");
+        assert!(
+            err.message.ends_with("ERROR: Unsupported URL: https://example.com"),
+            "nhánh này bọc thêm tiền tố nhưng vẫn chỉ lấy dòng cuối: {}",
+            err.message
         );
     }
 }
