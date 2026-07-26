@@ -177,6 +177,263 @@ impl Db {
         Ok(jobs)
     }
 
+    // ---- truy vấn điều phối hàng đợi ----------------------------------
+    //
+    // Cả nhóm dưới đây mang `#[allow(dead_code)]`: chúng là tầng truy vấn cho
+    // bộ điều phối, và bộ điều phối được thêm ở một bước sau. Tới lúc đó các
+    // attribute này phải được gỡ bỏ, không phải để lại — chúng chỉ tồn tại để
+    // tầng DB được ghép và kiểm thử trọn vẹn trước khi có người gọi.
+
+    /// Job kế tiếp mà bộ điều phối được phép khởi chạy: đang `queued`, và
+    /// không nằm trong khoảng chờ thử lại. `now_rfc3339` được truyền vào thay
+    /// vì đọc đồng hồ ở đây để test kiểm soát được thời gian.
+    ///
+    /// Thứ tự: `queue_position` trước, `created_at` sau. Vế thứ hai giữ cho
+    /// các job cũ (đều mang `queue_position = 0` từ migration 0008) vẫn chạy
+    /// đúng thứ tự chúng được tạo.
+    #[allow(dead_code)]
+    pub fn next_dispatchable_job(
+        &self,
+        now_rfc3339: &str,
+    ) -> Result<Option<DownloadJob>, AppError> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT * FROM download_jobs
+             WHERE status = 'queued'
+               AND (next_retry_at IS NULL OR next_retry_at <= ?1)
+             ORDER BY queue_position ASC, created_at ASC
+             LIMIT 1",
+            params![now_rfc3339],
+            row_to_job,
+        )
+        .optional()
+        .map_err(AppError::from)
+    }
+
+    /// Vị trí cho job mới thêm vào cuối hàng đợi.
+    #[allow(dead_code)]
+    pub fn next_queue_position(&self) -> Result<f64, AppError> {
+        let conn = self.conn();
+        let max: Option<f64> = conn.query_row(
+            "SELECT MAX(queue_position) FROM download_jobs
+             WHERE status IN ('queued','paused','downloading','fetching_metadata')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(position_between(max, None))
+    }
+
+    /// Đặt một job vào giữa hai hàng xóm (`None` nghĩa là đầu hoặc cuối danh
+    /// sách) — thao tác đằng sau một lần kéo-thả (FR-117).
+    ///
+    /// Chỉ ghi đúng một dòng. Đó không chỉ là chuyện nhanh: nếu phải đánh số
+    /// lại cả danh sách thì một job được thêm vào trong lúc người dùng đang kéo
+    /// sẽ bị ghi đè vị trí, vì danh sách giao diện gửi lên đã cũ.
+    ///
+    /// Giao diện gửi id của hai hàng xóm chứ không gửi số: giao diện không nên
+    /// phải biết gì về cách đánh số nội bộ.
+    #[allow(dead_code)]
+    pub fn move_job_between(
+        &self,
+        job_id: &str,
+        before_job_id: Option<&str>,
+        after_job_id: Option<&str>,
+    ) -> Result<(), AppError> {
+        let mut before = self.position_of(before_job_id)?;
+        let mut after = self.position_of(after_job_id)?;
+
+        // Chèn liên tiếp vào cùng một chỗ chia đôi khe hở mỗi lần. Khi nó hẹp
+        // tới mức f64 sắp hết chỗ, đánh số lại rồi đọc lại hàng xóm.
+        if needs_renormalize(before, after) {
+            self.renormalize_queue_positions()?;
+            before = self.position_of(before_job_id)?;
+            after = self.position_of(after_job_id)?;
+        }
+
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE download_jobs SET queue_position = ?1, updated_at = ?2 WHERE id = ?3",
+            params![
+                position_between(before, after),
+                Utc::now().to_rfc3339(),
+                job_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn position_of(&self, job_id: Option<&str>) -> Result<Option<f64>, AppError> {
+        let Some(job_id) = job_id else {
+            return Ok(None);
+        };
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT queue_position FROM download_jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(AppError::from)
+    }
+
+    /// Đánh số lại các job chưa kết thúc thành 1.0, 2.0, 3.0… giữ nguyên thứ tự
+    /// hiện tại. Chỉ chạy khi khe hở đã hẹp tới ngưỡng — trong sử dụng bình
+    /// thường gần như không bao giờ xảy ra.
+    #[allow(dead_code)]
+    pub fn renormalize_queue_positions(&self) -> Result<(), AppError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+
+        let ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM download_jobs
+                 WHERE status IN ('queued','paused','downloading','fetching_metadata')
+                 ORDER BY queue_position ASC, created_at ASC",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<String>>>()?
+        };
+
+        for (index, id) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE download_jobs SET queue_position = ?1 WHERE id = ?2",
+                params![(index + 1) as f64, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Gọi một lần lúc khởi động: job còn ghi `downloading`/`fetching_metadata`
+    /// là tàn dư của một phiên bị đóng đột ngột — tiến trình tải của chúng đã
+    /// chết cùng ứng dụng. Chuyển về `paused` để người dùng tiếp tục hoặc huỷ
+    /// (FR-115). Trả về số dòng đã đổi.
+    #[allow(dead_code)]
+    pub fn reset_interrupted_jobs(&self) -> Result<usize, AppError> {
+        let conn = self.conn();
+        let changed = conn.execute(
+            "UPDATE download_jobs SET status = 'paused', updated_at = ?1
+             WHERE status IN ('downloading','fetching_metadata')",
+            params![Utc::now().to_rfc3339()],
+        )?;
+        Ok(changed)
+    }
+
+    /// Cấp vị trí cho các job chưa từng có vị trí thật.
+    ///
+    /// Migration 0008 chỉ đánh số một lần cho các dòng có sẵn tại thời điểm nó
+    /// chạy. Một job được chèn bởi đường nào đó không đi qua `enqueue` sẽ mang
+    /// `queue_position = 0.0` và vì thế sắp trước *mọi* job đã được đánh số —
+    /// một lỗi thứ tự âm thầm, không bao giờ tự khỏi vì backfill không quay
+    /// lại lần hai.
+    ///
+    /// Gọi một lần lúc khởi động, cạnh `reset_interrupted_jobs`. Trong vận
+    /// hành bình thường nó không đổi dòng nào; nó tồn tại để bất biến "mọi job
+    /// đều có vị trí phân biệt" không phụ thuộc vào việc mọi đường tạo job đều
+    /// nhớ gọi đúng hàm.
+    #[allow(dead_code)]
+    pub fn repair_unpositioned_jobs(&self) -> Result<usize, AppError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+
+        let ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM download_jobs
+                 WHERE queue_position = 0
+                   AND status IN ('queued','paused','downloading','fetching_metadata')
+                 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<String>>>()?
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let max: Option<f64> =
+            tx.query_row("SELECT MAX(queue_position) FROM download_jobs", [], |row| {
+                row.get(0)
+            })?;
+        let mut next = max.unwrap_or(0.0);
+
+        // Xếp vào cuối theo thứ tự tạo: chúng chưa từng được người dùng sắp
+        // xếp, nên không có ý định nào để bảo toàn.
+        for id in &ids {
+            next += 1.0;
+            tx.execute(
+                "UPDATE download_jobs SET queue_position = ?1 WHERE id = ?2",
+                params![next, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ids.len())
+    }
+
+    /// Đưa job về hàng chờ kèm mốc thời gian được phép thử lại (FR-121).
+    /// `error_message` được giữ lại để giao diện hiển thị lý do đang chờ.
+    #[allow(dead_code)]
+    pub fn mark_job_for_retry(
+        &self,
+        job_id: &str,
+        next_retry_at_rfc3339: &str,
+        error_message: &str,
+    ) -> Result<(), AppError> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE download_jobs
+             SET status = 'queued',
+                 retry_count = retry_count + 1,
+                 next_retry_at = ?1,
+                 error_message = ?2,
+                 updated_at = ?3
+             WHERE id = ?4",
+            params![
+                next_retry_at_rfc3339,
+                error_message,
+                Utc::now().to_rfc3339(),
+                job_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Đổi trạng thái hàng loạt, trả về id các job thực sự bị đổi để tầng gọi
+    /// biết cần phát sự kiện cho những job nào (FR-118).
+    #[allow(dead_code)]
+    pub fn bulk_update_status(
+        &self,
+        from_statuses: &[JobStatus],
+        to_status: JobStatus,
+    ) -> Result<Vec<String>, AppError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let placeholders = from_statuses
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let status_strs: Vec<&str> = from_statuses.iter().map(|s| s.as_str()).collect();
+
+        let ids: Vec<String> = {
+            let sql = format!("SELECT id FROM download_jobs WHERE status IN ({placeholders})");
+            let mut stmt = tx.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(status_strs.iter()), |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<String>>>()?
+        };
+
+        for id in &ids {
+            tx.execute(
+                "UPDATE download_jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![to_status.as_str(), Utc::now().to_rfc3339(), id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
     // ---- downloaded_files ---------------------------------------------
 
     pub fn insert_downloaded_file(
@@ -262,6 +519,42 @@ impl Db {
         Self::set_setting(&conn, "default_output_directory", &settings.default_output_directory)?;
         Self::set_setting(&conn, "show_logs_tab", if settings.show_logs_tab { "1" } else { "0" })?;
         Ok(())
+    }
+}
+
+// Ba mục dưới đây cũng chỉ được gọi từ test cho tới khi bộ điều phối xuất
+// hiện — xem ghi chú ở đầu nhóm truy vấn điều phối trong `impl Db`.
+
+/// Khe hở hẹp nhất còn chấp nhận được giữa hai vị trí liền kề.
+///
+/// `f64` có 52 bit phần định trị, nên trên lý thuyết còn chia đôi được sâu hơn
+/// ngưỡng này rất nhiều. Đặt ngưỡng cao hơn giới hạn thật nhiều bậc để không
+/// bao giờ chạm tới vùng mà phép lấy điểm giữa trả về đúng bằng một trong hai
+/// đầu mút — lúc đó thứ tự sẽ hỏng một cách âm thầm.
+#[allow(dead_code)]
+const MIN_POSITION_GAP: f64 = 1e-6;
+
+/// Vị trí nằm giữa hai hàng xóm. `None` nghĩa là không có hàng xóm ở phía đó,
+/// tức là đang thả vào đầu hoặc cuối danh sách.
+#[allow(dead_code)]
+pub fn position_between(before: Option<f64>, after: Option<f64>) -> f64 {
+    match (before, after) {
+        (None, None) => 1.0,
+        (None, Some(after)) => after - 1.0,
+        (Some(before), None) => before + 1.0,
+        (Some(before), Some(after)) => (before + after) / 2.0,
+    }
+}
+
+/// Khe hở giữa hai hàng xóm đã hẹp tới mức phải đánh số lại chưa.
+///
+/// Chỉ đúng khi có cả hai hàng xóm: ở đầu hoặc cuối danh sách thì luôn còn chỗ
+/// vì ta cộng/trừ hẳn 1.0 chứ không chia đôi.
+#[allow(dead_code)]
+pub fn needs_renormalize(before: Option<f64>, after: Option<f64>) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => (after - before).abs() < MIN_POSITION_GAP,
+        _ => false,
     }
 }
 
@@ -496,6 +789,238 @@ mod tests {
         assert!(
             positions.iter().all(|position| *position > 0.0),
             "không dòng cũ nào được phép giữ mặc định 0, nhận được {positions:?}"
+        );
+    }
+
+    #[test]
+    fn next_dispatchable_job_respects_position_then_created_at() {
+        let db = temp_db();
+        let mut later = sample_job("later");
+        later.queue_position = 5.0;
+        later.created_at = "2026-07-26T00:00:00Z".to_string();
+        let mut earlier = sample_job("earlier");
+        earlier.queue_position = 1.0;
+        earlier.created_at = "2026-07-26T23:00:00Z".to_string();
+        db.insert_job(&later).unwrap();
+        db.insert_job(&earlier).unwrap();
+
+        let picked = db
+            .next_dispatchable_job("2026-07-27T00:00:00Z")
+            .unwrap()
+            .expect("a job is dispatchable");
+        assert_eq!(picked.id, "earlier", "queue_position thắng created_at");
+    }
+
+    #[test]
+    fn next_dispatchable_job_skips_jobs_waiting_to_retry() {
+        let db = temp_db();
+        let mut waiting = sample_job("waiting");
+        waiting.next_retry_at = Some("2026-07-26T00:10:00Z".to_string());
+        db.insert_job(&waiting).unwrap();
+
+        let too_early = db.next_dispatchable_job("2026-07-26T00:05:00Z").unwrap();
+        assert!(
+            too_early.is_none(),
+            "chưa tới giờ thử lại thì không được chọn"
+        );
+
+        let due = db.next_dispatchable_job("2026-07-26T00:10:01Z").unwrap();
+        assert_eq!(due.expect("tới giờ rồi").id, "waiting");
+    }
+
+    #[test]
+    fn next_dispatchable_job_ignores_non_queued_statuses() {
+        let db = temp_db();
+        let mut paused = sample_job("paused");
+        paused.status = JobStatus::Paused;
+        db.insert_job(&paused).unwrap();
+
+        assert!(db
+            .next_dispatchable_job("2026-07-27T00:00:00Z")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn next_queue_position_appends_past_the_maximum() {
+        let db = temp_db();
+        assert_eq!(
+            db.next_queue_position().unwrap(),
+            1.0,
+            "hàng đợi rỗng bắt đầu từ 1.0"
+        );
+
+        let mut job = sample_job("job-1");
+        job.queue_position = 4.0;
+        db.insert_job(&job).unwrap();
+        assert_eq!(db.next_queue_position().unwrap(), 5.0);
+    }
+
+    #[test]
+    fn position_between_takes_the_midpoint_of_two_neighbours() {
+        assert_eq!(position_between(Some(1.0), Some(2.0)), 1.5);
+        assert_eq!(position_between(Some(1.5), Some(2.0)), 1.75);
+    }
+
+    #[test]
+    fn position_between_handles_the_ends_of_the_list() {
+        assert_eq!(position_between(None, None), 1.0, "hàng đợi rỗng");
+        assert_eq!(position_between(None, Some(3.0)), 2.0, "thả lên đầu");
+        assert_eq!(position_between(Some(3.0), None), 4.0, "thả xuống cuối");
+    }
+
+    #[test]
+    fn needs_renormalize_only_when_the_gap_has_collapsed() {
+        assert!(!needs_renormalize(Some(1.0), Some(2.0)));
+        assert!(needs_renormalize(Some(1.0), Some(1.0 + 1e-9)));
+        assert!(
+            !needs_renormalize(None, Some(1.0)),
+            "ở đầu hoặc cuối danh sách thì luôn còn chỗ"
+        );
+    }
+
+    #[test]
+    fn move_job_between_only_rewrites_the_moved_row() {
+        let db = temp_db();
+        for (id, position) in [("a", 1.0), ("b", 2.0), ("c", 3.0)] {
+            let mut job = sample_job(id);
+            job.queue_position = position;
+            db.insert_job(&job).unwrap();
+        }
+
+        // Kéo "c" vào giữa "a" và "b".
+        db.move_job_between("c", Some("a"), Some("b")).unwrap();
+
+        assert_eq!(db.get_job("c").unwrap().unwrap().queue_position, 1.5);
+        assert_eq!(
+            db.get_job("a").unwrap().unwrap().queue_position,
+            1.0,
+            "hàng xóm không được đụng tới"
+        );
+        assert_eq!(db.get_job("b").unwrap().unwrap().queue_position, 2.0);
+    }
+
+    #[test]
+    fn move_job_between_renormalizes_when_the_gap_collapses() {
+        let db = temp_db();
+        // Hai hàng xóm sát nhau tới mức không còn chỗ chèn vào giữa.
+        for (id, position) in [("a", 1.0), ("b", 1.0 + 1e-12), ("c", 9.0)] {
+            let mut job = sample_job(id);
+            job.queue_position = position;
+            db.insert_job(&job).unwrap();
+        }
+
+        db.move_job_between("c", Some("a"), Some("b")).unwrap();
+
+        let a = db.get_job("a").unwrap().unwrap().queue_position;
+        let b = db.get_job("b").unwrap().unwrap().queue_position;
+        let c = db.get_job("c").unwrap().unwrap().queue_position;
+        assert!(a < c && c < b, "thứ tự a < c < b phải đúng sau khi chuẩn hoá");
+        assert!(b - a > 0.1, "sau chuẩn hoá khe hở phải rộng trở lại");
+    }
+
+    #[test]
+    fn reset_interrupted_jobs_pauses_downloading_and_fetching() {
+        let db = temp_db();
+        let mut downloading = sample_job("downloading");
+        downloading.status = JobStatus::Downloading;
+        let mut fetching = sample_job("fetching");
+        fetching.status = JobStatus::FetchingMetadata;
+        let mut completed = sample_job("completed");
+        completed.status = JobStatus::Completed;
+        db.insert_job(&downloading).unwrap();
+        db.insert_job(&fetching).unwrap();
+        db.insert_job(&completed).unwrap();
+
+        let count = db.reset_interrupted_jobs().unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(
+            db.get_job("downloading").unwrap().unwrap().status,
+            JobStatus::Paused
+        );
+        assert_eq!(
+            db.get_job("fetching").unwrap().unwrap().status,
+            JobStatus::Paused
+        );
+        assert_eq!(
+            db.get_job("completed").unwrap().unwrap().status,
+            JobStatus::Completed,
+            "job đã xong không được đụng tới"
+        );
+    }
+
+    #[test]
+    fn repair_unpositioned_jobs_appends_them_after_positioned_ones() {
+        let db = temp_db();
+        let mut positioned = sample_job("positioned");
+        positioned.queue_position = 4.0;
+        let mut orphan = sample_job("orphan");
+        orphan.queue_position = 0.0;
+        orphan.created_at = "2026-07-26T01:00:00Z".to_string();
+        db.insert_job(&positioned).unwrap();
+        db.insert_job(&orphan).unwrap();
+
+        let repaired = db.repair_unpositioned_jobs().unwrap();
+
+        assert_eq!(repaired, 1);
+        assert_eq!(
+            db.get_job("positioned").unwrap().unwrap().queue_position,
+            4.0
+        );
+        assert_eq!(
+            db.get_job("orphan").unwrap().unwrap().queue_position,
+            5.0,
+            "job chưa có vị trí phải xếp vào cuối, không phải đầu"
+        );
+    }
+
+    #[test]
+    fn repair_unpositioned_jobs_is_a_no_op_when_everything_has_a_position() {
+        let db = temp_db();
+        let mut job = sample_job("job-1");
+        job.queue_position = 2.0;
+        db.insert_job(&job).unwrap();
+
+        assert_eq!(db.repair_unpositioned_jobs().unwrap(), 0);
+        assert_eq!(db.get_job("job-1").unwrap().unwrap().queue_position, 2.0);
+    }
+
+    #[test]
+    fn mark_job_for_retry_requeues_with_a_future_deadline() {
+        let db = temp_db();
+        let mut running = sample_job("job-1");
+        running.status = JobStatus::Downloading;
+        db.insert_job(&running).unwrap();
+
+        db.mark_job_for_retry("job-1", "2026-07-26T00:00:30Z", "network timeout")
+            .unwrap();
+
+        let loaded = db.get_job("job-1").unwrap().unwrap();
+        assert_eq!(loaded.status, JobStatus::Queued);
+        assert_eq!(loaded.retry_count, 1);
+        assert_eq!(loaded.next_retry_at.as_deref(), Some("2026-07-26T00:00:30Z"));
+        assert_eq!(loaded.error_message.as_deref(), Some("network timeout"));
+    }
+
+    #[test]
+    fn bulk_update_status_returns_the_ids_it_changed() {
+        let db = temp_db();
+        let mut queued = sample_job("queued");
+        queued.status = JobStatus::Queued;
+        let mut done = sample_job("done");
+        done.status = JobStatus::Completed;
+        db.insert_job(&queued).unwrap();
+        db.insert_job(&done).unwrap();
+
+        let changed = db
+            .bulk_update_status(&[JobStatus::Queued], JobStatus::Paused)
+            .unwrap();
+
+        assert_eq!(changed, vec!["queued".to_string()]);
+        assert_eq!(
+            db.get_job("queued").unwrap().unwrap().status,
+            JobStatus::Paused
         );
     }
 }
