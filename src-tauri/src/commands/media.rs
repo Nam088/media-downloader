@@ -110,6 +110,12 @@ pub async fn preview_media(
     previews: State<'_, ActivePreviews>,
     source_url: String,
 ) -> Result<MediaSource, AppError> {
+    // Engine nhạc đã được thử và hụt. Giữ lại vì lỗi mà yt-dlp trả về sau đó
+    // cho một link Spotify ("cần đăng nhập/DRM") đúng về mặt kỹ thuật nhưng
+    // chỉ đường sai hoàn toàn: thứ hỏng là engine nhạc, không phải quyền truy
+    // cập của người dùng.
+    let mut music_engine_failed = false;
+
     // Link nhạc lossless (Spotify/Tidal/Apple Music/Pandora) đi qua engine
     // SpotiFLAC TRƯỚC khi yt-dlp được hỏi: yt-dlp không lỗi "sạch" với các
     // link này (nó trả một preview rỗng thay vì UNSUPPORTED_PLATFORM, nên cơ
@@ -131,6 +137,7 @@ pub async fn preview_media(
                         "preview_media: spotiflac preview failed for {source_url}, falling back to yt-dlp"
                     ),
                 );
+                music_engine_failed = true;
             }
         }
     }
@@ -157,6 +164,9 @@ pub async fn preview_media(
     let (source, playlist_entry_urls) = match result {
         Ok(raw) => {
             if is_login_required(&raw) {
+                if music_engine_failed {
+                    return Err(music_engine_unavailable(&source_url));
+                }
                 return Err(AppError::access_denied(
                     "This content requires login or is private/DRM-protected",
                 ));
@@ -228,6 +238,9 @@ pub async fn preview_media(
                             "preview_media: neither yt-dlp nor gallery-dl support {source_url}"
                         ),
                     );
+                    if music_engine_failed {
+                        return Err(music_engine_unavailable(&source_url));
+                    }
                     return Err(unsupported_after_all_engines(&source_url));
                 }
             }
@@ -480,6 +493,23 @@ fn decode_path_segment(segment: &str) -> String {
 /// người dùng biết vấn đề nằm ở link chứ không phải ở một cấu hình nào họ
 /// quên bật — thông báo "nền tảng không được hỗ trợ" cũ đọc như thể ứng dụng
 /// có một danh sách cho phép cố định, điều nó không hề có (FR-131).
+/// Link nhạc mà engine SpotiFLAC không chạy được, và không engine nào khác
+/// đọc nổi link đó.
+///
+/// Tách khỏi `access_denied`/`unsupported_after_all_engines` vì hai thông báo
+/// kia chỉ sai đường: chúng nói về link hoặc về quyền của người dùng, trong
+/// khi thứ hỏng nằm ở phía ứng dụng (worker chưa được đóng gói, bundle hỏng,
+/// môi trường thiếu thứ gì đó). Người đọc phải mở Logs xem dòng WARN của
+/// engine nhạc chứ không phải đi tìm tài khoản Spotify.
+fn music_engine_unavailable(source_url: &str) -> AppError {
+    AppError::new(
+        "MUSIC_ENGINE_UNAVAILABLE",
+        format!(
+            "The lossless music engine could not read {source_url}. Check the Logs tab for the SpotiFLAC error — the bundled worker may be missing or failed to start."
+        ),
+    )
+}
+
 fn unsupported_after_all_engines(source_url: &str) -> AppError {
     AppError::new(
         "UNSUPPORTED_ALL_ENGINES",
@@ -1048,6 +1078,28 @@ mod tests {
         let source = build_media_source("https://cdn.example.com/clips/beach.mp4", "generic", &raw);
 
         assert_eq!(source.title, "beach.mp4");
+    }
+
+    #[test]
+    fn a_music_link_whose_engine_failed_does_not_get_blamed_on_the_user() {
+        // yt-dlp trả "requires_login" cho mọi link Spotify, nên nếu để nguyên
+        // lỗi của nó thì một worker chưa build được sẽ hiện ra thành "nội dung
+        // riêng tư / cần đăng nhập" — người dùng đi tìm tài khoản Spotify
+        // trong khi thứ hỏng nằm hoàn toàn ở phía ứng dụng.
+        let error = music_engine_unavailable("https://open.spotify.com/track/x");
+
+        assert_eq!(error.code, "MUSIC_ENGINE_UNAVAILABLE");
+        assert!(
+            error.message.contains("Logs"),
+            "phải chỉ người dùng tới chỗ đọc được lý do thật, got: {}",
+            error.message
+        );
+        assert!(
+            !error.message.to_lowercase().contains("login"),
+            "không được nói gì về đăng nhập, got: {}",
+            error.message
+        );
+        assert!(error.message.contains("https://open.spotify.com/track/x"));
     }
 
     #[test]

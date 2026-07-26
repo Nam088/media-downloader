@@ -452,7 +452,8 @@
     "SPOTIFLAC_NO_SOURCE": "None of the music providers could supply this track — it may not exist on any lossless source. Try a normal download with the default engine (yt-dlp) instead.",
     "SPOTIFLAC_REGION_BLOCKED": "Every music provider refused this track because of regional restrictions, so it can't be downloaded from here.",
     "SPOTIFLAC_CHALLENGE_TIMEOUT": "The verification was not completed in time, so the download stopped. Retry it to get a fresh verification link.",
-    "SPOTIFLAC_NODE_MISSING": "Node.js was not found, so the extension providers are unavailable — the download continues with the built-in providers only."
+    "SPOTIFLAC_NODE_MISSING": "Node.js was not found, so the extension providers are unavailable — the download continues with the built-in providers only.",
+    "MUSIC_ENGINE_UNAVAILABLE": "The lossless music engine could not read this link. Open the Logs tab to see what the SpotiFLAC worker reported — its bundled files may be missing or it failed to start."
   },
   "compliance": {
     "title": "Before you start downloading",
