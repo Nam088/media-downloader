@@ -1,3 +1,8 @@
+// Một hằng số, hai chỗ dùng: ô xem trước (FR-213) và giá trị khởi tạo của bộ
+// chọn. Nhập lại từ `lib/filename-template` thay vì viết lại `"{title}"` ở đây
+// để hai nơi không bao giờ lệch nhau.
+import { DEFAULT_TEMPLATE as DEFAULT_FILENAME_TEMPLATE } from "../lib/filename-template";
+
 export type MediaType = "audio" | "video" | "gallery";
 
 /** Only meaningful when `media_type === "gallery"`. Mirrors the three modes
@@ -39,8 +44,67 @@ export type VideoContainer = "mp4" | "mkv" | "source";
  * and many TVs cannot decode it. */
 export type CodecPreference = "compatibility" | "quality";
 
+/** Where the chosen subtitles end up (FR-219). `"separate_files"` writes
+ * `.vtt`/`.srt` files next to the media and works for every output format;
+ * `"embedded"` puts them inside the media file as selectable tracks and only
+ * works for containers that can hold a subtitle track (see
+ * `supportsEmbeddedSubtitles`). */
+export type SubtitleDelivery = "separate_files" | "embedded";
+
+/** FR-217→FR-221. `languages` holds codes taken from
+ * `MediaSource.subtitles[].language` — the languages the source actually has.
+ * There is deliberately no fixed language list anywhere in this file.
+ *
+ * An empty `languages` means "no subtitles", which is the default: a job that
+ * predates this feature never starts pulling extra files.
+ *
+ * `include_auto_generated` is a single flag for the whole selection rather
+ * than a per-language one, because that is exactly how yt-dlp takes it
+ * (`--sub-langs` is a list, `--write-auto-subs` is one flag over that list).
+ * Set it whenever any picked language is only offered as auto-generated
+ * (`MediaSource.subtitles[].auto_generated`). */
+export interface SubtitleOptions {
+  languages: string[];
+  delivery: SubtitleDelivery;
+  include_auto_generated: boolean;
+}
+
+/** The slice of the content to download (FR-222→FR-224). At least one bound
+ * must be set — a range with neither is just "the whole thing", which is
+ * `{ mode: "whole" }`. Validate before submitting: the backend rejects an
+ * end that is not after the start, a negative time, or an empty range with
+ * `INVALID_TRIM_RANGE`. */
+export interface TrimRange {
+  /** Omitted/null means "from the beginning". */
+  start_seconds?: number | null;
+  /** Omitted/null means "to the end". */
+  end_seconds?: number | null;
+  /** FR-224 — cut exactly at the requested times by re-encoding around the
+   * cut points. The UI MUST warn that this makes the job noticeably slower;
+   * left off, cuts land on the nearest keyframe and cost nothing extra. */
+  accurate_cut?: boolean;
+}
+
+/** How the download is divided into files (FR-222→FR-227).
+ *
+ * A discriminated union, not `{ trim, split_chapters }` side by side, and
+ * that is the whole point: FR-226 says trimming and chapter-splitting are
+ * mutually exclusive, and a union makes "both at once" unrepresentable —
+ * TypeScript refuses it, and the Rust enum (`models::SegmentMode`) has the
+ * same shape, so no runtime check has to remember the rule. Disabling one
+ * control in the picker is a UX nicety on top, not the enforcement. */
+export type SegmentMode =
+  | { mode: "whole" }
+  | ({ mode: "trim" } & TrimRange)
+  | { mode: "split_chapters" };
+
 /** Every output choice attached to one job, stored with it so a retry
- * reproduces the original configuration (FR-235). */
+ * reproduces the original configuration (FR-235).
+ *
+ * The fields added after the first release are optional on purpose: the whole
+ * struct is `#[serde(default)]` on the Rust side, so any of them may be
+ * omitted and the backend fills in the value that reproduces today's
+ * behaviour (FR-233). */
 export interface OutputOptions {
   audio: AudioOutput;
   video_container: VideoContainer;
@@ -52,6 +116,17 @@ export interface OutputOptions {
    * art (WAV, or "keep source format" where the container is unknown ahead of
    * time). That is never a job failure (FR-210). */
   embed_thumbnail: boolean;
+  /** FR-212 — `{field}` filename template; see `src/lib/filename-template.ts`
+   * for the renderer that powers the live preview (FR-213). Omitted means
+   * `DEFAULT_TEMPLATE` (`"{title}"`), which reproduces today's names exactly.
+   *
+   * The extension is not part of it: the backend always appends the real one
+   * from the downloaded format, and a trailing `{ext}` is stripped so
+   * `"{title}.{ext}"` doesn't produce `Song.mp4.mp4`. */
+  filename_template?: string;
+  subtitles?: SubtitleOptions;
+  /** Trim **or** chapter-split — never both (FR-226). */
+  segment?: SegmentMode;
 }
 
 /** What a **new** job's picker should start on: metadata and cover art on, per
@@ -76,6 +151,25 @@ export const NEW_JOB_OUTPUT_OPTIONS: OutputOptions = {
   embed_metadata: true,
   embed_thumbnail: true,
 };
+
+/** What the subtitle picker starts on: nothing selected. Spelled out as its
+ * own constant rather than folded into `NEW_JOB_OUTPUT_OPTIONS`, because for
+ * these later options "what a new job starts as" and "what the backend
+ * assumes when the field is absent" are the *same* answer — so sending them
+ * would be noise on the wire, and a picker that never opened would look
+ * indistinguishable from one that was opened and left alone. */
+export const NEW_JOB_SUBTITLE_OPTIONS: SubtitleOptions = {
+  languages: [],
+  delivery: "separate_files",
+  include_auto_generated: false,
+};
+
+/** The whole content in one file — same reasoning as
+ * `NEW_JOB_SUBTITLE_OPTIONS`. */
+export const NEW_JOB_SEGMENT_MODE: SegmentMode = { mode: "whole" };
+
+/** The filename template a new job starts on, i.e. today's names exactly. */
+export const NEW_JOB_FILENAME_TEMPLATE = DEFAULT_FILENAME_TEMPLATE;
 
 /** Whether a bitrate control should be shown at all for this format (FR-203).
  * Lossless formats and "keep source" have no bitrate to set — the type has no
@@ -103,6 +197,46 @@ export function supportsCoverArt(
     return options.video_container !== "source";
   }
   return false;
+}
+
+/** Whether the chosen output can hold an embedded subtitle track
+ * (FR-220), so the picker can disable "embed" with an explanation instead of
+ * letting the backend silently skip it. Mirrors `queue::subtitle_embed_support`
+ * — keep the two in step.
+ *
+ * Audio outputs report `false`: there is no subtitle track inside an MP3.
+ * `"source"` reports `false` for the same reason as cover art — the real
+ * container is decided at download time and may be one that cannot hold
+ * subtitles. Separate subtitle files always work, including for audio. */
+export function supportsEmbeddedSubtitles(
+  mediaType: MediaType,
+  options: OutputOptions,
+): boolean {
+  return mediaType === "video" && options.video_container !== "source";
+}
+
+/** Why a trim range is unusable, or `null` when it is fine (FR-223). Mirrors
+ * `models::TrimRange::validate` so the field-level error the user sees is the
+ * same rule the backend enforces — with one addition the backend cannot make:
+ * `durationSeconds`, which lives on the preview, not on the job.
+ *
+ * Returns a stable reason code, not a sentence: the message belongs in the
+ * locale files. */
+export function validateTrimRange(
+  range: TrimRange,
+  durationSeconds?: number | null,
+): "empty" | "negative" | "end_before_start" | "beyond_duration" | null {
+  const { start_seconds: start, end_seconds: end } = range;
+  if (start == null && end == null) return "empty";
+  for (const bound of [start, end]) {
+    if (bound == null) continue;
+    if (!Number.isFinite(bound) || bound < 0) return "negative";
+  }
+  if (start != null && end != null && end <= start) return "end_before_start";
+  if (durationSeconds != null && durationSeconds > 0) {
+    if ((start ?? 0) >= durationSeconds) return "beyond_duration";
+  }
+  return null;
 }
 
 export type JobStatus =
@@ -147,6 +281,32 @@ export interface PlaylistEntryPreview {
   thumbnail_url: string | null;
 }
 
+/** One subtitle language the source actually offers (FR-217).
+ *
+ * `auto_generated` separates the author's own subtitles from machine-made
+ * ones — they come from two different maps in yt-dlp's output
+ * (`subtitles` vs `automatic_captions`), so this is source data, not a guess.
+ * When a language has both, only the author's is listed.
+ *
+ * `label` is the source's own human name (`"Vietnamese"`) and is `null` when
+ * it doesn't provide one — no name is invented from the code (FR-211), so the
+ * UI decides how to render a bare `"vi"`. */
+export interface SubtitleTrackPreview {
+  /** The code that goes into the download request, e.g. `"vi"`, `"en-US"`. */
+  language: string;
+  label: string | null;
+  auto_generated: boolean;
+}
+
+/** One chapter of the content (FR-225). `title` is `null` when the source
+ * gives the chapter no name — the UI supplies a placeholder, the backend
+ * never invents one (FR-211). */
+export interface ChapterPreview {
+  title: string | null;
+  start_seconds: number | null;
+  end_seconds: number | null;
+}
+
 /** Options are always populated from the real formats yt-dlp returned for
  * this specific link (FR-004, FR-019) — never a fixed list in this file.
  *
@@ -167,6 +327,24 @@ export interface MediaSource {
   is_gallery: boolean;
   gallery_items: GalleryItemPreview[];
   playlist_entries: PlaylistEntryPreview[];
+  /** The subtitle languages this source really has (FR-217). Three states,
+   * three different meanings — which is why it is nullable rather than a
+   * plain array:
+   *   - `null`: **not checked**. A gallery-dl preview, or a flat-playlist
+   *     preview (per-video metadata isn't fetched at that depth). Say
+   *     "unknown"; do not render an empty picker that reads as "still
+   *     loading".
+   *   - `[]`: checked, and the source has **no** subtitles — hide or disable
+   *     the subtitle section with an explanation (FR-221).
+   *   - non-empty: the real list; use it as-is.
+   *
+   * Optional only for older fixtures — the backend always sends the field. */
+  subtitles?: SubtitleTrackPreview[] | null;
+  /** The chapter list (FR-225), with the same three states as `subtitles`:
+   * `null` = not checked, `[]` = checked and there are none (disable the
+   * chapter-split option with an explanation), non-empty = show the count and
+   * enable it. */
+  chapters?: ChapterPreview[] | null;
 }
 
 export interface DownloadJob {
@@ -305,4 +483,11 @@ export interface JobStatusChangedEvent {
   status: JobStatus;
   error_message: string | null;
   output_file_path: string | null;
+  /** FR-227 — how many files this run produced: the original **plus** one per
+   * chapter, and only for a chapter-split job. `null`/absent means the usual
+   * single file, not "no files".
+   *
+   * A count on one event for one job, never N new queue rows: a chapter split
+   * stays exactly one entry in the queue and in history. */
+  produced_file_count?: number | null;
 }
