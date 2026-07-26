@@ -341,6 +341,12 @@ fn classify_gallery_dl_error(stderr: &str) -> AppError {
         AppError::unsupported_platform(stderr.lines().last().unwrap_or(stderr))
     } else if lower.contains("401") || lower.contains("403") || lower.contains("private") || lower.contains("login") {
         AppError::access_denied(stderr.lines().last().unwrap_or(stderr).to_string())
+    } else if crate::downloader::retry::has_network_marker(&lower) {
+        // Kiểm tra lỗi mạng SAU các lỗi nội dung, cùng lý do như trong `ytdlp`.
+        AppError::new(
+            "NETWORK_ERROR",
+            stderr.lines().last().unwrap_or(stderr).to_string(),
+        )
     } else {
         AppError::new(
             "DOWNLOAD_FAILED",
@@ -426,7 +432,19 @@ mod tests {
 
     #[test]
     fn classifies_unknown_errors_as_generic_download_failed() {
-        let err = classify_gallery_dl_error("[gallery-dl][error] network timeout");
+        let err = classify_gallery_dl_error("[gallery-dl][error] something unusual happened");
         assert_eq!(err.code, "DOWNLOAD_FAILED");
+    }
+
+    #[test]
+    fn classifies_network_failures_separately() {
+        assert_eq!(
+            classify_gallery_dl_error("ConnectionError: Connection timed out").code,
+            "NETWORK_ERROR"
+        );
+        assert_eq!(
+            classify_gallery_dl_error("HttpError: 403 Forbidden").code,
+            "ACCESS_DENIED"
+        );
     }
 }

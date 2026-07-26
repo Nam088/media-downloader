@@ -132,6 +132,7 @@
     "INVALID_QUALITY_OPTION": "The selected quality is no longer available for this link. Please preview it again.",
     "PREVIEW_REQUIRED": "Please preview the link before downloading.",
     "DOWNLOAD_FAILED": "The download failed. Please try again or use a different link.",
+    "NETWORK_ERROR": "Network problem. Check your connection — the download will retry automatically.",
     "NOT_FOUND": "This item could not be found.",
     "INVALID_JOB_STATE": "This action isn't available for the current download state.",
     "MISSING_QUALITY": "Please choose a quality before downloading.",

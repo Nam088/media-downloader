@@ -242,6 +242,14 @@ fn classify_ytdlp_error(stderr: &str) -> AppError {
         AppError::access_denied(stderr.lines().last().unwrap_or(stderr).to_string())
     } else if lower.contains("unsupported url") || lower.contains("no extractor") {
         AppError::unsupported_platform(stderr.lines().last().unwrap_or(stderr))
+    } else if crate::downloader::retry::has_network_marker(&lower) {
+        // Kiểm tra lỗi mạng SAU các lỗi nội dung: một thông báo "private video"
+        // đôi khi cũng chứa từ "connection", và lỗi nội dung phải thắng để không
+        // bị thử lại vô ích.
+        AppError::new(
+            "NETWORK_ERROR",
+            stderr.lines().last().unwrap_or(stderr).to_string(),
+        )
     } else {
         AppError::new(
             "DOWNLOAD_FAILED",
@@ -307,8 +315,36 @@ mod tests {
     }
 
     #[test]
-    fn classifies_unknown_errors_as_generic_download_failed() {
-        let err = classify_ytdlp_error("ERROR: network timeout");
-        assert_eq!(err.code, "DOWNLOAD_FAILED");
+    fn classifies_network_failures_separately() {
+        for stderr in [
+            "ERROR: network timeout",
+            "ERROR: [Errno 110] Connection timed out",
+            "ERROR: unable to download video data: <urlopen error [Errno -3] Temporary failure in name resolution>",
+            "ERROR: Unable to download webpage: HTTP Error 503: Service Unavailable",
+            "ERROR: HTTP Error 429: Too Many Requests",
+            "ERROR: Connection reset by peer",
+        ] {
+            assert_eq!(
+                classify_ytdlp_error(stderr).code,
+                "NETWORK_ERROR",
+                "phải nhận ra là lỗi mạng: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_failures_do_not_become_network_errors() {
+        assert_eq!(
+            classify_ytdlp_error("ERROR: Private video. Sign in if you've been granted access").code,
+            "ACCESS_DENIED"
+        );
+        assert_eq!(
+            classify_ytdlp_error("ERROR: Unsupported URL: https://example.com").code,
+            "UNSUPPORTED_PLATFORM"
+        );
+        assert_eq!(
+            classify_ytdlp_error("ERROR: something unusual happened").code,
+            "DOWNLOAD_FAILED"
+        );
     }
 }

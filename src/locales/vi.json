@@ -131,6 +131,7 @@
     "INVALID_QUALITY_OPTION": "Mức chất lượng đã chọn không còn khả dụng cho liên kết này. Vui lòng xem trước lại.",
     "PREVIEW_REQUIRED": "Vui lòng xem trước liên kết trước khi tải.",
     "DOWNLOAD_FAILED": "Tải thất bại. Vui lòng thử lại hoặc dùng liên kết khác.",
+    "NETWORK_ERROR": "Sự cố mạng. Kiểm tra kết nối — bản tải sẽ tự thử lại.",
     "NOT_FOUND": "Không tìm thấy mục này.",
     "INVALID_JOB_STATE": "Thao tác này không khả dụng với trạng thái tải hiện tại.",
     "MISSING_QUALITY": "Vui lòng chọn mức chất lượng trước khi tải.",
