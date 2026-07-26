@@ -3,3 +3,4 @@ pub mod history;
 pub mod media;
 pub mod queue_control;
 pub mod settings;
+pub mod url_list;

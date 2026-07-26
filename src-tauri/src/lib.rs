@@ -72,6 +72,7 @@ pub fn run() {
             commands::history::list_queue,
             commands::history::list_history,
             commands::history::open_containing_folder,
+            commands::url_list::read_url_list_file,
             logging::get_logs,
             logging::clear_logs,
         ])
