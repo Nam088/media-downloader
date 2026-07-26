@@ -37,7 +37,7 @@ import {
 import { buildJobInput } from "@/lib/build-job-input";
 import { trimErrorFor } from "@/lib/trim-input";
 import { audioOutputDetail, videoOutputDetail } from "@/lib/output-format-labels";
-import { formatDuration, formatFileSize } from "@/lib/format";
+import { CURATED_PLATFORMS, formatDuration, formatFileSize, formatPlatformLabel } from "@/lib/format";
 import { dedupeUrls, extractUrlsFromText } from "@/lib/url-parsing";
 import { NEW_JOB_OUTPUT_OPTIONS } from "@/types/download";
 import type {
@@ -51,23 +51,6 @@ import type {
   OutputOptions,
   VideoQualityOption,
 } from "@/types/download";
-
-const PLATFORM_DISPLAY_NAMES: Record<string, string> = {
-  youtube: "YouTube",
-  tiktok: "TikTok",
-  facebook: "Facebook",
-  instagram: "Instagram",
-  twitter_x: "X (Twitter)",
-  soundcloud: "SoundCloud",
-};
-
-/** `preview.platform` is whatever the backend resolved it to — one of the 6
- * required platforms, or yt-dlp's own extractor name for anything else (see
- * `commands::media::resolve_platform_label`) — so this only prettifies the
- * label, it never decides what's allowed. */
-function platformDisplayName(platform: string): string {
-  return PLATFORM_DISPLAY_NAMES[platform] ?? platform.charAt(0).toUpperCase() + platform.slice(1);
-}
 
 /** One row in the quality picker — mirrors the reference layout: radio +
  * bold quality label + codec detail + right-aligned estimated size. Options
@@ -550,9 +533,9 @@ export function DownloadForm() {
                 <span className="text-xs font-semibold text-muted-foreground mr-1">
                   {t("downloadForm.supported_label")}
                 </span>
-                {Object.values(PLATFORM_DISPLAY_NAMES).map((plat) => (
-                  <span key={plat} className="rounded-md bg-muted/70 px-2.5 py-1 text-xs font-semibold text-foreground/80 border border-border/50">
-                    {plat}
+                {CURATED_PLATFORMS.map((platform) => (
+                  <span key={platform} className="rounded-md bg-muted/70 px-2.5 py-1 text-xs font-semibold text-foreground/80 border border-border/50">
+                    {formatPlatformLabel(platform)}
                   </span>
                 ))}
               </div>
@@ -594,7 +577,7 @@ export function DownloadForm() {
                   </div>
                 </div>
                 <Badge variant="secondary" className="w-fit rounded-md font-semibold text-xs px-2.5 py-0.5">
-                  {platformDisplayName(preview.platform)}
+                  {formatPlatformLabel(preview.platform)}
                 </Badge>
               </div>
             </div>

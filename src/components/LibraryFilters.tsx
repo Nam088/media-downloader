@@ -3,6 +3,7 @@ import { ArrowDownWideNarrow, ArrowUpNarrowWide, LayoutGrid, List, Search, X } f
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { formatPlatformLabel } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { hasActiveFilters, useLibraryStore } from "@/stores/library-store";
 import type { MediaType } from "@/types/download";
@@ -143,7 +144,7 @@ export function LibraryFilters() {
                 onClick={() => togglePlatform(platform)}
                 testId={`library-filter-platform-${platform}`}
               >
-                {platform}
+                {formatPlatformLabel(platform)}
               </Chip>
             ))}
           </FilterRow>
@@ -210,7 +211,7 @@ export function LibraryFilters() {
               </ActiveChip>
             ))}
             {filters.platforms.map((platform) => (
-              <ActiveChip key={`platform-${platform}`}>{platform}</ActiveChip>
+              <ActiveChip key={`platform-${platform}`}>{formatPlatformLabel(platform)}</ActiveChip>
             ))}
             {filters.formats.map((format) => (
               <ActiveChip key={`format-${format}`}>{format}</ActiveChip>

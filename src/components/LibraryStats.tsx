@@ -1,7 +1,7 @@
 import { useTranslation } from "react-i18next";
 import { FileWarning, HardDrive, Layers } from "lucide-react";
 
-import { formatFileSize } from "@/lib/format";
+import { formatFileSize, formatPlatformLabel } from "@/lib/format";
 import { useLibraryStore } from "@/stores/library-store";
 import type { LibraryBreakdownEntry } from "@/types/library";
 import type { MediaType } from "@/types/download";
@@ -56,7 +56,7 @@ export function LibraryStats() {
       <Breakdown
         heading={t("library.stats_by_platform")}
         entries={stats.by_platform}
-        labelOf={(entry) => entry.key}
+        labelOf={(entry) => formatPlatformLabel(entry.key)}
         isActive={(entry) => filters.platforms.includes(entry.key)}
         onSelect={(entry) => togglePlatform(entry.key)}
         testId="library-breakdown-platform"

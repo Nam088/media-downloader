@@ -533,11 +533,11 @@ describe("Library — statistics as filters (FR-328, FR-329)", () => {
     await renderLibrary();
     const breakdown = await screen.findByTestId("library-breakdown-platform");
 
-    await userEvent.click(within(breakdown).getByRole("button", { name: /tiktok/ }));
+    await userEvent.click(within(breakdown).getByRole("button", { name: /tiktok/i }));
 
     await waitFor(() => expect(lastQuery("list_library").platforms).toEqual(["tiktok"]));
     // The active-filter strip has to say so, or the list looks arbitrarily short.
-    expect(screen.getByTestId("library-active-filters").textContent).toContain("tiktok");
+    expect(screen.getByTestId("library-active-filters").textContent).toContain("TikTok");
     expect(screen.getByTestId("library-filter-platform-tiktok")).toHaveAttribute(
       "aria-pressed",
       "true",
