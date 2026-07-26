@@ -24,6 +24,8 @@
 - App đã có sẵn toàn bộ hạ tầng cho pattern này (copy-on-first-use vào `app_data_dir`, `.bundled-version` marker, chmod, matrix build trong `release.yml`) → thỏa FR-010 không cần cơ chế mới.
 - Worker tự viết cho phép: (a) emit **progress có cấu trúc** (module có `core/progress.py` hook được; executable chính chủ chỉ in output cho người đọc), (b) mở kênh **stdin để bơm grant code** Cloudflare vào process (FR-007), (c) chạy mode `preview` lấy metadata track/playlist mà không tải (dùng `AsyncSpotiFLAC.get_playlist` và tương đương cho track) — khớp cơ chế preview-trước-validate-sau của `commands/download.rs::validate_quality`.
 
+**Bẫy đóng gói đã gặp thật**: `pip install SpotiFLAC==1.5.5` **không** kéo theo `nodriver`, dù `requirements.txt` của upstream có `nodriver>=0.36` và `core/solver.py` import nó ở top level — metadata wheel thiếu. Hệ quả: bundle build xong vẫn chết ngay ở `import SpotiFLAC` với `No module named 'nodriver'`. `build-spotiflac-onedir.sh` vì thế cài nodriver tường minh và `--collect-all nodriver`.
+
 **Alternatives considered**:
 - *Executable chính chủ (SpotiFLAC-macOS/…)*: nhẹ công build, nhưng stdout không có contract ổn định để parse tiến trình, không có kênh grant-injection, không có preview mode tách rời → bị loại.
 - *Bắt người dùng cài pip/Python*: vi phạm FR-010 → loại.

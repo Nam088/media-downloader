@@ -5,7 +5,7 @@ Hướng dẫn chạy & xác nhận feature hoạt động end-to-end. Chi tiế
 ## Prerequisites
 
 - Toolchain hiện có của repo: `pnpm`, Rust stable, Tauri 2 CLI.
-- **Python 3.11+ và `pyinstaller`** (chỉ build-time, để đóng gói worker).
+- **Python 3.11+ và `pyinstaller`** (chỉ build-time, để đóng gói worker). Script build tự cài `nodriver` bên cạnh `SpotiFLAC`: gói pip của SpotiFLAC **quên khai báo** dependency đó trong metadata dù `requirements.txt` upstream có, mà `core/solver.py` lại import nó ở top level — thiếu nó thì chính `import SpotiFLAC` đã hỏng.
 - ffmpeg dev binary (đã có qua `scripts/fetch-dev-binaries.sh`).
 - Tùy chọn: Node.js trong PATH (để test JS Extensions fallback), Chrome/Chromium (auto-solver Cloudflare).
 

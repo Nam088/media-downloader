@@ -439,7 +439,8 @@
     "SPOTIFLAC_NO_SOURCE": "Không nguồn phát nào cung cấp được bài này — có thể bài hát không tồn tại trên các nguồn lossless. Hãy thử tải thường bằng engine mặc định (yt-dlp) thay thế.",
     "SPOTIFLAC_REGION_BLOCKED": "Mọi nguồn phát đều từ chối bài này do giới hạn khu vực, nên không tải được từ đây.",
     "SPOTIFLAC_CHALLENGE_TIMEOUT": "Chưa hoàn tất xác minh trong thời gian cho phép nên lượt tải đã dừng. Hãy thử lại để nhận liên kết xác minh mới.",
-    "SPOTIFLAC_NODE_MISSING": "Không tìm thấy Node.js nên các nguồn mở rộng không khả dụng — lượt tải vẫn tiếp tục với các nguồn có sẵn."
+    "SPOTIFLAC_NODE_MISSING": "Không tìm thấy Node.js nên các nguồn mở rộng không khả dụng — lượt tải vẫn tiếp tục với các nguồn có sẵn.",
+    "MUSIC_ENGINE_UNAVAILABLE": "Engine nhạc lossless không đọc được liên kết này. Mở tab Nhật ký để xem worker SpotiFLAC báo gì — có thể tệp đi kèm bị thiếu hoặc worker không khởi động được."
   },
   "compliance": {
     "title": "Trước khi bắt đầu tải",

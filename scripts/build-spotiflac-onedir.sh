@@ -38,7 +38,14 @@ case "$(uname -s)" in
 esac
 
 "$VENV_BIN/pip" install --quiet --upgrade pip
-"$VENV_BIN/pip" install --quiet "SpotiFLAC==$SPOTIFLAC_VERSION" pyinstaller
+# `nodriver` is installed explicitly on purpose: SpotiFLAC's own
+# requirements.txt lists nodriver>=0.36, but its published wheel metadata
+# omits it, so `pip install SpotiFLAC` alone leaves it out — and
+# SpotiFLAC/core/solver.py imports it at module scope, which makes a plain
+# `import SpotiFLAC` fail outright. It is also what the automated Cloudflare
+# solver runs on (research.md R4, layer 1), so it is a real dependency here,
+# not just an import-time formality.
+"$VENV_BIN/pip" install --quiet "SpotiFLAC==$SPOTIFLAC_VERSION" "nodriver>=0.36" pyinstaller
 
 # SpotiFLAC imports its providers/extensions dynamically in places; collect
 # the whole package (code + any data files) so PyInstaller's static analysis
@@ -46,6 +53,7 @@ esac
 "$VENV_BIN/pyinstaller" \
   --onedir --console --name spotiflac-worker \
   --collect-all SpotiFLAC \
+  --collect-all nodriver \
   --exclude-module pkg_resources \
   --distpath "$BUILD_ROOT/dist" \
   --workpath "$BUILD_ROOT/build" \
