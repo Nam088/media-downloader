@@ -267,7 +267,27 @@ jobs:
         # only inside their own _internal/ folder (libmpdec.so.4, needed by
         # _decimal, is the first one it hits). deb and rpm are unaffected and
         # build fine; only the AppImage artifact is missing.
-        run: pnpm tauri build --verbose --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          # Make just the one missing library resolvable system-wide, rather
+          # than putting the bundles' whole _internal/ folders on the search
+          # path. Scope is the entire point: those folders also contain an
+          # ancient libstdc++.so.6, and exposing them broadly is what killed
+          # `node` last time. libmpdec is used by nothing else on the runner,
+          # so publishing it alone cannot shadow anything that matters.
+          if [ "${{ matrix.platform }}" = "ubuntu-latest" ]; then
+            if ! ldconfig -p | grep -q 'libmpdec\.so\.4'; then
+              FOUND=$(find src-tauri/binaries -name 'libmpdec.so.4*' -print -quit)
+              if [ -n "$FOUND" ]; then
+                echo "Publishing $FOUND so linuxdeploy can resolve it"
+                sudo cp "$FOUND" /usr/local/lib/
+                sudo ldconfig
+              else
+                echo "::warning::libmpdec.so.4 not found in any bundle; AppImage bundling will likely fail"
+              fi
+            fi
+          fi
+          pnpm tauri build --verbose --target ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
         with:
