@@ -106,15 +106,6 @@ jobs:
             patchelf \
             build-essential \
             file
-          # AppImage bundling runs linuxdeploy, which is itself an AppImage,
-          # and a type-2 AppImage mounts itself through FUSE 2. ubuntu-latest
-          # is now 24.04, which ships only libfuse3 — so linuxdeploy failed to
-          # execute at all and Tauri reported a bare `failed to run
-          # linuxdeploy` with no output from the tool, because there was none.
-          # 24.04 renamed the package during the 64-bit time_t transition, and
-          # that rename is exactly the kind of thing that breaks again on the
-          # next LTS, hence the fallback.
-          sudo apt-get install -y libfuse2t64 || sudo apt-get install -y libfuse2
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -238,56 +229,30 @@ jobs:
             exit 1
           fi
 
+      # Linux ships deb + rpm only. AppImage is deliberately absent from
+      # bundle.targets in tauri.conf.json (JSON has no comments, so the
+      # reasoning lives here).
+      #
+      # linuxdeploy resolves shared libraries for every ELF inside the AppDir,
+      # and that includes yt-dlp's official onedir bundle. That bundle is
+      # compiled on an old distro for wide compatibility, so it references
+      # libraries Ubuntu 24.04 no longer ships: libmpdec.so.4 was fixable by
+      # publishing the copy found inside the bundle, and the very next one,
+      # libreadline.so.6, exists neither in the bundle nor in any 24.04
+      # package. It is a queue, not a single bug.
+      #
+      # Our self-built bundles do not have this problem — gallery-dl's
+      # PyInstaller build passes linuxdeploy cleanly because it is compiled on
+      # this same runner. So the real fix is to self-build yt-dlp too, and the
+      # reason we do not is that yt-dlp loads ~1800 extractors dynamically and
+      # would need a PyInstaller hook to match. Getting that subtly wrong
+      # breaks the app's primary download engine in a way only some sites would
+      # reveal, which is a bad trade for one packaging format.
+      #
+      # deb and rpm cover Debian/Ubuntu/Mint and Fedora/RHEL/openSUSE. Revisit
+      # if yt-dlp is ever self-built here.
       - name: Build installer
-        # Belt and braces with libfuse2 above, deliberately: the package name
-        # already changed once across Ubuntu releases, while this variable is
-        # honoured by the AppImage runtime itself and so does not depend on any
-        # distro packaging at all. One failed AppImage bundle costs a ~20
-        # minute round trip to discover, which is worth more than the tidiness
-        # of picking only one of the two. No effect on Windows/macOS, which
-        # never build an AppImage.
-        env:
-          APPIMAGE_EXTRACT_AND_RUN: 1
-        # --verbose stays until Linux goes green: Tauri reports an AppImage
-        # failure as a bare `failed to run linuxdeploy` and swallows the tool's
-        # own output, which is what made the first two attempts at this guesses
-        # rather than fixes.
-        #
-        # DO NOT put the PyInstaller bundles' _internal/ folders on
-        # LD_LIBRARY_PATH to satisfy linuxdeploy. That was tried and it broke
-        # the build earlier and harder than the problem it aimed at: the
-        # variable applies to every process in the tree, so `node` — which
-        # runs vite inside this very command — loaded the ancient
-        # libstdc++.so.6 shipped inside yt-dlp's bundle and died on a missing
-        # GLIBCXX_3.4.21 before Tauri was even reached.
-        #
-        # The open problem is narrower than it looked: linuxdeploy resolves
-        # shared libraries for every ELF in the AppDir, including those Python
-        # bundles, whose extension modules link against libraries that exist
-        # only inside their own _internal/ folder (libmpdec.so.4, needed by
-        # _decimal, is the first one it hits). deb and rpm are unaffected and
-        # build fine; only the AppImage artifact is missing.
-        shell: bash
-        run: |
-          # Make just the one missing library resolvable system-wide, rather
-          # than putting the bundles' whole _internal/ folders on the search
-          # path. Scope is the entire point: those folders also contain an
-          # ancient libstdc++.so.6, and exposing them broadly is what killed
-          # `node` last time. libmpdec is used by nothing else on the runner,
-          # so publishing it alone cannot shadow anything that matters.
-          if [ "${{ matrix.platform }}" = "ubuntu-latest" ]; then
-            if ! ldconfig -p | grep -q 'libmpdec\.so\.4'; then
-              FOUND=$(find src-tauri/binaries -name 'libmpdec.so.4*' -print -quit)
-              if [ -n "$FOUND" ]; then
-                echo "Publishing $FOUND so linuxdeploy can resolve it"
-                sudo cp "$FOUND" /usr/local/lib/
-                sudo ldconfig
-              else
-                echo "::warning::libmpdec.so.4 not found in any bundle; AppImage bundling will likely fail"
-              fi
-            fi
-          fi
-          pnpm tauri build --verbose --target ${{ matrix.target }}
+        run: pnpm tauri build --target ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
         with:
