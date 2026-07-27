@@ -54,7 +54,13 @@ Grab the installer for your OS from the [Releases](../../releases) page — ever
 
 No need to separately install Python, Node.js, or ffmpeg — everything is bundled in the installer.
 
-> **macOS**: since the app isn't signed with an Apple Developer certificate, the first launch may show "is damaged and can't be opened" from Gatekeeper. Run `xattr -cr "/Applications/Media Downloader.app"` to clear the quarantine flag, then open it again.
+> **macOS: "is damaged and can't be opened"?** The app isn't actually damaged — **ignore this dialog, don't move it to the Trash.** It isn't signed with an Apple Developer certificate yet, and macOS shows this exact message for any unsigned app downloaded from the internet, no matter which browser you used (Safari, Chrome, Yandex, etc. all trigger it the same way).
+>
+> Fix it once, from Terminal:
+> ```bash
+> xattr -cr "/Applications/Media Downloader.app"
+> ```
+> Then open the app normally. You only need to do this after each fresh download/install.
 
 ## Development
 

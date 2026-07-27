@@ -54,7 +54,13 @@ Tải bản cài đặt cho hệ điều hành của bạn tại trang [Releases
 
 Không cần cài Python, Node.js hay ffmpeg riêng — toàn bộ đã được đóng gói sẵn trong bộ cài.
 
-> **macOS**: vì ứng dụng chưa được ký bằng chứng chỉ Apple Developer, lần đầu mở có thể bị Gatekeeper báo "is damaged and can't be opened". Chạy `xattr -cr "/Applications/Media Downloader.app"` để gỡ cờ quarantine rồi mở lại bình thường.
+> **macOS báo "is damaged and can't be opened"?** App không hề bị hỏng — **cứ bỏ qua thông báo này, đừng bấm Move to Trash.** Do ứng dụng chưa được ký bằng chứng chỉ Apple Developer, nên macOS luôn hiện đúng thông báo này với bất kỳ app chưa ký nào tải từ internet, bất kể bạn dùng trình duyệt gì (Safari, Chrome, Yandex... đều bị như nhau).
+>
+> Sửa một lần bằng Terminal:
+> ```bash
+> xattr -cr "/Applications/Media Downloader.app"
+> ```
+> Rồi mở lại app bình thường. Mỗi lần tải/cài bản mới đều cần chạy lại lệnh này.
 
 ## Phát triển
 
