@@ -229,28 +229,40 @@ jobs:
             exit 1
           fi
 
-      # Linux ships deb + rpm only. AppImage is deliberately absent from
-      # bundle.targets in tauri.conf.json (JSON has no comments, so the
-      # reasoning lives here).
+      # linuxdeploy resolves every ELF in the AppDir against SYSTEM library
+      # paths only — it never looks inside the AppDir's own nested folders.
+      # Our PyInstaller resources keep their libraries in _internal/, so any
+      # of those the host does not also provide reads to linuxdeploy as a
+      # missing dependency and fails the bundle. Nothing is actually absent:
+      # libmpdec.so.4 and libreadline.so.6 both ship inside yt-dlp's bundle.
       #
-      # linuxdeploy resolves shared libraries for every ELF inside the AppDir,
-      # and that includes yt-dlp's official onedir bundle. That bundle is
-      # compiled on an old distro for wide compatibility, so it references
-      # libraries Ubuntu 24.04 no longer ships: libmpdec.so.4 was fixable by
-      # publishing the copy found inside the bundle, and the very next one,
-      # libreadline.so.6, exists neither in the bundle nor in any 24.04
-      # package. It is a queue, not a single bug.
+      # Scanning all 158 ELF files in that bundle shows the set is bounded —
+      # everything required and not shipped is core glibc (libc, libpthread,
+      # libm...), which every host has and linuxdeploy blacklists anyway. So
+      # publishing the bundled libraries the host lacks is sufficient, not a
+      # chase.
       #
-      # Our self-built bundles do not have this problem — gallery-dl's
-      # PyInstaller build passes linuxdeploy cleanly because it is compiled on
-      # this same runner. So the real fix is to self-build yt-dlp too, and the
-      # reason we do not is that yt-dlp loads ~1800 extractors dynamically and
-      # would need a PyInstaller hook to match. Getting that subtly wrong
-      # breaks the app's primary download engine in a way only some sites would
-      # reveal, which is a bad trade for one packaging format.
-      #
-      # deb and rpm cover Debian/Ubuntu/Mint and Fedora/RHEL/openSUSE. Revisit
-      # if yt-dlp is ever self-built here.
+      # The `ldconfig -p` guard is the whole safety story: it skips anything
+      # the system already provides. Copying indiscriminately would put the
+      # bundles' ancient libstdc++.so.6 ahead of the real one for every
+      # process on the runner, which is exactly how an earlier attempt at this
+      # killed `node` before the build even started.
+      - name: Publish bundled libraries the host does not provide
+        if: matrix.platform == 'ubuntu-latest'
+        shell: bash
+        run: |
+          published=0
+          while IFS= read -r lib; do
+            base=$(basename "$lib")
+            if ! ldconfig -p | grep -q "[[:space:]]$base[[:space:]]"; then
+              echo "publishing $base (from ${lib#src-tauri/binaries/})"
+              sudo cp -n "$lib" /usr/local/lib/
+              published=$((published + 1))
+            fi
+          done < <(find src-tauri/binaries -path '*/_internal/*' -name 'lib*.so*' -type f)
+          sudo ldconfig
+          echo "published $published library/libraries the host was missing"
+
       - name: Build installer
         run: pnpm tauri build --target ${{ matrix.target }}
 
