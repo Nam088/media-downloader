@@ -71,12 +71,6 @@ const PLATFORM_DISPLAY_NAMES: Record<string, string> = {
   twitter_x: "X (Twitter)",
   soundcloud: "SoundCloud",
   imgurgallery: "Imgur",
-  spotify: "Spotify",
-  tidal: "TIDAL",
-  apple_music: "Apple Music",
-  pandora: "Pandora",
-  // Id provider của SpotiFLAC (danh sách thứ tự ưu tiên trong Cài đặt);
-  // fallback viết hoa chữ đầu sẽ chỉ hiển thị "Amazon" trơn.
   amazon: "Amazon Music",
 };
 
@@ -87,10 +81,9 @@ export function formatPlatformLabel(platform: string): string {
 }
 
 /** The platforms worth advertising as "quick tags" before a preview
- * (`PLATFORM_HOSTS` in `src-tauri/src/platform.rs`): the 6 FR-014 requires
- * plus the 4 music sources the SpotiFLAC engine handles. Everything else
- * `formatPlatformLabel` prettifies is a fallback the app happens to support,
- * not something to showcase as a headline feature. */
+ * (`PLATFORM_HOSTS` in `src-tauri/src/platform.rs`): the 6 FR-014 requires.
+ * Everything else `formatPlatformLabel` prettifies is a fallback the app
+ * happens to support, not something to showcase as a headline feature. */
 export const CURATED_PLATFORMS = [
   "youtube",
   "tiktok",
@@ -98,8 +91,4 @@ export const CURATED_PLATFORMS = [
   "instagram",
   "twitter_x",
   "soundcloud",
-  "spotify",
-  "tidal",
-  "apple_music",
-  "pandora",
 ] as const;

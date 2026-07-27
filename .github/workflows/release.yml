@@ -1,23 +1,20 @@
 name: Release
 
-# Builds installers for Windows, macOS, and Linux with yt-dlp, gallery-dl AND
-# spotiflac-worker bundled as resources (all three as "onedir" builds, unpacked
-# once into the app's data directory at first run by
-# ytdlp_binary::resolve_ytdlp_executable /
-# gallery_dl_binary::resolve_gallery_dl_executable /
-# spotiflac_binary::resolve_spotiflac_executable) and ffmpeg bundled as an
+# Builds installers for Windows, macOS, and Linux with yt-dlp and gallery-dl
+# bundled as resources (both as "onedir" builds, unpacked once into the app's
+# data directory at first run by ytdlp_binary::resolve_ytdlp_executable /
+# gallery_dl_binary::resolve_gallery_dl_executable) and ffmpeg bundled as an
 # externalBin sidecar (FR-018/SC-008) — end users never install anything
 # beyond this one installer. Triggered manually or on a version tag.
 #
-# All three ship as onedir (executable + a pre-unpacked Python runtime folder)
+# Both ship as onedir (executable + a pre-unpacked Python runtime folder)
 # rather than the single-file "onefile" build: onefile re-extracts its entire
 # bundled runtime into a fresh temp dir on every single launch (~14s
 # measured), which is what made preview/download feel slow before this was
 # changed — onedir only pays that cost once, on first run. gallery-dl
 # additionally has no official standalone build for macOS at all, so its
 # onedir build is compiled ourselves in CI for every platform
-# (scripts/build-gallery-dl-onedir.sh) rather than downloaded; spotiflac-worker
-# is this project's own code and so is always self-built.
+# (scripts/build-gallery-dl-onedir.sh) rather than downloaded.
 # `main` and `develop` build on every push so a broken build is caught on the
 # branch that caused it. Any other branch can still be built on demand from the
 # Actions tab — `workflow_dispatch` lets you pick the ref — but is not built
@@ -30,9 +27,6 @@ name: Release
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - develop
     tags:
       - "v*"
 
@@ -46,19 +40,16 @@ jobs:
             target: x86_64-pc-windows-msvc
             ytdlp_zip_asset: yt-dlp_win.zip
             ytdlp_exe_name: yt-dlp.exe
-            spotiflac_exe_name: spotiflac-worker.exe
             ffmpeg_dest_name: ffmpeg-x86_64-pc-windows-msvc.exe
           - platform: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             ytdlp_zip_asset: yt-dlp_linux.zip
             ytdlp_exe_name: yt-dlp_linux
-            spotiflac_exe_name: spotiflac-worker
             ffmpeg_dest_name: ffmpeg-x86_64-unknown-linux-gnu
           - platform: macos-latest
             target: aarch64-apple-darwin
             ytdlp_zip_asset: yt-dlp_macos.zip
             ytdlp_exe_name: yt-dlp_macos
-            spotiflac_exe_name: spotiflac-worker
             ffmpeg_dest_name: ffmpeg-aarch64-apple-darwin
 
     runs-on: ${{ matrix.platform }}
@@ -136,35 +127,6 @@ jobs:
         shell: bash
         run: bash scripts/build-gallery-dl-onedir.sh
 
-      # spotiflac-worker is always self-built: it is this project's own thin
-      # protocol wrapper (scripts/spotiflac_worker.py) around the SpotiFLAC
-      # pip module — see scripts/build-spotiflac-onedir.sh.
-      - name: Build spotiflac-worker onedir resource (${{ matrix.platform }})
-        shell: bash
-        run: bash scripts/build-spotiflac-onedir.sh
-
-      # PyInstaller exits 0 for a bundle that cannot import its own package,
-      # and this is not hypothetical: SpotiFLAC's published wheel metadata
-      # omits nodriver even though core/solver.py imports it at module scope,
-      # so the first bundle built here died on `import SpotiFLAC` while the
-      # build itself looked perfectly green. Without this step that ships as a
-      # release, and the only symptom a user sees is music links quietly
-      # falling back to yt-dlp.
-      #
-      # Deliberately offline: an invalid URL still walks the whole import
-      # chain and emits the protocol `hello` before failing, so the check
-      # proves the bundle loads without depending on a music service being
-      # reachable from CI.
-      - name: Verify the spotiflac-worker bundle actually loads
-        shell: bash
-        run: |
-          OUTPUT=$(src-tauri/binaries/spotiflac-onedir/${{ matrix.spotiflac_exe_name }} \
-            preview --url "not-a-real-url" 2>&1 || true)
-          echo "$OUTPUT"
-          if ! grep -q '"type":"hello"' <<<"$OUTPUT"; then
-            echo "::error::spotiflac-worker bundle failed to start — it never emitted its hello event"
-            exit 1
-          fi
 
       # ---- ffmpeg sidecar ---------------------------------------------
       # Linux/Windows: BtbN/FFmpeg-Builds "gpl" static builds — no shared

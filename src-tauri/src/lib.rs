@@ -90,8 +90,6 @@ pub fn run() {
             commands::settings::update_settings,
             commands::media::preview_media,
             commands::media::cancel_preview_media,
-            commands::music::submit_cloudflare_grant,
-            commands::music::get_pending_challenge,
             commands::download::create_download_job,
             commands::download::create_playlist_download_jobs,
             commands::download::pause_job,

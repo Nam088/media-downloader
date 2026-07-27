@@ -15,11 +15,6 @@ pub enum MediaType {
     /// TikTok slideshow). `DownloadJob.gallery_mode` picks what to actually
     /// do with the gallery's files.
     Gallery,
-    /// Backed by the SpotiFLAC engine (specs/006-spotiflac-integration):
-    /// lossless music matched from a Spotify/Tidal/Apple Music/Pandora link.
-    /// `DownloadJob.audio_quality` holds the app-facing tier
-    /// (`flac16`/`flac24`/`mp3_320`), never a yt-dlp format string.
-    Music,
 }
 
 /// Only meaningful when `DownloadJob.media_type == MediaType::Gallery`.
@@ -477,12 +472,6 @@ pub enum JobStatus {
     Queued,
     FetchingMetadata,
     Downloading,
-    /// Chỉ dùng cho job `MediaType::Music`: tác vụ đang dừng giữa chừng chờ
-    /// người dùng nhập Cloudflare grant code (data-model.md §2 của
-    /// specs/006-spotiflac-integration). Worker process còn sống và giữ một
-    /// slot concurrency; quá 15 phút không có grant hợp lệ thì queue tự
-    /// chuyển sang `Failed` với mã `SPOTIFLAC_CHALLENGE_TIMEOUT`.
-    WaitingInput,
     Paused,
     Completed,
     Failed,
@@ -495,7 +484,6 @@ impl JobStatus {
             JobStatus::Queued => "queued",
             JobStatus::FetchingMetadata => "fetching_metadata",
             JobStatus::Downloading => "downloading",
-            JobStatus::WaitingInput => "waiting_input",
             JobStatus::Paused => "paused",
             JobStatus::Completed => "completed",
             JobStatus::Failed => "failed",
@@ -508,7 +496,6 @@ impl JobStatus {
             "queued" => Some(JobStatus::Queued),
             "fetching_metadata" => Some(JobStatus::FetchingMetadata),
             "downloading" => Some(JobStatus::Downloading),
-            "waiting_input" => Some(JobStatus::WaitingInput),
             "paused" => Some(JobStatus::Paused),
             "completed" => Some(JobStatus::Completed),
             "failed" => Some(JobStatus::Failed),
@@ -670,17 +657,6 @@ pub struct MediaSource {
     /// always empty.
     pub is_gallery: bool,
     pub gallery_items: Vec<GalleryItemPreview>,
-    /// `true` khi preview này do engine SpotiFLAC trả về (specs/006): link
-    /// nhạc Spotify/Tidal/Apple Music/Pandora. Khi `true`,
-    /// `available_music_tiers` là danh sách lựa chọn duy nhất và mọi
-    /// `available_*` khác đều rỗng — cùng quy ước với `is_gallery`.
-    #[serde(default)]
-    pub is_music: bool,
-    /// Các tier chất lượng nhạc (`flac16`/`flac24`/`mp3_320`) — rỗng cho mọi
-    /// preview không phải nhạc. `create_download_job` validate tier job nhạc
-    /// theo đúng danh sách này (FR-019 áp cho engine mới).
-    #[serde(default)]
-    pub available_music_tiers: Vec<String>,
     /// One entry per item in a flat-playlist preview (empty when
     /// `!is_playlist`) — lets the frontend list every video in a playlist
     /// individually (title/duration/thumbnail) instead of only offering an
@@ -753,10 +729,6 @@ pub struct LibraryItem {
     pub downloaded_at: String,
     pub is_missing: bool,
     pub job_id: String,
-    /// Nhà cung cấp nhạc đã thật sự giao file (`"tidal"`, `"ext:qobuz-web"`…)
-    /// — chỉ mục `MediaType::Music` mới có. `None` cho mọi engine khác và
-    /// mọi dòng ghi trước migration 0014.
-    pub source_provider: Option<String>,
 }
 
 /// Tiêu chí sắp xếp thư viện (FR-309).
@@ -907,11 +879,6 @@ pub struct NewLibraryFile {
     pub source_url: String,
     pub duration_seconds: Option<i64>,
     pub thumbnail_path: Option<String>,
-    /// Provider thật sự đã giao file cho một job `MediaType::Music`
-    /// (`"tidal"`/`"qobuz"`/`"deezer"`/`"amazon"`/`"ext:<name>"`). `None` cho
-    /// mọi engine khác — cột `downloaded_files.source_provider` từ migration
-    /// 0014.
-    pub source_provider: Option<String>,
 }
 
 /// Mirrors `data-model.md` §5 (AppSettings).
@@ -935,22 +902,6 @@ pub struct AppSettings {
     pub max_retry_attempts: u32,
     /// Đóng cửa sổ thì thu về khay hệ thống thay vì thoát (FR-127).
     pub run_in_background: bool,
-    /// Thứ tự ưu tiên provider cho engine SpotiFLAC, dạng CSV
-    /// (`"tidal,qobuz,deezer,amazon"` — FR-004 của specs/006). Chỉ chấp nhận
-    /// hoán vị/tập con khác rỗng của bốn provider đó (`apply_patch` enforce).
-    pub spotiflac_service_order: String,
-    /// Tier chất lượng mặc định cho job nhạc: `flac16` / `flac24` / `mp3_320`
-    /// (FR-003). Job lưu tier riêng của nó; đây chỉ là mặc định cho form.
-    pub spotiflac_quality: String,
-    /// Cho phép engine tự rơi về JS extension (`ext:*`) khi native provider
-    /// hỏng (FR-005). Chỉ có hiệu lực thật khi máy có Node.js — thiếu Node
-    /// thì worker luôn chạy `--no-extensions-fallback` kèm cảnh báo.
-    pub spotiflac_extensions_fallback: bool,
-    /// Telegram Bot token cho thông báo Cloudflare từ xa (FR-008). Lưu
-    /// PLAINTEXT trong SQLite — app chưa có secret storage, UI phải nói rõ.
-    pub tg_bot_token: String,
-    /// Chat ID Telegram nhận thông báo — chuỗi chữ số hoặc rỗng.
-    pub tg_chat_id: String,
 }
 
 #[cfg(test)]

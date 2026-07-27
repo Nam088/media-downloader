@@ -16,6 +16,13 @@
         { "path": "$AUDIO/**" },
         { "path": "$PICTURE/**" }
       ]
+    },
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "http://*" },
+        { "url": "https://*" }
+      ]
     }
   ]
 }

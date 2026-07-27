@@ -19,11 +19,6 @@ const SAVED_SETTINGS = {
   rate_limit_kbps: 0,
   max_retry_attempts: 3,
   run_in_background: false,
-  spotiflac_service_order: "tidal,qobuz,deezer,amazon",
-  spotiflac_quality: "flac16",
-  spotiflac_extensions_fallback: true,
-  tg_bot_token: "",
-  tg_chat_id: "",
 } satisfies AppSettings;
 
 /**
@@ -137,8 +132,6 @@ describe("Settings page — concurrency, rate limit, background mode (FR-112, FR
 
     // Not decoration: a user who caps at 500 KB/s to protect a shared line and
     // then measures 1.5 MB/s across 3 downloads will report the cap as broken.
-    // "applies per download" rather than "per download": the SpotiFLAC quality
-    // hint also says "per download", and findByText refuses two matches.
     const hint = await screen.findByText(/applies per download/i);
     expect(hint).toHaveTextContent(/not.*total/i);
   });

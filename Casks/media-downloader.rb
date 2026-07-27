@@ -11,7 +11,7 @@ cask "media-downloader" do
 
   url "https://github.com/Nam088/media-downloader/releases/download/v#{version}/Media.Downloader_0.1.0_aarch64.dmg"
   name "Media Downloader"
-  desc "Download video, audio, and lossless music from YouTube, Spotify, Tidal, and more"
+  desc "Download video and audio from YouTube and 1000+ other sites"
   homepage "https://github.com/Nam088/media-downloader"
 
   # Release CI only builds aarch64-apple-darwin today — installing this cask

@@ -14,6 +14,9 @@ import { Library } from "@/pages/Library";
 import { Settings } from "@/pages/Settings";
 import { Logs } from "@/pages/Logs";
 
+import { SecretMessageModal } from "@/components/SecretMessageModal";
+import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
+
 type Route = "home" | "library" | "history" | "logs" | "settings";
 
 function useSyncBackendSettings() {
@@ -31,18 +34,37 @@ function useSyncBackendSettings() {
 function AppShell() {
   const { t } = useTranslation();
   const [route, setRoute] = useState<Route>("home");
+  const [showSecretModal, setShowSecretModal] = useState(false);
   const { settings } = useAppSettings();
   useSyncBackendSettings();
+
+  useKeyboardShortcuts({
+    onSecretTrigger: () => {
+      setShowSecretModal((prev) => !prev);
+    },
+    onSearchFocus: () => {
+      if (route !== "library" && route !== "history") {
+        setRoute("library");
+      }
+      setTimeout(() => {
+        const searchInput =
+          document.querySelector<HTMLInputElement>("input[type='search']") ||
+          document.querySelector<HTMLInputElement>("input[placeholder*='search']") ||
+          document.querySelector<HTMLInputElement>("input[placeholder*='tìm']") ||
+          document.querySelector<HTMLInputElement>("input[data-testid*='search']");
+        if (searchInput) {
+          searchInput.focus();
+          searchInput.select();
+        }
+      }, 50);
+    },
+  });
 
   // Derived at render time rather than corrected via a setState-in-effect
   // redirect: if the Logs tab gets hidden (Settings toggle) while it's the
   // active route, this just falls back to "home" for that render — no
-  // effect, no extra render pass.
   const effectiveRoute: Route = route === "logs" && settings && !settings.show_logs_tab ? "home" : route;
 
-  // Hidden by default (models::AppSettings.show_logs_tab) — the Logs page is
-  // a debugging aid (job failures/retries/fallback decisions), not something
-  // most users need in the main nav; toggled on from Settings.
   const navItems: { id: Route; label: string; icon: typeof HomeIcon }[] = [
     { id: "home", label: t("nav.home", "Home"), icon: HomeIcon },
     { id: "library", label: t("nav.library"), icon: LibraryIcon },
@@ -54,13 +76,11 @@ function AppShell() {
   ];
 
   return (
-    <div className="min-h-screen bg-background text-foreground flex flex-col font-sans selection:bg-primary/20 selection:text-primary">
+    <div className="min-h-screen w-full max-w-full overflow-x-hidden overscroll-none bg-background text-foreground flex flex-col font-sans selection:bg-primary/20 selection:text-primary">
       <ComplianceDisclaimer />
       
-      {/* Dashboard Top Header */}
-      <header className="sticky top-0 z-50 border-b border-border/70 bg-background/85 backdrop-blur-xl transition-all shadow-2xs">
+      <header className="fixed top-0 left-0 right-0 z-50 w-full select-none border-b border-border/70 bg-background/85 backdrop-blur-xl transition-all shadow-2xs">
         <div className="mx-auto flex h-16 max-w-5xl items-center justify-between px-6">
-          {/* Logo & Brand */}
           <div className="group flex items-center gap-3.5 cursor-pointer" onClick={() => setRoute("home")}>
             <div className="relative flex h-9 w-9 items-center justify-center rounded-md bg-primary text-primary-foreground shadow-sm transition-all duration-300 group-hover:scale-105 group-hover:bg-primary/90 group-active:scale-95">
               <Download className="h-4.5 w-4.5 stroke-[2.5] transition-transform duration-300 group-hover:translate-y-0.5" />
@@ -77,8 +97,7 @@ function AppShell() {
             </div>
           </div>
 
-          {/* Flat Navbar Link Navigation */}
-          <nav className="flex items-center gap-8">
+          <nav className="flex items-center gap-3 sm:gap-6 md:gap-8">
             {navItems.map((item) => {
               const isActive = effectiveRoute === item.id;
               const Icon = item.icon;
@@ -95,14 +114,13 @@ function AppShell() {
                   <Icon className={`h-4.5 w-4.5 transition-transform duration-200 ${isActive ? "text-primary scale-110" : "group-hover:scale-110"}`} />
                   <span>{item.label}</span>
                   {isActive && (
-                    <span className="absolute bottom-0 left-0 right-0 h-[2.5px] rounded-full bg-primary animate-in fade-in slide-in-from-bottom-1 zoom-in-95 duration-200 ease-out shadow-2xs" />
+                    <span className="absolute bottom-0 left-0 right-0 h-[2.5px] rounded-full bg-primary shadow-2xs transition-all duration-200 ease-out animate-in fade-in-50 zoom-in-95" />
                   )}
                 </button>
               );
             })}
           </nav>
 
-          {/* Right Action Controls */}
           <div className="flex items-center gap-2">
             <ThemeToggle />
             <LanguageSwitcher />
@@ -110,30 +128,25 @@ function AppShell() {
         </div>
       </header>
 
-      {/* Main Content with Smooth Spring-like CSS Animation */}
-      <main className="flex-1 py-4">
-        <div className={effectiveRoute === "home" ? "block animate-in fade-in-50 slide-in-from-bottom-2 zoom-in-98 duration-300 ease-out" : "hidden"}>
+      <main className="flex-1 pt-16 py-4">
+        <div className={effectiveRoute === "home" ? "block animate-in fade-in-50 duration-150" : "hidden"}>
           <Home />
         </div>
-        {/* Every page is mounted at once and toggled with block/hidden, so the
-            Library exists from the first frame. It is told whether it is the
-            visible route rather than fetching on mount: a library query plus a
-            disk reconciliation pass on every app start, for a tab nobody
-            opened, is not free. */}
-        <div className={effectiveRoute === "library" ? "block animate-in fade-in-50 slide-in-from-bottom-2 zoom-in-98 duration-300 ease-out" : "hidden"}>
+        <div className={effectiveRoute === "library" ? "block animate-in fade-in-50 duration-150" : "hidden"}>
           <Library active={effectiveRoute === "library"} />
         </div>
-        <div className={effectiveRoute === "history" ? "block animate-in fade-in-50 slide-in-from-bottom-2 zoom-in-98 duration-300 ease-out" : "hidden"}>
+        <div className={effectiveRoute === "history" ? "block animate-in fade-in-50 duration-150" : "hidden"}>
           <History />
         </div>
-        <div className={effectiveRoute === "logs" ? "block animate-in fade-in-50 slide-in-from-bottom-2 zoom-in-98 duration-300 ease-out" : "hidden"}>
+        <div className={effectiveRoute === "logs" ? "block animate-in fade-in-50 duration-150" : "hidden"}>
           <Logs />
         </div>
-        <div className={effectiveRoute === "settings" ? "block animate-in fade-in-50 slide-in-from-bottom-2 zoom-in-98 duration-300 ease-out" : "hidden"}>
+        <div className={effectiveRoute === "settings" ? "block animate-in fade-in-50 duration-150" : "hidden"}>
           <Settings />
         </div>
       </main>
 
+      <SecretMessageModal open={showSecretModal} onClose={() => setShowSecretModal(false)} />
       <Toaster />
     </div>
   );

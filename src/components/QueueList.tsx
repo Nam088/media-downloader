@@ -1,20 +1,19 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { useTranslation } from "react-i18next";
-import { ChevronDown, ChevronRight, GripVertical, Pause, Play, X, RotateCcw } from "lucide-react";
+import { ChevronDown, ChevronRight, GripVertical, Pause, Play, X, RotateCcw, ExternalLink } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { Button } from "@/components/ui/button";
 import { QueueToolbar } from "@/components/QueueToolbar";
-import { CloudflareGrantDialog } from "@/components/CloudflareGrantDialog";
 import { ensureQueueListeners, useQueueStore } from "@/stores/queue-store";
-import { formatFileSize, formatPlatformLabel, formatSpeed } from "@/lib/format";
+import { formatFileSize, formatSpeed } from "@/lib/format";
+import { openExternalUrl } from "@/lib/open-url";
 import type { DownloadJob } from "@/types/download";
 
 const ACTIVE_STATUSES = new Set([
   "queued",
   "fetching_metadata",
   "downloading",
-  "waiting_input",
   "paused",
 ]);
 /** What "Pause all" would act on. `paused` is counted separately. */
@@ -48,8 +47,7 @@ type DragOrigin = {
   overId: string | null;
 };
 
-function JobControls({ job, onVerify }: { job: DownloadJob; onVerify: (jobId: string) => void }) {
-  const { t } = useTranslation();
+function JobControls({ job }: { job: DownloadJob }) {
   const { pauseJob, resumeJob, cancelJob, retryJob } = useQueueStore();
 
   if (job.status === "downloading" || job.status === "queued" || job.status === "fetching_metadata") {
@@ -70,30 +68,6 @@ function JobControls({ job, onVerify }: { job: DownloadJob; onVerify: (jobId: st
       <div className="flex gap-1">
         <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => resumeJob(job.id)}>
           <Play className="h-3.5 w-3.5" />
-        </Button>
-        <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => cancelJob(job.id)}>
-          <X className="h-3.5 w-3.5" />
-        </Button>
-      </div>
-    );
-  }
-
-  // A music job waiting on a Cloudflare grant cannot be paused — that would
-  // kill the worker holding the challenge open (data-model.md §2). The way
-  // forward is the grant dialog; the way out is cancelling.
-  //
-  // "Verify now" is the only way back to a challenge the user dismissed, so
-  // the row must keep offering it for as long as the job is blocked.
-  if (job.status === "waiting_input") {
-    return (
-      <div className="flex gap-1">
-        <Button
-          variant="outline"
-          size="sm"
-          className="h-7 px-2 text-xs font-semibold"
-          onClick={() => onVerify(job.id)}
-        >
-          {t("queue.openChallenge")}
         </Button>
         <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => cancelJob(job.id)}>
           <X className="h-3.5 w-3.5" />
@@ -166,7 +140,7 @@ function IndeterminateProgress({ label }: { label: string }) {
 /** One job's row, shared by standalone jobs and playlist-group children.
  * `title` falls back to `source_url` for jobs created before that field
  * existed, or paths where the backend never had a title to begin with. */
-function JobRow({ job, onVerify }: { job: DownloadJob; onVerify: (jobId: string) => void }) {
+function JobRow({ job }: { job: DownloadJob }) {
   const { t } = useTranslation();
   const retryCountdown = useRetryCountdown(job);
   // Present only while this job is actually running. `progress_percent: null`
@@ -176,30 +150,33 @@ function JobRow({ job, onVerify }: { job: DownloadJob; onVerify: (jobId: string)
   const live = useQueueStore((state) => state.liveProgress[job.id]);
   const percentUnknown = live !== undefined && live.progress_percent === null;
   return (
-    <div className="rounded-md border border-border/80 bg-card p-3 shadow-2xs transition-all">
+    <div className="rounded-md border border-border/80 bg-card p-3 shadow-2xs transition-all hover:border-primary/30">
       <div className="flex items-center justify-between gap-3">
-        <span className="truncate text-sm font-medium text-foreground">{job.title ?? job.source_url}</span>
+        <span
+          role="link"
+          tabIndex={0}
+          onClick={() => void openExternalUrl(job.source_url)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              void openExternalUrl(job.source_url);
+            }
+          }}
+          className="truncate text-sm font-semibold text-foreground hover:text-primary hover:underline transition-colors text-left flex items-center gap-1.5 cursor-pointer group/job outline-none"
+        >
+          <span className="truncate">{job.title ?? job.source_url}</span>
+          <ExternalLink className="h-3.5 w-3.5 shrink-0 opacity-0 group-hover/job:opacity-100 transition-opacity text-primary" />
+        </span>
         <div className="flex shrink-0 items-center gap-2">
-          {/* `waiting_input` gets the warning treatment: it is the one status
-              where nothing moves until the user acts, so it must not read
-              like an ordinary passive state such as "Paused". */}
-          <span
-            className={`rounded-sm px-1.5 py-0.5 text-[11px] font-medium capitalize ${
-              job.status === "waiting_input"
-                ? "bg-amber-500/10 text-amber-600 dark:text-amber-400"
-                : "bg-muted/80 text-muted-foreground"
-            }`}
-          >
+          <span className="rounded-sm bg-muted/80 px-1.5 py-0.5 text-[11px] font-medium capitalize text-muted-foreground">
             {retryCountdown !== null
               ? t("queue.retry_countdown", {
                   seconds: retryCountdown,
                   attempt: job.retry_count + 1,
                 })
-              : job.status === "waiting_input"
-                ? t("queue.waitingInput")
-                : t(`queue.status.${job.status}`)}
+              : t(`queue.status.${job.status}`)}
           </span>
-          <JobControls job={job} onVerify={onVerify} />
+          <JobControls job={job} />
         </div>
       </div>
       {percentUnknown ? (
@@ -210,14 +187,6 @@ function JobRow({ job, onVerify }: { job: DownloadJob; onVerify: (jobId: string)
       <div className="mt-2 flex justify-between text-xs font-mono text-muted-foreground">
         <span className="flex items-center gap-2">
           <span>{formatSpeed(job.speed_bytes_per_sec)}</span>
-          {/* FR-009 — which provider a music job is actually pulling from
-              right now. Live-only, like the speed beside it: the value comes
-              with the progress ticks and disappears with the run. */}
-          {job.media_type === "music" && live?.provider && (
-            <span className="rounded-sm bg-muted/80 px-1.5 py-0.5 font-sans font-medium">
-              {t("queue.provider", { provider: formatPlatformLabel(live.provider) })}
-            </span>
-          )}
         </span>
         {/* With no percentage to show, show what is actually known instead of
             a "0%" that is simply false — the bytes fetched so far come in the
@@ -242,12 +211,10 @@ function PlaylistGroup({
   jobs,
   collapsed,
   onToggle,
-  onVerify,
 }: {
   jobs: DownloadJob[];
   collapsed: boolean;
   onToggle: () => void;
-  onVerify: (jobId: string) => void;
 }) {
   const { t } = useTranslation();
   const total = jobs.length;
@@ -280,7 +247,7 @@ function PlaylistGroup({
       {!collapsed && (
         <div className="mt-3 flex flex-col gap-2 border-t border-border/60 pt-3">
           {jobs.map((job) => (
-            <JobRow key={job.id} job={job} onVerify={onVerify} />
+            <JobRow key={job.id} job={job} />
           ))}
         </div>
       )}
@@ -296,31 +263,6 @@ export function QueueList() {
   // reference each time and re-render forever.
   const allJobs = useQueueStore(useShallow((state) => state.orderedJobs()));
   const moveJob = useQueueStore((state) => state.moveJob);
-  // One dialog for the whole queue, not one per row: two music jobs can be
-  // challenged at once, and stacking two modals over each other would leave
-  // the user unable to tell which download they are verifying. The first
-  // undismissed challenge wins; solving or dismissing it reveals the next.
-  const challenges = useQueueStore((state) => state.challenges);
-  const dismissChallenge = useQueueStore((state) => state.dismissChallenge);
-  const restorePendingChallenge = useQueueStore((state) => state.restorePendingChallenge);
-  // Reopening a dismissed challenge is a view-level decision, so it stays
-  // here rather than un-setting the store's `dismissed` flag: the store
-  // records what the *backend* is waiting on, not which modal is on screen.
-  const [reopenedJobId, setReopenedJobId] = useState<string | null>(null);
-  const openChallenge =
-    Object.entries(challenges).find(([, entry]) => !entry.dismissed) ??
-    (reopenedJobId && challenges[reopenedJobId]
-      ? ([reopenedJobId, challenges[reopenedJobId]] as const)
-      : undefined);
-
-  /** "Verify now" on a blocked row. The store call is what recovers a
-   * challenge this window never saw (a reload drops the URL, which lives only
-   * in the Rust process); when the entry is already known it is a no-op and
-   * the local flag alone reopens the dialog. */
-  function handleVerify(jobId: string) {
-    setReopenedJobId(jobId);
-    void restorePendingChallenge(jobId);
-  }
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
   // Reordering runs on pointer events, not the HTML5 drag-and-drop API: this
   // is a Tauri v2 webview, where `dragDropEnabled` defaults to true and the
@@ -514,7 +456,6 @@ export function QueueList() {
               jobs={children}
               collapsed={collapsedGroups.has(playlistId)}
               onToggle={() => toggleGroup(playlistId)}
-              onVerify={handleVerify}
             />
           ))}
           <ul className="flex list-none flex-col gap-2 p-0">
@@ -562,26 +503,13 @@ export function QueueList() {
                   <div aria-hidden className="w-7 shrink-0" />
                 )}
                 <div className="min-w-0 flex-1">
-                  <JobRow job={job} onVerify={handleVerify} />
+                  <JobRow job={job} />
                 </div>
               </li>
             ))}
           </ul>
         </>
       )}
-      <CloudflareGrantDialog
-        jobId={openChallenge?.[0] ?? null}
-        challengeUrl={openChallenge?.[1].challengeUrl ?? null}
-        open={Boolean(openChallenge)}
-        onOpenChange={(open) => {
-          if (open || !openChallenge) return;
-          // Closing means "not now", not "solved": the entry stays so the row
-          // keeps its way back in, and the local reopen flag is cleared so the
-          // dialog does not spring straight back up.
-          dismissChallenge(openChallenge[0]);
-          setReopenedJobId(null);
-        }}
-      />
     </div>
   );
 }

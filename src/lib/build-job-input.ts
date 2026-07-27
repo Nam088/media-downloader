@@ -4,7 +4,6 @@ import type {
   GalleryMode,
   MediaSource,
   MediaType,
-  MusicQualityTier,
   OutputOptions,
 } from "@/types/download";
 
@@ -22,10 +21,6 @@ export interface BuildJobInputArgs {
   selectedGalleryIndices?: number[];
   /** Only consulted when `preview.is_playlist`; defaults to `single_item`. */
   playlistScope?: "single_item" | "entire_playlist";
-  /** The SpotiFLAC tier, consulted only when `mediaType === "music"`. Carried
-   * in `audio_quality` on the wire — the backend validates it against the
-   * preview's `available_music_tiers`, so no made-up tier survives. */
-  musicTier?: MusicQualityTier;
   /** The output choices from `OutputOptionsPicker`. Omitting it is a supported
    * call that yields the pre-Phase-2 behaviour exactly (see
    * `CreateJobInput.output_options`), which is what the batch flow — with no
@@ -53,27 +48,8 @@ export function buildJobInput(args: BuildJobInputArgs): CreateJobInput {
     galleryMode,
     selectedGalleryIndices,
     playlistScope,
-    musicTier,
     outputOptions,
   } = args;
-
-  // A music job is the SpotiFLAC engine's: the tier travels in
-  // `audio_quality`, and none of the video/gallery knobs apply — the backend
-  // rejects them outright for this media type, so they are never sent.
-  // `output_options` is omitted for the same reason as the gallery branch:
-  // only the filename template would apply, and sending choices the engine
-  // ignores would record a lie (contracts/tauri-interface.md §1).
-  if (mediaType === "music") {
-    return {
-      source_url: preview.source_url,
-      media_type: "music",
-      audio_quality: musicTier ?? null,
-      video_quality: null,
-      output_directory: outputDirectory,
-      playlist_scope: preview.is_playlist ? (playlistScope ?? "single_item") : undefined,
-      title: preview.title,
-    };
-  }
 
   if (preview.is_gallery) {
     // Only the images are ever selectable — the audio track has no checkbox

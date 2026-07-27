@@ -5,7 +5,6 @@ pub mod gallery_dl_binary;
 pub mod queue;
 pub mod retry;
 pub mod scheduler;
-pub mod spotiflac;
-pub mod spotiflac_binary;
+
 pub mod ytdlp;
 pub mod ytdlp_binary;

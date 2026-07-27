@@ -66,23 +66,6 @@ else
   echo "gallery-dl onedir build already present at $GALLERY_DL_ONEDIR_DEST"
 fi
 
-SPOTIFLAC_ONEDIR_DEST="$BIN_DIR/spotiflac-onedir"
-SPOTIFLAC_EXE_NAME="spotiflac-worker"
-if [[ "$(uname -s)" =~ ^(MINGW|MSYS|CYGWIN) ]]; then
-  SPOTIFLAC_EXE_NAME="spotiflac-worker.exe"
-fi
-
-# Always a local PyInstaller --onedir build of our own worker around the
-# SpotiFLAC pip module — the official standalone executables have no
-# structured progress / stdin grant channel. See
-# scripts/build-spotiflac-onedir.sh for the full rationale.
-if [[ ! -x "$SPOTIFLAC_ONEDIR_DEST/$SPOTIFLAC_EXE_NAME" ]]; then
-  echo "Building spotiflac-worker onedir locally (first run only; needs python3+pip)..."
-  bash "$REPO_ROOT/scripts/build-spotiflac-onedir.sh"
-else
-  echo "spotiflac-worker onedir build already present at $SPOTIFLAC_ONEDIR_DEST"
-fi
-
 # macOS gets the same static arm64 build the release pipeline uses, rather
 # than a copy of the system one. Two reasons, both learned the hard way: a
 # Homebrew ffmpeg is dynamically linked, so it runs here and nowhere else —

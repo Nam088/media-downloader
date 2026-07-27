@@ -4,7 +4,7 @@
 
 Ứng dụng desktop tải video, âm thanh và nhạc lossless từ nhiều nền tảng — chạy trên Windows, macOS và Linux, đóng gói sẵn mọi công cụ cần thiết, không yêu cầu người dùng cài thêm Python hay bất kỳ dependency nào.
 
-Xây trên [Tauri 2](https://tauri.app/) (Rust + React), dùng [yt-dlp](https://github.com/yt-dlp/yt-dlp) và [gallery-dl](https://github.com/mikf/gallery-dl) làm engine tải video/ảnh, và [SpotiFLAC](https://github.com/BartolomeoRusso9/SpotiFLAC-Module-Version) làm engine nhạc lossless.
+Xây trên [Tauri 2](https://tauri.app/) (Rust + React), dùng [yt-dlp](https://github.com/yt-dlp/yt-dlp) và [gallery-dl](https://github.com/mikf/gallery-dl) làm engine tải.
 
 ## Tính năng
 
@@ -25,13 +25,6 @@ Xây trên [Tauri 2](https://tauri.app/) (Rust + React), dùng [yt-dlp](https://
 - Tự nhúng metadata (tiêu đề, nghệ sĩ, album) và ảnh bìa vào file khi định dạng hỗ trợ.
 - Đặt tên file theo mẫu tuỳ chỉnh, tải phụ đề, cắt một đoạn cụ thể, tách video theo chương thành nhiều file.
 - Lưu một cấu hình đầu ra thành preset để dùng lại cho lần tải sau.
-
-### Nhạc lossless — SpotiFLAC
-- Dán liên kết Spotify, Tidal, Apple Music hoặc Pandora để tải bản nhạc **FLAC lossless thật** (16-bit hoặc 24-bit Hi-Res) từ Tidal, Qobuz, Deezer, Amazon Music — không cần tài khoản của bất kỳ dịch vụ nào.
-- Tự động thử lần lượt các nhà cung cấp theo thứ tự ưu tiên do người dùng cấu hình, kèm fallback qua JS extension khi nguồn chính gặp sự cố (yêu cầu Node.js).
-- Tùy chọn tier MP3 320kbps (tải bản lossless rồi chuyển mã bằng ffmpeg đã đóng gói sẵn).
-- Xử lý mượt khi gặp xác minh Cloudflare: hộp thoại nhập mã xác minh ngay trong ứng dụng, có thể cấu hình thêm Telegram Bot để nhận thông báo xác minh từ xa.
-- Album/playlist/nghệ sĩ được tách thành từng bài tải độc lập trong cùng hàng đợi.
 
 ### Thư viện
 - Mọi file đã tải được lập chỉ mục tự động — xem lại theo lưới hoặc danh sách, tìm kiếm và lọc theo loại nội dung, nền tảng, định dạng.
@@ -68,7 +61,7 @@ Yêu cầu: Node.js 22+, pnpm, Rust stable, Python 3 (chỉ để build sidecar)
 
 ```bash
 pnpm install
-bash scripts/fetch-dev-binaries.sh   # tải/dựng yt-dlp, gallery-dl, spotiflac-worker, ffmpeg cho máy dev
+bash scripts/fetch-dev-binaries.sh   # tải/dựng yt-dlp, gallery-dl, ffmpeg cho máy dev
 pnpm tauri dev
 ```
 
@@ -83,7 +76,7 @@ cd src-tauri && cargo test   # backend (Rust)
 
 - **Frontend**: React 19 + TypeScript, Zustand cho state, i18next cho đa ngôn ngữ.
 - **Backend**: Rust (Tauri 2), SQLite (rusqlite) lưu hàng đợi/lịch sử/thư viện/cài đặt.
-- **Engine tải**: ba engine chạy song song theo loại nội dung — `yt-dlp` (video/audio đa nền tảng), `gallery-dl` (ảnh/gallery), `spotiflac-worker` (nhạc lossless, tự viết bọc quanh module Python SpotiFLAC).
+- **Engine tải**: hai engine chạy song song theo loại nội dung — `yt-dlp` (video/audio đa nền tảng), `gallery-dl` (ảnh/gallery).
 - Mỗi công cụ Python được đóng gói dạng PyInstaller onedir và giải nén vào thư mục dữ liệu ứng dụng ở lần chạy đầu — không cần người dùng cài Python.
 
 Tài liệu thiết kế chi tiết từng tính năng nằm trong [`specs/`](specs/), theo phương pháp spec-driven development.

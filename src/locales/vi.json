@@ -13,9 +13,23 @@
     "loading": "Đang tải…",
     "cancel": "Huỷ",
     "retry": "Thử lại",
-    "close": "Đóng"
+    "close": "Đóng",
+    "open_in_browser": "Mở trong trình duyệt"
   },
   "settings": {
+    "subtitle": "Tùy chỉnh cấu hình chung, tốc độ tải và hệ thống",
+    "tab_all": "Tất cả",
+    "tab_general": "Giao diện",
+    "tab_downloads": "Tải xuống & Tốc độ",
+    "tab_system": "Hệ thống",
+    "tab_about": "Thông tin",
+    "section_general": "Giao diện & Ngôn ngữ",
+    "section_downloads": "Tải xuống & Băng thông",
+    "section_system": "Hệ thống & Chạy ngầm",
+    "section_about": "Tác giả & Thông tin",
+    "author_label": "Tác giả",
+    "github_label": "Trang GitHub",
+    "version_label": "Phiên bản",
     "theme_label": "Giao diện",
     "language_label": "Ngôn ngữ",
     "default_output_directory_label": "Thư mục lưu mặc định",
@@ -26,24 +40,7 @@
     "rate_limit_label": "Giới hạn tốc độ (KB/s)",
     "rate_limit_hint": "0 nghĩa là không giới hạn. Giới hạn này áp dụng cho từng lượt tải, không phải cho tổng của cả ứng dụng — khi có {{concurrency}} lượt tải chạy cùng lúc, tốc độ cộng lại có thể lên tới {{concurrency}}× con số này.",
     "background_label": "Tiếp tục chạy nền",
-    "background_hint": "Đóng cửa sổ sẽ thu nhỏ ứng dụng xuống khay hệ thống và các lượt tải vẫn chạy tiếp.",
-    "spotiflac": {
-      "section": "Tải nhạc",
-      "serviceOrder": "Thứ tự ưu tiên nguồn phát",
-      "serviceOrderHint": "Liên kết nhạc được thử theo đúng thứ tự này; nguồn nào không có bài thì tự chuyển sang nguồn kế tiếp.",
-      "moveUp": "Đưa {{provider}} lên trên",
-      "moveDown": "Đưa {{provider}} xuống dưới",
-      "quality": "Chất lượng nhạc mặc định",
-      "qualityHint": "Mức khởi tạo cho liên kết nhạc vừa xem trước. Bạn vẫn đổi được cho từng lượt tải.",
-      "extensionsFallback": "Dùng nguồn mở rộng khi hết cách",
-      "extensionsFallbackHint": "Thử các nguồn JavaScript của cộng đồng khi cả bốn nguồn trên đều không có bài. Cần cài Node.js; nếu thiếu thì lượt tải vẫn chạy tiếp mà bỏ qua chúng.",
-      "tgBotToken": "Token bot Telegram",
-      "tgBotTokenPlaceholder": "Bỏ trống để tắt thông báo Telegram",
-      "tgChatId": "Chat ID Telegram",
-      "tgChatIdPlaceholder": "Chỉ gồm chữ số",
-      "telegramHint": "Khi một lượt tải cần xác minh Cloudflare, bot sẽ gửi liên kết vào cuộc trò chuyện này để bạn xử lý dù không ngồi trước máy.",
-      "plaintextWarning": "Token được lưu dạng văn bản thuần trong cơ sở dữ liệu cục bộ của ứng dụng. Hãy dùng một bot tạo riêng cho ứng dụng này."
-    }
+    "background_hint": "Đóng cửa sổ sẽ thu nhỏ ứng dụng xuống khay hệ thống và các lượt tải vẫn chạy tiếp."
   },
   "theme": {
     "toggle_label": "Đổi giao diện",
@@ -102,9 +99,10 @@
     "filter_date_to_joiner": "đến",
     "filter_missing_only": "Chỉ tệp đang thiếu",
     "media_type_audio": "Âm thanh",
+    "media_type_music": "Nhạc",
     "media_type_video": "Video",
     "media_type_gallery": "Hình ảnh",
-    "media_type_music": "Nhạc",
+
     "active_filters_label": "Đang lọc theo",
     "active_search": "Từ khoá: {{term}}",
     "active_date_from": "Từ {{date}}",
@@ -126,8 +124,7 @@
     "prev_page": "Trang trước",
     "next_page": "Trang sau",
     "missing_badge": "Không tìm thấy tệp",
-    "provider_extension": "{{name}} (ext)",
-    "provider_badge_title": "Được tải từ {{provider}}",
+
     "select_item": "Chọn {{title}}",
     "select_all": "Chọn tất cả",
     "select_none": "Bỏ chọn",
@@ -231,18 +228,7 @@
       "canceled": "Đã huỷ"
     }
   },
-  "music": {
-    "challenge": {
-      "title": "Lượt tải này cần xác minh nhanh",
-      "instructions": "Nguồn phát yêu cầu kiểm tra Cloudflare. Hãy mở trang bên dưới, hoàn tất kiểm tra, rồi dán mã nhận được vào đây — lượt tải sẽ chạy tiếp đúng chỗ đang dừng.",
-      "openBrowser": "Mở trang xác minh",
-      "grantLabel": "Mã xác minh",
-      "grantPlaceholder": "Dán mã lấy từ trang xác minh",
-      "submit": "Tải tiếp",
-      "attemptsLeft_other": "Còn {{count}} lần thử trước khi lượt tải bị huỷ",
-      "submit_failed": "Mã đó không được chấp nhận. Hãy xem lại trang xác minh và dán mã mới nhất."
-    }
-  },
+
   "downloadForm": {
     "url_label": "Liên kết video hoặc âm thanh",
     "url_placeholder": "Dán liên kết YouTube, TikTok, Facebook, Instagram, X, hoặc SoundCloud",
@@ -396,16 +382,7 @@
     "presets_adjusted_subtitles_dropped": "Liên kết này không có phụ đề {{languages}}, nên các ngôn ngữ đó đã bị bỏ khỏi lựa chọn.",
     "presets_adjusted_subtitles_unavailable": "Liên kết này không có phụ đề nào, nên các ngôn ngữ phụ đề trong preset đã được xoá.",
     "presets_adjusted_subtitles_not_embeddable": "Định dạng đầu ra đã chọn không chứa được track phụ đề, nên phụ đề sẽ được lưu thành file riêng.",
-    "presets_adjusted_chapters_unavailable": "Liên kết này không có chương, nên sẽ tải thành một file trọn vẹn.",
-    "musicTier": {
-      "label": "Chất lượng nhạc",
-      "flac16": "FLAC 16-bit Lossless",
-      "flac16Hint": "Chất lượng CD (16-bit / 44.1 kHz) — không mất dữ liệu, lựa chọn thông dụng",
-      "flac24": "FLAC 24-bit Hi-Res",
-      "flac24Hint": "Chất lượng phòng thu Hi-Res (tối đa 24-bit) — dung lượng lớn nhất",
-      "mp3_320": "MP3 320kbps",
-      "mp3_320Hint": "Chuyển từ bản lossless sau khi tải — tệp nhẹ hơn, phát được ở mọi nơi"
-    }
+    "presets_adjusted_chapters_unavailable": "Liên kết này không có chương, nên sẽ tải thành một file trọn vẹn."
   },
   "logs": {
     "description": "Hoạt động gần đây của backend — job lỗi, thử lại, và các quyết định dự phòng. Hữu ích để tìm hiểu vì sao một lượt tải không như mong đợi.",
@@ -435,16 +412,60 @@
     "TRASH_FAILED": "Không chuyển được tệp vào thùng rác của hệ thống, nên tệp vẫn nằm nguyên chỗ cũ.",
     "INVALID_FILE_NAME": "Tên đó không còn ký tự nào mà hệ thống tệp lưu được. Hãy chọn một tên khác.",
     "NOT_A_FILE": "Đường dẫn đó là một thư mục chứ không phải một tệp. Hãy trỏ đúng vào tệp.",
-    "EMPTY_PLAYLIST": "Hãy chọn ít nhất một tệp trước khi xuất danh sách phát.",
-    "SPOTIFLAC_NO_SOURCE": "Không nguồn phát nào cung cấp được bài này — có thể bài hát không tồn tại trên các nguồn lossless. Hãy thử tải thường bằng engine mặc định (yt-dlp) thay thế.",
-    "SPOTIFLAC_REGION_BLOCKED": "Mọi nguồn phát đều từ chối bài này do giới hạn khu vực, nên không tải được từ đây.",
-    "SPOTIFLAC_CHALLENGE_TIMEOUT": "Chưa hoàn tất xác minh trong thời gian cho phép nên lượt tải đã dừng. Hãy thử lại để nhận liên kết xác minh mới.",
-    "SPOTIFLAC_NODE_MISSING": "Không tìm thấy Node.js nên các nguồn mở rộng không khả dụng — lượt tải vẫn tiếp tục với các nguồn có sẵn.",
-    "MUSIC_ENGINE_UNAVAILABLE": "Engine nhạc lossless không đọc được liên kết này. Mở tab Nhật ký để xem worker SpotiFLAC báo gì — có thể tệp đi kèm bị thiếu hoặc worker không khởi động được."
+    "EMPTY_PLAYLIST": "Hãy chọn ít nhất một tệp trước khi xuất danh sách phát."
   },
   "compliance": {
     "title": "Trước khi bắt đầu tải",
     "body": "Chỉ tải nội dung bạn sở hữu hoặc được phép sử dụng. Bạn tự chịu trách nhiệm tuân thủ luật bản quyền và Điều khoản Dịch vụ của từng nền tảng. Ứng dụng này không hỗ trợ phá khoá DRM hay truy cập nội dung riêng tư/trả phí.",
     "acknowledge": "Tôi đã hiểu"
+  },
+  "secret": {
+    "title": "Thông điệp bí mật",
+    "subtitle": "Easter Egg từ Nam088",
+    "refresh": "Lấy thông điệp khác",
+    "close": "Đóng",
+    "loading": "Đang lấy thông điệp...",
+    "default_quote": "Hãy viết phần mềm sạch sẽ, tối ưu code và luôn tiến về phía trước.",
+    "advice_provider": "Advice Slip Free API",
+    "dummyjson_provider": "DummyJSON Free API",
+    "step": "Bước {{current}} / {{total}}",
+    "prev": "Trước",
+    "next": "Sau",
+    "json_url_label": "URL JSON tùy chỉnh (GitHub Gist / npoint.io)",
+    "json_url_placeholder": "https://raw.githubusercontent.com/.../steps.json",
+    "step_title": "Bước {{number}}",
+    "default_step1_title": "Bước 1: Chào mừng",
+    "default_step1_msg": "Chào Nam088! Chúc bạn một ngày làm việc hiệu quả.",
+    "default_step2_title": "Bước 2: Mẹo phím tắt",
+    "default_step2_msg": "Bấm Cmd+K / Ctrl+K ở bất kỳ đâu để tìm kiếm tệp nhanh chóng.",
+    "default_step3_title": "Bước 3: Tải siêu tốc",
+    "default_step3_msg": "Dán nhiều link media cùng lúc để tải hàng loạt cực nhanh.",
+    "replay": "Chơi lại",
+    "continue": "Tiếp tục",
+    "reset_tooltip": "Reset về mặc định",
+    "geo_title": "🌍 Địa lý vui",
+    "geo_q1": "Thủ đô của nước Pháp là thành phố nào?",
+    "geo_q1_paris": "🇮🇫 Paris",
+    "geo_q1_berlin": "🇩🇪 Berlin",
+    "geo_q1_rome": "🇮🇹 Rome",
+    "geo_q1_amsterdam": "🇳🇱 Amsterdam",
+    "geo_q1_correct": "✅ Chính xác! Paris — thành phố ánh sáng, nơi có tháp Eiffel nổi tiếng toàn cầu.",
+    "geo_q1_wrong": "❌ Sai rồi! Thủ đô của Pháp là Paris — nơi có tháp Eiffel huyền thoại.",
+    "geo_q2": "Sông nào dài nhất thế giới?",
+    "geo_q2_amazon": "🌊 Sông Amazon",
+    "geo_q2_nile": "🌊 Sông Nile",
+    "geo_q2_yangtze": "🌊 Sông Dương Tử",
+    "geo_q2_mississippi": "🌊 Sông Mississippi",
+    "geo_q2_correct": "✅ Đúng! Sông Nile ở châu Phi dài khoảng 6.650 km — dài nhất thế giới.",
+    "geo_q2_amazon_ans": "❌ Gần đúng! Sông Amazon lớn nhất về lưu lượng nước, nhưng Sông Nile mới là dài nhất (~6.650 km).",
+    "geo_q2_wrong": "❌ Chưa đúng! Sông Nile ở châu Phi mới là con sông dài nhất thế giới (~6.650 km).",
+    "geo_q3": "Quốc gia nào có diện tích lớn nhất thế giới?",
+    "geo_q3_china": "🇨🇳 Trung Quốc",
+    "geo_q3_usa": "🇺🇸 Hoa Kỳ",
+    "geo_q3_russia": "🇷🇺 Nga",
+    "geo_q3_canada": "🇨🇦 Canada",
+    "geo_q3_correct": "✅ Hoàn toàn chính xác! Nga với diện tích ~17,1 triệu km² — lớn nhất thế giới, trải dài qua 11 múi giờ. 🎉 Bạn đã hoàn thành bộ câu hỏi địa lý!",
+    "geo_q3_wrong": "❌ Chưa đúng! Nga mới là quốc gia lớn nhất với ~17,1 triệu km², trải dài qua 11 múi giờ. 🎉 Bạn đã hoàn thành bộ câu hỏi địa lý!",
+    "geo_bot": "Geography Bot"
   }
 }

@@ -5,6 +5,13 @@
 
 @custom-variant dark (&:is(.dark *));
 
+html, body {
+  overflow-x: hidden;
+  overscroll-behavior: none;
+  overscroll-behavior-y: none;
+  max-width: 100vw;
+}
+
 /* Indeterminate progress bar (QueueList). A download whose source reports no
    total size — audio-only formats, HLS — has no percentage at all, so its bar
    slides instead of filling. Nothing in tw-animate-css loops like this. */
@@ -167,5 +174,17 @@
   }
   ::-webkit-scrollbar-thumb:hover {
     background: var(--muted-foreground);
+  }
+}
+
+@layer utilities {
+  .ease-spring {
+    transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .ease-bounce-subtle {
+    transition-timing-function: cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+  .smooth-transition {
+    transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
   }
 }

@@ -1,16 +1,18 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { openExternalUrl } from "@/lib/open-url";
 import {
+  Check,
   ChevronLeft,
   ChevronRight,
+  ExternalLink,
   FileAudio,
   FileVideo,
   FolderOpen,
   FolderInput,
   Images,
   Link2,
-  Music,
   Pencil,
   Play,
   RotateCcw,
@@ -20,6 +22,8 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import { formatDuration, formatFileSize, formatPlatformLabel } from "@/lib/format";
 import { pageNumbers, totalPagesOf } from "@/lib/pagination";
 import { cn } from "@/lib/utils";
@@ -59,6 +63,7 @@ interface LibraryGridProps {
 export function LibraryGrid({ onPreview, onRequest }: LibraryGridProps) {
   const { t } = useTranslation();
   const items = useLibraryStore((state) => state.items);
+  const page = useLibraryStore((state) => state.page);
   const viewMode = useLibraryStore((state) => state.viewMode);
   const loading = useLibraryStore((state) => state.loading);
   const filters = useLibraryStore((state) => state.filters);
@@ -70,9 +75,29 @@ export function LibraryGrid({ onPreview, onRequest }: LibraryGridProps) {
 
   if (loading && items.length === 0) {
     return (
-      <p className="py-16 text-center text-sm text-muted-foreground" data-testid="library-loading">
-        {t("common.loading")}
-      </p>
+      <div
+        className={cn(
+          "animate-in fade-in-50 duration-200",
+          viewMode === "grid"
+            ? "grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4"
+            : "flex flex-col gap-2.5",
+        )}
+        data-testid="library-loading"
+      >
+        {Array.from({ length: 8 }).map((_, i) => (
+          <div
+            key={i}
+            className="flex flex-col gap-3 rounded-xl border border-border/70 bg-card p-3 shadow-2xs"
+          >
+            <Skeleton className="h-32 w-full rounded-lg" />
+            <Skeleton className="h-4 w-3/4" />
+            <div className="flex items-center justify-between pt-1">
+              <Skeleton className="h-3 w-1/3" />
+              <Skeleton className="h-3 w-1/4" />
+            </div>
+          </div>
+        ))}
+      </div>
     );
   }
 
@@ -110,7 +135,9 @@ export function LibraryGrid({ onPreview, onRequest }: LibraryGridProps) {
   return (
     <div className="flex flex-col gap-4">
       <ul
+        key={page}
         className={cn(
+          "animate-in fade-in-50 duration-150 ease-out",
           viewMode === "grid"
             ? "grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4"
             : "flex flex-col gap-2",
@@ -250,7 +277,6 @@ const MEDIA_TYPE_ICONS: Record<MediaType, typeof FileAudio> = {
   audio: FileAudio,
   video: FileVideo,
   gallery: Images,
-  music: Music,
 };
 
 /** FR-301 acceptance #3: không ô nào để trống. Mọi mục trong CSDL hiện tại rơi
@@ -289,40 +315,6 @@ function Thumbnail({ item, className }: { item: LibraryItem; className?: string 
       data-testid="library-thumbnail-image"
       onError={() => setFailed(true)}
     />
-  );
-}
-
-/** T043 — nhãn nguồn phát đã thật sự giao file cho một mục nhạc lossless.
- *
- * Chỉ mục `media_type === "music"` mới có khái niệm này (engine SpotiFLAC thử
- * lần lượt TIDAL → Qobuz → Deezer → Amazon → extension), nên mọi loại khác trả
- * về `null` dù backend có gửi gì đi nữa. Trường `source_provider` còn optional
- * vì `models::LibraryItem` phía Rust chưa expose nó — vắng field thì đơn giản
- * là không có badge, không phải lỗi. */
-function ProviderBadge({ item }: { item: LibraryItem }) {
-  const { t } = useTranslation();
-
-  if (item.media_type !== "music") return null;
-  const provider = item.source_provider?.trim();
-  if (!provider) return null;
-
-  const extensionName = provider.startsWith("ext:") ? provider.slice(4).trim() : null;
-  if (extensionName === "") return null;
-
-  const label =
-    extensionName !== null
-      ? t("library.provider_extension", { name: extensionName })
-      : formatPlatformLabel(provider);
-
-  return (
-    <span
-      className="inline-flex items-center rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary"
-      data-testid="library-provider-badge"
-      data-provider={provider}
-      title={t("library.provider_badge_title", { provider: label })}
-    >
-      {label}
-    </span>
   );
 }
 
@@ -438,16 +430,21 @@ function IconAction({
   children: React.ReactNode;
 }) {
   return (
-    <Button
-      variant="ghost"
-      size="icon"
-      className="h-7 w-7"
-      aria-label={label}
-      data-testid={testId}
-      onClick={onClick}
-    >
-      {children}
-    </Button>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7 rounded-md text-muted-foreground hover:bg-primary/10 hover:text-primary transition-all duration-150"
+          aria-label={label}
+          data-testid={testId}
+          onClick={onClick}
+        >
+          {children}
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -461,14 +458,19 @@ function SelectBox({
   label: string;
 }) {
   return (
-    <input
-      type="checkbox"
-      checked={selected}
-      onChange={onToggle}
-      aria-label={label}
-      data-testid="library-select"
-      className="h-4 w-4 shrink-0 cursor-pointer accent-primary"
-    />
+    <label className="relative inline-flex cursor-pointer items-center justify-center">
+      <input
+        type="checkbox"
+        checked={selected}
+        onChange={onToggle}
+        aria-label={label}
+        data-testid="library-select"
+        className="peer sr-only"
+      />
+      <div className="flex h-5.5 w-5.5 items-center justify-center rounded-md border border-border/80 bg-background/85 backdrop-blur-md shadow-xs transition-all duration-200 peer-checked:border-primary peer-checked:bg-primary peer-checked:text-primary-foreground peer-focus-visible:ring-2 peer-focus-visible:ring-primary/40 hover:border-primary/60 hover:scale-105">
+        <Check className={cn("h-3.5 w-3.5 stroke-[3] transition-transform duration-150", selected ? "scale-100 opacity-100" : "scale-0 opacity-0")} />
+      </div>
+    </label>
   );
 }
 
@@ -476,15 +478,14 @@ function SelectBox({
  * nguồn phát chỉ xuất hiện trên mục nhạc có `source_provider` (T043). */
 function ItemMeta({ item }: { item: LibraryItem }) {
   return (
-    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
-      <span>{formatPlatformLabel(item.platform)}</span>
-      <ProviderBadge item={item} />
-      <span>{item.file_format}</span>
-      <span>{formatFileSize(item.file_size_bytes)}</span>
+    <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+      <span className="rounded bg-muted/60 px-1.5 py-0.5 font-medium text-foreground/80">{formatPlatformLabel(item.platform)}</span>
+      <span className="rounded bg-muted/60 px-1.5 py-0.5 font-mono text-foreground/80">{item.file_format}</span>
+      <span className="font-mono text-xs text-muted-foreground">{formatFileSize(item.file_size_bytes)}</span>
       {item.duration_seconds !== null && (
-        <span data-testid="library-item-duration">{formatDuration(item.duration_seconds)}</span>
+        <span className="font-mono text-xs text-muted-foreground" data-testid="library-item-duration">{formatDuration(item.duration_seconds)}</span>
       )}
-      <span>{new Date(item.downloaded_at).toLocaleDateString()}</span>
+      <span className="ml-auto text-[10px] text-muted-foreground/70">{new Date(item.downloaded_at).toLocaleDateString()}</span>
     </div>
   );
 }
@@ -496,23 +497,28 @@ function GridCard(props: ItemProps) {
   return (
     <li
       className={cn(
-        "flex flex-col overflow-hidden rounded-xl border bg-card shadow-2xs transition-colors",
-        selected ? "border-primary" : "border-border/70",
+        "group flex flex-col overflow-hidden rounded-xl border bg-card shadow-2xs transition-all duration-200 hover:shadow-md hover:border-primary/40",
+        selected ? "border-primary ring-1 ring-primary/30 bg-primary/[0.02]" : "border-border/70",
       )}
       data-testid="library-item"
       data-item-id={item.id}
       data-missing={item.is_missing ? "true" : "false"}
     >
-      <div className="relative">
+      <div className="relative overflow-hidden">
         <button
           type="button"
           onClick={props.onPreview}
           aria-label={t("library.action_play")}
-          className="block w-full"
+          className="group/thumb block w-full relative overflow-hidden cursor-pointer"
         >
-          <Thumbnail item={item} className="h-32 w-full" />
+          <Thumbnail item={item} className="h-36 w-full transition-transform duration-300 group-hover/thumb:scale-105" />
+          <div className="absolute inset-0 bg-black/30 opacity-0 group-hover/thumb:opacity-100 transition-opacity duration-200 flex items-center justify-center">
+            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg transition-transform duration-200 group-hover/thumb:scale-110">
+              <Play className="h-5 w-5 fill-current ml-0.5" />
+            </div>
+          </div>
         </button>
-        <div className="absolute left-2 top-2 rounded bg-background/80 p-1">
+        <div className="absolute left-2.5 top-2.5 z-10">
           <SelectBox
             selected={selected}
             onToggle={onToggleSelected}
@@ -520,18 +526,28 @@ function GridCard(props: ItemProps) {
           />
         </div>
         {item.is_missing && (
-          <div className="absolute right-2 top-2">
+          <div className="absolute right-2.5 top-2.5 z-10">
             <MissingBadge />
           </div>
         )}
       </div>
 
-      <div className="flex flex-1 flex-col gap-1 p-3">
-        <p className="line-clamp-2 text-xs font-semibold text-foreground" title={item.title}>
-          {item.title}
-        </p>
+      <div className="flex flex-1 flex-col gap-2 p-3.5">
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={() => void openExternalUrl(item.source_url)}
+              className="line-clamp-2 text-xs font-semibold leading-snug text-foreground transition-colors hover:text-primary text-left hover:underline cursor-pointer flex items-start gap-1"
+            >
+              <span className="flex-1">{item.title}</span>
+              <ExternalLink className="h-3 w-3 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-primary mt-0.5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent>{t("common.open_in_browser")}</TooltipContent>
+        </Tooltip>
         <ItemMeta item={item} />
-        <div className="mt-auto flex flex-wrap items-center pt-2">
+        <div className="mt-auto flex items-center justify-between pt-2.5 border-t border-border/40">
           <ItemActions {...props} />
         </div>
       </div>
@@ -546,8 +562,8 @@ function ListRow(props: ItemProps) {
   return (
     <li
       className={cn(
-        "flex items-center gap-3 rounded-lg border bg-card px-3 py-2 shadow-2xs transition-colors",
-        selected ? "border-primary" : "border-border/70",
+        "group flex items-center gap-3 rounded-xl border bg-card px-3.5 py-2.5 shadow-2xs transition-all duration-200 hover:border-primary/40 hover:shadow-xs",
+        selected ? "border-primary ring-1 ring-primary/30 bg-primary/[0.02]" : "border-border/70",
       )}
       data-testid="library-item"
       data-item-id={item.id}
@@ -558,12 +574,22 @@ function ListRow(props: ItemProps) {
         onToggle={onToggleSelected}
         label={t("library.select_item", { title: item.title })}
       />
-      <Thumbnail item={item} className="h-10 w-10 shrink-0 rounded" />
+      <Thumbnail item={item} className="h-10 w-10 shrink-0 rounded-lg" />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <p className="truncate text-xs font-semibold text-foreground" title={item.title}>
-            {item.title}
-          </p>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={() => void openExternalUrl(item.source_url)}
+                className="truncate text-xs font-semibold text-foreground transition-colors hover:text-primary hover:underline cursor-pointer inline-flex items-center gap-1 text-left"
+              >
+                <span className="truncate">{item.title}</span>
+                <ExternalLink className="h-3 w-3 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-primary" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>{t("common.open_in_browser")}</TooltipContent>
+          </Tooltip>
           {item.is_missing && <MissingBadge />}
         </div>
         <ItemMeta item={item} />

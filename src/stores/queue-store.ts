@@ -3,9 +3,9 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import i18n from "@/lib/i18n";
+import { sendQueueCompletionNotification } from "@/lib/notifications";
 import type {
   DownloadJob,
-  JobCloudflareChallengeEvent,
   JobProgressEvent,
   JobStatusChangedEvent,
   LiveProgress,
@@ -14,45 +14,15 @@ import type {
 /** Statuses a job never leaves on its own — the ones `clearFinished` hides. */
 const FINISHED_STATUSES = new Set(["completed", "failed", "canceled"]);
 
-/** How many rejected grant codes end the job (data-model.md §6): the backend
- * fails it with `SPOTIFLAC_CHALLENGE_TIMEOUT` after the third bad one, so the
- * dialog can say how many tries genuinely remain. */
-export const MAX_GRANT_ATTEMPTS = 3;
-
-/** One music job's pending Cloudflare challenge. Ephemeral on both sides of
- * the bridge — mirrors the Rust side's in-memory `CloudflareChallenge`
- * (data-model.md §6): nothing here is persisted, and the entry disappears the
- * moment the job leaves `waiting_input`. */
-export interface PendingChallenge {
-  challengeUrl: string;
-  /** Grant codes the worker has already rejected. Each rejection re-emits
-   * `job:cloudflare_challenge`, which is what bumps this counter — submitting
-   * never does, because only the worker knows the verdict. */
-  attempts: number;
-  /** The user closed the dialog without solving the challenge. The entry is
-   * flagged rather than deleted so `attempts` survives the dismissal and the
-   * queue row's "Verify now" button has something to reopen. A re-emitted
-   * challenge also un-dismisses it, because at that point there is genuinely
-   * new news to show. */
-  dismissed: boolean;
-}
-
 interface QueueState {
   jobs: Record<string, DownloadJob>;
   /** Keyed by job id, and only present while that job is actually running.
    * Holds what the database has no column for — see `LiveProgress`. */
   liveProgress: Record<string, LiveProgress>;
-  /** Job id -> the Cloudflare challenge that job is blocked on, for as long
-   * as it sits in `waiting_input` (contracts/tauri-interface.md §3). */
-  challenges: Record<string, PendingChallenge>;
   upsertJob: (job: DownloadJob) => void;
   upsertJobs: (jobs: DownloadJob[]) => void;
   applyProgress: (event: JobProgressEvent) => void;
   applyStatusChanged: (event: JobStatusChangedEvent) => void;
-  applyChallenge: (event: JobCloudflareChallengeEvent) => void;
-  dismissChallenge: (jobId: string) => void;
-  submitGrant: (jobId: string, grant: string) => Promise<void>;
-  restorePendingChallenge: (jobId: string) => Promise<void>;
   hydrate: () => Promise<void>;
   orderedJobs: () => DownloadJob[];
   pauseAll: () => Promise<void>;
@@ -69,7 +39,6 @@ interface QueueState {
 export const useQueueStore = create<QueueState>((set, get) => ({
   jobs: {},
   liveProgress: {},
-  challenges: {},
   upsertJob: (job) => set((state) => ({ jobs: { ...state.jobs, [job.id]: job } })),
   upsertJobs: (jobs) =>
     set((state) => ({
@@ -98,9 +67,6 @@ export const useQueueStore = create<QueueState>((set, get) => ({
           [event.job_id]: {
             progress_percent: event.progress_percent,
             downloaded_bytes: event.downloaded_bytes,
-            // Music jobs only. A tick without it keeps the last provider that
-            // was named — the worker only repeats it when it switches.
-            provider: event.provider ?? state.liveProgress[event.job_id]?.provider,
           },
         },
       };
@@ -109,21 +75,20 @@ export const useQueueStore = create<QueueState>((set, get) => ({
     set((state) => {
       const existing = state.jobs[event.job_id];
       if (!existing) return state;
-      // A job that has stopped has no live run to describe any more, so the
-      // ephemeral half goes away and the row falls back to its stored
-      // numbers. For a completed job that means 100%: the backend forces it
-      // on the row, and this event carries no progress of its own, so
-      // without mirroring it here the queue would keep showing whatever the
-      // last tick happened to say until the next hydrate.
+
       const finished = FINISHED_STATUSES.has(event.status);
       const liveProgress = { ...state.liveProgress };
       if (finished) delete liveProgress[event.job_id];
-      // A challenge only exists while the job is parked on it. Leaving
-      // `waiting_input` at all — the grant landed, the user cancelled, the
-      // 15-minute timeout fired — means the URL is spent, so the dialog must
-      // not be able to reopen on it.
-      const challenges = { ...state.challenges };
-      if (event.status !== "waiting_input") delete challenges[event.job_id];
+
+      if (event.status === "completed" && existing.status !== "completed") {
+        const remainingActive = Object.values(state.jobs).filter(
+          (j) => j.id !== event.job_id && !FINISHED_STATUSES.has(j.status),
+        ).length;
+        if (remainingActive === 0) {
+          sendQueueCompletionNotification(Object.keys(state.jobs).length);
+        }
+      }
+
       return {
         jobs: {
           ...state.jobs,
@@ -137,95 +102,8 @@ export const useQueueStore = create<QueueState>((set, get) => ({
           },
         },
         liveProgress,
-        challenges,
       };
     }),
-  applyChallenge: (event) =>
-    set((state) => {
-      const existing = state.challenges[event.job_id];
-      return {
-        // Recorded even for a job the store has not seen yet: the challenge
-        // event can beat the `job:status_changed` that introduces the row, and
-        // dropping it here would lose the only copy of the URL (the Rust side
-        // keeps it in memory, but re-fetching needs a job the UI knows about).
-        challenges: {
-          ...state.challenges,
-          [event.job_id]: {
-            challengeUrl: event.challenge_url,
-            // A repeat of the event for a job that already has a challenge
-            // means the worker rejected the last grant and is asking again —
-            // that re-emit *is* the attempt counter (data-model.md §6).
-            attempts: existing ? existing.attempts + 1 : 0,
-            dismissed: false,
-          },
-        },
-      };
-    }),
-  dismissChallenge: (jobId) =>
-    set((state) => {
-      const existing = state.challenges[jobId];
-      if (!existing || existing.dismissed) return state;
-      return {
-        challenges: { ...state.challenges, [jobId]: { ...existing, dismissed: true } },
-      };
-    }),
-  /**
-   * Sends a grant code to the worker waiting on this job's stdin. Deliberately
-   * no state change on success: the challenge only resolves when the worker
-   * says so — acceptance arrives as `job:status_changed` (which clears the
-   * entry), rejection as a re-emitted `job:cloudflare_challenge` (which bumps
-   * `attempts`). Rejections from the command itself (job gone, worker dead)
-   * propagate to the caller for display.
-   */
-  submitGrant: async (jobId, grant) => {
-    await invoke("submit_cloudflare_grant", { jobId, grant });
-  },
-  /**
-   * Re-reads a job's challenge from the backend — the two cases where the
-   * store's copy is missing or shelved:
-   *
-   *  - Reload recovery: the challenge lives in memory on both sides of the
-   *    bridge, so a frontend reload loses this store's copy while the worker
-   *    keeps waiting (`get_pending_challenge`, data-model.md §6).
-   *  - "Verify now" on a dismissed challenge: the queue row's way back into
-   *    a dialog the user waved away. The URL is re-read rather than trusted
-   *    from the shelved entry, and `dismissed` is cleared — which is what
-   *    actually reopens the dialog. `attempts` survives: dismissing was
-   *    never a free retry.
-   *
-   * Only ever called on an explicit user action or by the already-open
-   * dialog — never from a passive scan — so it cannot resurrect a dialog the
-   * user just closed. Never throws: a failed lookup just leaves the dialog
-   * closed, and the next challenge re-emit reopens it anyway.
-   */
-  restorePendingChallenge: async (jobId) => {
-    const existing = get().challenges[jobId];
-    if (existing && !existing.dismissed) return;
-    try {
-      const pending = await invoke<{ challenge_url: string } | null>("get_pending_challenge", {
-        jobId,
-      });
-      if (!pending) return;
-      set((state) => {
-        // An event may have landed while the lookup was in flight; the event
-        // is newer than the snapshot, so it wins.
-        const current = state.challenges[jobId];
-        if (current && !current.dismissed) return state;
-        return {
-          challenges: {
-            ...state.challenges,
-            [jobId]: {
-              challengeUrl: pending.challenge_url,
-              attempts: current?.attempts ?? 0,
-              dismissed: false,
-            },
-          },
-        };
-      });
-    } catch (error) {
-      console.error("failed to restore a pending cloudflare challenge", error);
-    }
-  },
   /**
    * Reloads the queue from the database. The store used to live only in
    * memory, so closing the app threw away the entire visible queue even though
@@ -364,7 +242,7 @@ export const useQueueStore = create<QueueState>((set, get) => ({
 
 let listenersInitialized = false;
 
-/** Registers the `job:progress`/`job:cloudflare_challenge`/
+/** Registers the `job:progress`/
  * `job:status_changed` listeners exactly once per app session
  * (contracts/tauri-commands.md). Safe to call from multiple components —
  * only the first call actually subscribes. */
@@ -374,9 +252,6 @@ export function ensureQueueListeners() {
 
   listen<JobProgressEvent>("job:progress", (event) => {
     useQueueStore.getState().applyProgress(event.payload);
-  });
-  listen<JobCloudflareChallengeEvent>("job:cloudflare_challenge", (event) => {
-    useQueueStore.getState().applyChallenge(event.payload);
   });
   listen<JobStatusChangedEvent>("job:status_changed", (event) => {
     useQueueStore.getState().applyStatusChanged(event.payload);

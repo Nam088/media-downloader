@@ -24,34 +24,73 @@ export function LibraryStats() {
 
   if (!stats) return null;
 
+  const totalItems = stats.total_items || 1;
+  const videoCount = stats.by_media_type.find((m) => m.key === "video")?.item_count ?? 0;
+  const audioCount = stats.by_media_type.find((m) => m.key === "audio")?.item_count ?? 0;
+  const galleryCount = stats.by_media_type.find((m) => m.key === "gallery")?.item_count ?? 0;
+
+  const videoPct = Math.round((videoCount / totalItems) * 100);
+  const audioPct = Math.round((audioCount / totalItems) * 100);
+  const galleryPct = Math.round((galleryCount / totalItems) * 100);
+
   return (
     <section
-      className="grid gap-4 rounded-xl border border-border/70 bg-card/60 p-4 md:grid-cols-3"
+      className="flex flex-col gap-3 rounded-xl border border-border/70 bg-card/60 p-4 shadow-2xs"
       aria-label={t("library.stats_heading")}
       data-testid="library-stats"
     >
-      <div className="flex flex-col gap-3">
-        <Metric
-          icon={<Layers className="h-4 w-4" />}
-          label={t("library.stats_total_items")}
-          value={String(stats.total_items)}
-          testId="library-stats-total-items"
-        />
-        <Metric
-          icon={<HardDrive className="h-4 w-4" />}
-          label={t("library.stats_total_size")}
-          value={formatFileSize(stats.total_size_bytes)}
-          testId="library-stats-total-size"
-        />
-        {stats.missing_items > 0 && (
+      {/* Proportion Bar */}
+      {stats.total_items > 0 && (
+        <div className="flex flex-col gap-1.5 pb-2 border-b border-border/40">
+          <div className="flex h-2 w-full overflow-hidden rounded-full bg-muted/60">
+            {videoPct > 0 && (
+              <div
+                style={{ width: `${videoPct}%` }}
+                className="bg-primary transition-all duration-300"
+                title={`${t("library.media_type_video")}: ${videoCount}`}
+              />
+            )}
+            {audioPct > 0 && (
+              <div
+                style={{ width: `${audioPct}%` }}
+                className="bg-sky-500 transition-all duration-300"
+                title={`${t("library.media_type_audio")}: ${audioCount}`}
+              />
+            )}
+            {galleryPct > 0 && (
+              <div
+                style={{ width: `${galleryPct}%` }}
+                className="bg-emerald-500 transition-all duration-300"
+                title={`${t("library.media_type_gallery")}: ${galleryCount}`}
+              />
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="grid gap-4 md:grid-cols-3">
+        <div className="flex flex-col gap-3">
           <Metric
-            icon={<FileWarning className="h-4 w-4 text-amber-600 dark:text-amber-400" />}
-            label={t("library.stats_missing")}
-            value={String(stats.missing_items)}
-            testId="library-stats-missing"
+            icon={<Layers className="h-4 w-4 text-primary" />}
+            label={t("library.stats_total_items")}
+            value={String(stats.total_items)}
+            testId="library-stats-total-items"
           />
-        )}
-      </div>
+          <Metric
+            icon={<HardDrive className="h-4 w-4 text-primary" />}
+            label={t("library.stats_total_size")}
+            value={formatFileSize(stats.total_size_bytes)}
+            testId="library-stats-total-size"
+          />
+          {stats.missing_items > 0 && (
+            <Metric
+              icon={<FileWarning className="h-4 w-4 text-amber-600 dark:text-amber-400" />}
+              label={t("library.stats_missing")}
+              value={String(stats.missing_items)}
+              testId="library-stats-missing"
+            />
+          )}
+        </div>
 
       <Breakdown
         heading={t("library.stats_by_platform")}
@@ -62,14 +101,15 @@ export function LibraryStats() {
         testId="library-breakdown-platform"
       />
 
-      <Breakdown
-        heading={t("library.stats_by_media_type")}
-        entries={stats.by_media_type}
-        labelOf={(entry) => t(`library.media_type_${entry.key}`)}
-        isActive={(entry) => filters.media_types.includes(entry.key as MediaType)}
-        onSelect={(entry) => toggleMediaType(entry.key as MediaType)}
-        testId="library-breakdown-media-type"
-      />
+        <Breakdown
+          heading={t("library.stats_by_media_type")}
+          entries={stats.by_media_type}
+          labelOf={(entry) => t(`library.media_type_${entry.key}`)}
+          isActive={(entry) => filters.media_types.includes(entry.key as MediaType)}
+          onSelect={(entry) => toggleMediaType(entry.key as MediaType)}
+          testId="library-breakdown-media-type"
+        />
+      </div>
     </section>
   );
 }

@@ -28,6 +28,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/0012_library_index.sql")),
         M::up(include_str!("migrations/0013_history_created_at_index.sql")),
         M::up(include_str!("migrations/0014_music_engine.sql")),
+        M::up(include_str!("migrations/0015_remove_music_engine.sql")),
     ])
 }
 
@@ -417,11 +418,8 @@ impl Db {
     pub fn reset_interrupted_jobs(&self) -> Result<usize, AppError> {
         let conn = self.conn();
         let changed = conn.execute(
-            // `waiting_input` đi cùng nhóm: worker giữ challenge đã chết theo
-            // tiến trình cũ, nên grant code người dùng nhập sau khi mở lại app
-            // không còn chỗ nào để bơm vào — job phải chạy lại từ đầu.
             "UPDATE download_jobs SET status = 'paused', updated_at = ?1
-             WHERE status IN ('downloading','fetching_metadata','waiting_input')",
+             WHERE status IN ('downloading','fetching_metadata')",
             params![Utc::now().to_rfc3339()],
         )?;
         Ok(changed)
@@ -540,8 +538,8 @@ impl Db {
             "INSERT INTO downloaded_files (
                 id, job_id, file_path, file_format, file_size_bytes, completed_at,
                 title, media_type, platform, source_url, duration_seconds,
-                thumbnail_path, search_text, source_provider, is_missing
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,0)
+                thumbnail_path, search_text, is_missing
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,0)
              ON CONFLICT(file_path) DO UPDATE SET
                 job_id = excluded.job_id,
                 file_format = excluded.file_format,
@@ -554,7 +552,6 @@ impl Db {
                 duration_seconds = COALESCE(excluded.duration_seconds, duration_seconds),
                 thumbnail_path = COALESCE(excluded.thumbnail_path, thumbnail_path),
                 search_text = excluded.search_text,
-                source_provider = COALESCE(excluded.source_provider, source_provider),
                 is_missing = 0",
             params![
                 uuid::Uuid::new_v4().to_string(),
@@ -570,7 +567,6 @@ impl Db {
                 file.duration_seconds,
                 file.thumbnail_path,
                 search_text_for(&file.title, &file.file_path),
-                file.source_provider,
             ],
         )?;
         Ok(())
@@ -1009,19 +1005,6 @@ impl Db {
                 .parse()
                 .unwrap_or(3),
             run_in_background: Self::get_setting_or_default(&conn, "run_in_background", "0")? == "1",
-            spotiflac_service_order: Self::get_setting_or_default(
-                &conn,
-                "spotiflac_service_order",
-                "tidal,qobuz,deezer,amazon",
-            )?,
-            spotiflac_quality: Self::get_setting_or_default(&conn, "spotiflac_quality", "flac16")?,
-            spotiflac_extensions_fallback: Self::get_setting_or_default(
-                &conn,
-                "spotiflac_extensions_fallback",
-                "1",
-            )? != "0",
-            tg_bot_token: Self::get_setting_or_default(&conn, "tg_bot_token", "")?,
-            tg_chat_id: Self::get_setting_or_default(&conn, "tg_chat_id", "")?,
         })
     }
 
@@ -1047,15 +1030,6 @@ impl Db {
             "run_in_background",
             if settings.run_in_background { "1" } else { "0" },
         )?;
-        Self::set_setting(&conn, "spotiflac_service_order", &settings.spotiflac_service_order)?;
-        Self::set_setting(&conn, "spotiflac_quality", &settings.spotiflac_quality)?;
-        Self::set_setting(
-            &conn,
-            "spotiflac_extensions_fallback",
-            if settings.spotiflac_extensions_fallback { "1" } else { "0" },
-        )?;
-        Self::set_setting(&conn, "tg_bot_token", &settings.tg_bot_token)?;
-        Self::set_setting(&conn, "tg_chat_id", &settings.tg_chat_id)?;
         Ok(())
     }
 
@@ -1368,7 +1342,6 @@ fn media_type_str(media_type: &MediaType) -> &'static str {
         MediaType::Audio => "audio",
         MediaType::Video => "video",
         MediaType::Gallery => "gallery",
-        MediaType::Music => "music",
     }
 }
 
@@ -1394,7 +1367,6 @@ fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<DownloadJob> {
         media_type: match media_type_raw.as_str() {
             "audio" => MediaType::Audio,
             "gallery" => MediaType::Gallery,
-            "music" => MediaType::Music,
             _ => MediaType::Video,
         },
         audio_quality: row.get("audio_quality")?,
@@ -1447,7 +1419,6 @@ fn row_to_library_item(row: &rusqlite::Row) -> rusqlite::Result<LibraryItem> {
         media_type: match media_type_raw.as_str() {
             "audio" => MediaType::Audio,
             "gallery" => MediaType::Gallery,
-            "music" => MediaType::Music,
             _ => MediaType::Video,
         },
         file_format: row.get("file_format")?,
@@ -1459,7 +1430,6 @@ fn row_to_library_item(row: &rusqlite::Row) -> rusqlite::Result<LibraryItem> {
         downloaded_at: row.get("completed_at")?,
         is_missing: row.get::<_, i64>("is_missing")? != 0,
         job_id: row.get("job_id")?,
-        source_provider: row.get("source_provider")?,
     })
 }
 
@@ -3189,7 +3159,7 @@ mod tests {
         // định chính 0014 là thứ nới CHECK chứ không phải migration nào khác.
         let (conn, path) = raw_conn_at_version_with_path(13);
 
-        // Trước 0014: 'music' và 'waiting_input' đều bị CHECK chặn…
+        // Trước 0014: 'music' bị CHECK chặn…
         let music_before = conn.execute(
             "INSERT INTO download_jobs (
                 id, source_url, platform, media_type, status, progress_percent,
@@ -3202,8 +3172,6 @@ mod tests {
             music_before.is_err(),
             "media_type='music' phải bị CHECK chặn ở v13 — nếu không, test này không kiểm chứng gì cả"
         );
-        // …và `downloaded_files` chưa có cột provider.
-        assert!(!column_names(&conn, "downloaded_files").contains(&"source_provider".to_string()));
 
         // Một dòng hợp lệ có sẵn phải sống sót qua rebuild.
         insert_legacy_completed_job(
@@ -3224,11 +3192,10 @@ mod tests {
                     id, source_url, platform, media_type, status, progress_percent,
                     output_directory, created_at, updated_at
                  ) VALUES ('m-after','https://open.spotify.com/track/x','spotify',
-                           'music','waiting_input',0,'/tmp','2026-07-27T00:00:00Z','2026-07-27T00:00:00Z')",
+                           'music','queued',0,'/tmp','2026-07-27T00:00:00Z','2026-07-27T00:00:00Z')",
                 [],
             )
-            .expect("0014 phải được đăng ký trong `migrations()` — 'music' + 'waiting_input' phải hợp lệ");
-            assert!(column_names(&conn, "downloaded_files").contains(&"source_provider".to_string()));
+            .expect("0014 phải được đăng ký trong `migrations()` — 'music' phải hợp lệ");
         }
 
         let survivor = db.get_job("job-survivor").unwrap();
@@ -3237,47 +3204,8 @@ mod tests {
             "rebuild bảng phải chép nguyên dữ liệu cũ sang, không được làm rơi dòng nào"
         );
         let music = db.get_job("m-after").unwrap().expect("job nhạc đọc lại được");
-        assert_eq!(music.media_type, MediaType::Music);
-        assert_eq!(music.status, JobStatus::WaitingInput);
-    }
-
-    #[test]
-    fn a_music_file_round_trips_through_the_library_with_its_provider() {
-        let db = temp_db();
-        let job = DownloadJob {
-            media_type: MediaType::Music,
-            platform: "spotify".to_string(),
-            ..sample_job("job-music")
-        };
-        db.insert_job(&job).unwrap();
-        db.insert_downloaded_file(&NewLibraryFile {
-            job_id: "job-music".to_string(),
-            file_path: "/tmp/song.flac".to_string(),
-            file_format: "flac".to_string(),
-            file_size_bytes: 12_345_678,
-            title: "Bài Hát Lossless".to_string(),
-            media_type: MediaType::Music,
-            platform: "spotify".to_string(),
-            source_url: "https://open.spotify.com/track/x".to_string(),
-            duration_seconds: Some(215),
-            thumbnail_path: None,
-            source_provider: Some("qobuz".to_string()),
-        })
-        .unwrap();
-
-        let items = db.list_library(&LibraryQuery::default()).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].media_type, MediaType::Music);
-
-        let stored: Option<String> = db
-            .conn()
-            .query_row(
-                "SELECT source_provider FROM downloaded_files WHERE file_path = '/tmp/song.flac'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(stored.as_deref(), Some("qobuz"));
+        assert_eq!(music.media_type, MediaType::Video);
+        assert_eq!(music.status, JobStatus::Queued);
     }
 
     #[test]
@@ -3498,7 +3426,6 @@ mod tests {
             source_url: format!("https://example.com/{job_id}"),
             duration_seconds,
             thumbnail_path: None,
-            source_provider: None,
         })
         .unwrap();
         db.conn()

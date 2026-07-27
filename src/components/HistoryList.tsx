@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
+import { openExternalUrl } from "@/lib/open-url";
 import {
   FolderOpen,
   RotateCcw,
@@ -14,9 +15,12 @@ import {
   Trash2,
   ChevronLeft,
   ChevronRight,
+  ExternalLink,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import {
   Dialog,
   DialogContent,
@@ -207,8 +211,26 @@ export function HistoryList({
 
   if (jobs === null) {
     return (
-      <div className="flex h-40 items-center justify-center rounded-xl border border-dashed border-border/80 p-8">
-        <p className="text-sm text-muted-foreground animate-pulse">{t("common.loading")}</p>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 animate-in fade-in-50 duration-200">
+        {Array.from({ length: 6 }).map((_, i) => (
+          <div
+            key={i}
+            className="flex flex-col gap-3.5 rounded-xl border border-border/80 bg-card p-4 shadow-2xs"
+          >
+            <div className="flex items-start gap-3">
+              <Skeleton className="h-10 w-10 shrink-0 rounded-lg" />
+              <div className="flex-1 space-y-2 py-0.5">
+                <Skeleton className="h-4 w-4/5" />
+                <Skeleton className="h-3 w-1/2" />
+              </div>
+              <Skeleton className="h-5 w-16 rounded-full" />
+            </div>
+            <div className="flex items-center justify-between pt-2 border-t border-border/40">
+              <Skeleton className="h-3 w-1/3" />
+              <Skeleton className="h-8 w-24 rounded-lg" />
+            </div>
+          </div>
+        ))}
       </div>
     );
   }
@@ -247,7 +269,10 @@ export function HistoryList({
         )
       ) : (
         <>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div
+            key={effectivePage}
+            className="animate-in fade-in-50 duration-150 ease-out grid grid-cols-1 md:grid-cols-2 gap-4"
+          >
             {jobs.map((job) => {
               const isAudio = job.media_type === "audio";
               const isGallery = job.media_type === "gallery";
@@ -279,13 +304,28 @@ export function HistoryList({
                       )}
                     </div>
 
-                    <div className="flex min-w-0 flex-1 flex-col gap-1">
-                      <span className="truncate text-sm font-bold leading-tight text-foreground/90 group-hover:text-primary transition-colors" title={fileName}>
-                        {fileName}
-                      </span>
-                      <span className="truncate text-xs text-muted-foreground font-mono" title={job.source_url}>
+                    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <button
+                            type="button"
+                            onClick={() => void openExternalUrl(job.source_url)}
+                            className="truncate text-sm font-bold leading-tight text-foreground/90 hover:text-primary hover:underline transition-colors text-left flex items-center gap-1.5 cursor-pointer group/link"
+                          >
+                            <span className="truncate">{fileName}</span>
+                            <ExternalLink className="h-3.5 w-3.5 shrink-0 opacity-0 group-hover/link:opacity-100 transition-opacity text-primary" />
+                          </button>
+                        </TooltipTrigger>
+                        <TooltipContent>{t("common.open_in_browser")}</TooltipContent>
+                      </Tooltip>
+                      <button
+                        type="button"
+                        onClick={() => void openExternalUrl(job.source_url)}
+                        className="truncate text-xs text-muted-foreground font-mono text-left hover:text-primary transition-colors cursor-pointer"
+                        title={job.source_url}
+                      >
                         {job.source_url}
-                      </span>
+                      </button>
                     </div>
                   </div>
 
@@ -321,28 +361,36 @@ export function HistoryList({
                     {/* Action Buttons */}
                     <div className="flex items-center gap-1">
                       {job.status === "completed" && job.output_file_path && (
-                        <Button
-                          variant="secondary"
-                          size="sm"
-                          className="h-8 gap-1.5 rounded-lg px-2.5 text-xs font-semibold hover:bg-primary/10 hover:text-primary transition-colors"
-                          onClick={() => handleOpenFolder(job.id)}
-                          title={t("history.open_folder")}
-                        >
-                          <FolderOpen className="h-3.5 w-3.5" />
-                          <span>{t("history.open_folder_button")}</span>
-                        </Button>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              className="h-8 gap-1.5 rounded-lg px-2.5 text-xs font-semibold hover:bg-primary/10 hover:text-primary transition-colors"
+                              onClick={() => handleOpenFolder(job.id)}
+                            >
+                              <FolderOpen className="h-3.5 w-3.5" />
+                              <span>{t("history.open_folder_button")}</span>
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{t("history.open_folder")}</TooltipContent>
+                        </Tooltip>
                       )}
                       {job.status === "failed" && (
-                        <Button
-                          variant="secondary"
-                          size="sm"
-                          className="h-8 gap-1.5 rounded-lg px-2.5 text-xs font-semibold hover:bg-destructive/10 hover:text-destructive transition-colors"
-                          onClick={() => handleRetry(job.id)}
-                          title={t("common.retry")}
-                        >
-                          <RotateCcw className="h-3.5 w-3.5" />
-                          <span>{t("common.retry")}</span>
-                        </Button>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              className="h-8 gap-1.5 rounded-lg px-2.5 text-xs font-semibold hover:bg-destructive/10 hover:text-destructive transition-colors"
+                              onClick={() => handleRetry(job.id)}
+                            >
+                              <RotateCcw className="h-3.5 w-3.5" />
+                              <span>{t("common.retry")}</span>
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{t("common.retry")}</TooltipContent>
+                        </Tooltip>
                       )}
                     </div>
                   </div>
@@ -361,10 +409,10 @@ export function HistoryList({
                 value={pageSize}
                 onChange={(e) => setPageSize(Number(e.target.value))}
                 data-testid="history-page-size"
-                className="h-8 rounded-lg border border-border/80 bg-card px-2 text-xs shadow-2xs"
+                className="h-8 cursor-pointer rounded-lg border border-border/80 bg-card px-2.5 py-1 text-xs font-medium text-foreground shadow-2xs outline-none transition-colors hover:bg-accent/40 focus-visible:ring-1 focus-visible:ring-primary/40 dark:bg-card"
               >
                 {HISTORY_PAGE_SIZES.map((size) => (
-                  <option key={size} value={size}>
+                  <option key={size} value={size} className="bg-popover text-popover-foreground">
                     {size}
                   </option>
                 ))}

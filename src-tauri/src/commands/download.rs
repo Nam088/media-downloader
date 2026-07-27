@@ -14,7 +14,6 @@ pub enum MediaTypeInput {
     Audio,
     Video,
     Gallery,
-    Music,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -145,32 +144,6 @@ fn validate_quality(
                 }
             }
         }
-        MediaTypeInput::Music => {
-            // Chỉ chấp nhận cho một preview mà chính engine SpotiFLAC đã trả
-            // về (cùng luật với Gallery: không tin `media_type` frontend gửi
-            // cho một link mà preview cache nói khác — FR-019).
-            if !preview.is_music {
-                return Err(AppError::invalid_quality_option());
-            }
-            let tier = input
-                .audio_quality
-                .as_deref()
-                .ok_or_else(AppError::invalid_quality_option)?;
-            if !preview.available_music_tiers.iter().any(|t| t == tier) {
-                return Err(AppError::invalid_quality_option());
-            }
-            // Các lựa chọn đầu ra video/phụ đề/cắt đoạn không có nghĩa với
-            // đường tải nhạc (worker tự tag + nhúng bìa; ffmpeg chỉ đụng vào
-            // ở bước transcode MP3 320) — nhận chúng rồi âm thầm bỏ qua là
-            // hứa một thứ không làm.
-            if let Some(options) = &input.output_options {
-                let has_foreign_options = !options.subtitles.languages.is_empty()
-                    || options.segment != crate::models::SegmentMode::Whole;
-                if has_foreign_options {
-                    return Err(AppError::invalid_quality_option());
-                }
-            }
-        }
     }
     Ok(())
 }
@@ -201,7 +174,6 @@ fn new_job(args: NewJobArgs) -> DownloadJob {
             MediaTypeInput::Audio => MediaType::Audio,
             MediaTypeInput::Video => MediaType::Video,
             MediaTypeInput::Gallery => MediaType::Gallery,
-            MediaTypeInput::Music => MediaType::Music,
         },
         audio_quality: args.audio_quality,
         video_quality: args.video_quality,
@@ -436,125 +408,4 @@ pub async fn retry_job(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{MediaSource, SegmentMode, SubtitleOptions, TrimRange};
-
-    /// Preview đúng hình dạng mà `try_music_preview` trả về cho một track đơn.
-    fn music_preview() -> MediaSource {
-        MediaSource {
-            source_url: "https://open.spotify.com/track/x".to_string(),
-            title: "Someone – Song".to_string(),
-            thumbnail_url: None,
-            duration_seconds: Some(215),
-            platform: "spotify".to_string(),
-            is_playlist: false,
-            playlist_item_count: None,
-            available_video_qualities: Vec::new(),
-            available_audio_formats: Vec::new(),
-            is_gallery: false,
-            gallery_items: Vec::new(),
-            is_music: true,
-            available_music_tiers: vec![
-                "flac16".to_string(),
-                "flac24".to_string(),
-                "mp3_320".to_string(),
-            ],
-            playlist_entries: Vec::new(),
-            subtitles: None,
-            chapters: None,
-        }
-    }
-
-    fn music_input(audio_quality: Option<&str>, output_options: Option<OutputOptions>) -> CreateJobInput {
-        CreateJobInput {
-            source_url: "https://open.spotify.com/track/x".to_string(),
-            media_type: MediaTypeInput::Music,
-            audio_quality: audio_quality.map(str::to_string),
-            video_quality: None,
-            gallery_mode: None,
-            selected_gallery_indices: None,
-            output_directory: "/tmp".to_string(),
-            playlist_scope: None,
-            title: None,
-            output_options,
-        }
-    }
-
-    #[test]
-    fn a_tier_from_the_preview_is_accepted() {
-        for tier in ["flac16", "flac24", "mp3_320"] {
-            assert!(
-                validate_quality(&music_preview(), &music_input(Some(tier), None)).is_ok(),
-                "{tier} nằm trong danh sách tier của preview"
-            );
-        }
-    }
-
-    #[test]
-    fn a_tier_the_preview_never_offered_is_rejected() {
-        // FR-019 áp cho engine mới: backend không tin chuỗi chất lượng frontend
-        // gửi mà không đối chiếu preview thật của chính link đó.
-        let err = validate_quality(&music_preview(), &music_input(Some("flac999"), None))
-            .expect_err("tier lạ phải bị từ chối");
-        assert_eq!(err.code, "INVALID_QUALITY_OPTION");
-
-        let err = validate_quality(&music_preview(), &music_input(None, None))
-            .expect_err("job nhạc không có tier là không hợp lệ");
-        assert_eq!(err.code, "INVALID_QUALITY_OPTION");
-    }
-
-    #[test]
-    fn a_music_job_against_a_non_music_preview_is_rejected() {
-        // Cùng luật với gallery: `media_type` do frontend gửi không được phép
-        // mâu thuẫn với engine đã thật sự resolve link này.
-        let mut preview = music_preview();
-        preview.is_music = false;
-        preview.available_music_tiers.clear();
-
-        let err = validate_quality(&preview, &music_input(Some("flac16"), None))
-            .expect_err("preview yt-dlp không dựng được job nhạc");
-        assert_eq!(err.code, "INVALID_QUALITY_OPTION");
-    }
-
-    #[test]
-    fn output_options_that_do_not_apply_to_music_are_rejected_instead_of_ignored() {
-        // Nhận rồi âm thầm bỏ qua là hứa một thứ không làm: worker tự tag và
-        // nhúng bìa, không có chỗ nào cho phụ đề hay cắt đoạn.
-        let with_subtitles = OutputOptions {
-            subtitles: SubtitleOptions {
-                languages: vec!["vi".to_string()],
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let err = validate_quality(
-            &music_preview(),
-            &music_input(Some("flac16"), Some(with_subtitles)),
-        )
-        .expect_err("phụ đề không có nghĩa với một file nhạc");
-        assert_eq!(err.code, "INVALID_QUALITY_OPTION");
-
-        let with_trim = OutputOptions {
-            segment: SegmentMode::Trim(TrimRange {
-                start_seconds: Some(30.0),
-                end_seconds: Some(60.0),
-                accurate_cut: false,
-            }),
-            ..Default::default()
-        };
-        let err = validate_quality(
-            &music_preview(),
-            &music_input(Some("flac16"), Some(with_trim)),
-        )
-        .expect_err("cắt đoạn không đi qua đường tải nhạc");
-        assert_eq!(err.code, "INVALID_QUALITY_OPTION");
-    }
-
-    #[test]
-    fn plain_output_options_still_pass_through_for_music() {
-        assert!(validate_quality(
-            &music_preview(),
-            &music_input(Some("flac24"), Some(OutputOptions::default()))
-        )
-        .is_ok());
-    }
 }

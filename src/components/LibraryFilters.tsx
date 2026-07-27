@@ -9,7 +9,7 @@ import { hasActiveFilters, useLibraryStore } from "@/stores/library-store";
 import type { MediaType } from "@/types/download";
 import type { LibrarySort } from "@/types/library";
 
-const MEDIA_TYPES: MediaType[] = ["audio", "video", "gallery", "music"];
+const MEDIA_TYPES: MediaType[] = ["audio", "video", "gallery"];
 const SORTS: LibrarySort[] = ["downloaded_at", "title", "file_size", "duration"];
 
 /**
@@ -68,10 +68,10 @@ export function LibraryFilters() {
             value={sort}
             onChange={(event) => setSort(event.target.value as LibrarySort, direction)}
             data-testid="library-sort"
-            className="h-9 rounded-lg border border-border/80 bg-card px-2 text-xs shadow-2xs"
+            className="h-9 cursor-pointer rounded-lg border border-border/80 bg-card px-3 py-1 text-xs font-medium text-foreground shadow-2xs outline-none transition-colors hover:bg-accent/40 focus-visible:ring-1 focus-visible:ring-primary/40 dark:bg-card"
           >
             {SORTS.map((option) => (
-              <option key={option} value={option}>
+              <option key={option} value={option} className="bg-popover text-popover-foreground">
                 {t(`library.sort_${option}`)}
               </option>
             ))}

@@ -13,7 +13,6 @@ dist-ssr
 /src-tauri/binaries/ffmpeg*
 /src-tauri/binaries/yt-dlp*
 /src-tauri/binaries/gallery-dl*
-/src-tauri/binaries/spotiflac*
 /src-tauri/gen
 
 # Logs
@@ -58,9 +57,9 @@ coverage
 src-tauri/icons/android/
 src-tauri/icons/ios/
 
-# Python build artefacts. The PyInstaller onedir bundles for yt-dlp,
-# gallery-dl and spotiflac are built by scripts/, which leaves these behind.
-# The build/dist rules are scoped to scripts/ on purpose: bare `build/` would
+# Python build artefacts. The PyInstaller onedir bundles for yt-dlp and
+# gallery-dl are built by scripts/, which leaves these behind. The
+# build/dist rules are scoped to scripts/ on purpose: bare `build/` would
 # quietly swallow an unrelated directory later, and `dist` is already ignored
 # above for the Vite output.
 __pycache__/

@@ -4,7 +4,7 @@
 
 A desktop app for downloading video, audio, and lossless music from a wide range of platforms — runs on Windows, macOS, and Linux, ships every tool it needs, and requires no Python, Node.js, or other dependency from the user.
 
-Built on [Tauri 2](https://tauri.app/) (Rust + React), using [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [gallery-dl](https://github.com/mikf/gallery-dl) as the video/image download engines, and [SpotiFLAC](https://github.com/BartolomeoRusso9/SpotiFLAC-Module-Version) as the lossless music engine.
+Built on [Tauri 2](https://tauri.app/) (Rust + React), using [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [gallery-dl](https://github.com/mikf/gallery-dl) as the download engines.
 
 ## Features
 
@@ -25,13 +25,6 @@ Built on [Tauri 2](https://tauri.app/) (Rust + React), using [yt-dlp](https://gi
 - Automatic metadata (title, artist, album) and cover art embedding wherever the output format supports it.
 - Custom filename templates, subtitle downloads, trimming a specific segment, and splitting a video into per-chapter files.
 - Save a full output configuration as a reusable preset.
-
-### Lossless music — SpotiFLAC
-- Paste a Spotify, Tidal, Apple Music, or Pandora link to get the track as **genuine lossless FLAC** (16-bit or 24-bit Hi-Res) sourced from Tidal, Qobuz, Deezer, or Amazon Music — no account required for any of them.
-- Automatically tries providers in a user-configured priority order, with JS-extension fallback when the primary source has trouble (requires Node.js).
-- An MP3 320kbps tier is available too (downloads the lossless source, then transcodes with the bundled ffmpeg).
-- Handles Cloudflare verification gracefully: an in-app dialog for entering the verification code, plus optional Telegram Bot notifications for remote verification.
-- Albums, playlists, and artist discographies are split into independent per-track downloads in the same queue.
 
 ### Library
 - Every downloaded file is indexed automatically — browse as a grid or list, search and filter by content type, platform, or format.
@@ -68,7 +61,7 @@ Requires: Node.js 22+, pnpm, Rust stable, Python 3 (build-time only, for the sid
 
 ```bash
 pnpm install
-bash scripts/fetch-dev-binaries.sh   # fetches/builds yt-dlp, gallery-dl, spotiflac-worker, ffmpeg for local dev
+bash scripts/fetch-dev-binaries.sh   # fetches/builds yt-dlp, gallery-dl, ffmpeg for local dev
 pnpm tauri dev
 ```
 
@@ -83,7 +76,7 @@ cd src-tauri && cargo test   # backend (Rust)
 
 - **Frontend**: React 19 + TypeScript, Zustand for state, i18next for localization.
 - **Backend**: Rust (Tauri 2), SQLite (rusqlite) for the queue, history, library, and settings.
-- **Download engines**: three engines run side by side depending on content type — `yt-dlp` (general video/audio), `gallery-dl` (images/galleries), `spotiflac-worker` (lossless music, a thin wrapper this project wrote around the SpotiFLAC Python module).
+- **Download engines**: two engines run side by side depending on content type — `yt-dlp` (general video/audio), `gallery-dl` (images/galleries).
 - Each Python-based tool ships as a PyInstaller onedir build and is unpacked into the app's data directory on first run — no Python installation required on the user's machine.
 
 Detailed design docs for each feature live under [`specs/`](specs/), following a spec-driven development approach.

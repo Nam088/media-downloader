@@ -19,7 +19,6 @@ use super::filename;
 use super::gallery_dl;
 use super::retry::{decide_outcome, Outcome};
 use super::scheduler::{available_slots, TICK_INTERVAL_MS};
-use super::spotiflac;
 use super::ytdlp;
 use super::ytdlp_binary;
 
@@ -57,12 +56,6 @@ struct JobProgressEvent {
     downloaded_bytes: Option<i64>,
     speed_bytes_per_sec: Option<i64>,
     eta_seconds: Option<i64>,
-    /// Nhà cung cấp nguồn nhạc đang phục vụ lần tải này (`"tidal"`,
-    /// `"ext:qobuz-web"`…) — chỉ job `MediaType::Music` mới có. `None` cho
-    /// yt-dlp/gallery-dl: chúng chỉ có đúng một nguồn, chính là link người
-    /// dùng dán vào.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provider: Option<String>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -101,30 +94,8 @@ struct JobStatusChangedEvent {
 struct RunningJob {
     cancel_tx: watch::Sender<bool>,
     run_id: u64,
-    /// Chỉ job nhạc: challenge Cloudflare đang chờ người dùng nhập grant.
-    /// Sống trong bộ nhớ đúng bằng vòng đời worker — app khởi động lại thì
-    /// worker đã chết, và `reset_interrupted_jobs` đưa job về hàng chờ để
-    /// chạy lại (challenge sẽ tự phát sinh lại nếu còn).
-    challenge: Option<PendingChallenge>,
 }
 
-/// Trạng thái một Cloudflare challenge đang chờ (data-model.md §6).
-#[derive(Clone)]
-pub struct PendingChallenge {
-    pub challenge_url: String,
-    /// Handle worker để bơm grant xuống stdin.
-    child: spotiflac::SpotiflacChild,
-    /// Số lần nhập grant đã thử — quá `MAX_GRANT_ATTEMPTS` thì job thất bại.
-    attempts: u8,
-}
-
-/// Số lần nhập grant tối đa trước khi bỏ cuộc.
-const MAX_GRANT_ATTEMPTS: u8 = 3;
-
-/// Trần thời gian một job được phép đứng ở `waiting_input`. Không có nó, một
-/// người dùng bỏ mặc hộp thoại sẽ giữ vĩnh viễn một slot concurrency (tối đa
-/// 8 slot toàn ứng dụng) — hàng đợi đứng im mà không có gì báo tại sao.
-const CHALLENGE_TIMEOUT_SECS: u64 = 15 * 60;
 
 pub struct DownloadQueue {
     db: Arc<Db>,
@@ -160,53 +131,6 @@ impl DownloadQueue {
         queue
     }
 
-    /// Bơm grant code người dùng vừa nhập xuống worker đang giữ challenge
-    /// (FR-007). KHÔNG tự đổi trạng thái job: chỉ khi worker thật sự tải tiếp
-    /// (nhịp progress kế tiếp) `run_music_job` mới đưa job về `downloading` —
-    /// đổi ngay tại đây sẽ báo "đang tải" cho một grant vừa bị từ chối.
-    ///
-    /// Grant sai lần thứ `MAX_GRANT_ATTEMPTS` thì bỏ cuộc: giết worker và để
-    /// `finish_job` đánh dấu thất bại với `SPOTIFLAC_CHALLENGE_TIMEOUT`.
-    pub async fn submit_cloudflare_grant(&self, job_id: &str, grant: &str) -> Result<(), AppError> {
-        let grant = grant.trim();
-        if grant.is_empty() {
-            return Err(AppError::new(
-                "MISSING_QUALITY",
-                "A grant code is required to continue",
-            ));
-        }
-
-        let (child, attempts) = {
-            let mut running = self.running.lock().await;
-            let entry = running
-                .get_mut(job_id)
-                .ok_or_else(|| AppError::not_found("Job"))?;
-            let challenge = entry
-                .challenge
-                .as_mut()
-                .ok_or_else(|| AppError::not_found("Cloudflare challenge"))?;
-            challenge.attempts += 1;
-            (challenge.child.clone(), challenge.attempts)
-        };
-
-        if attempts > MAX_GRANT_ATTEMPTS {
-            child.kill().await;
-            clear_challenge(&self.handles(), job_id).await;
-            return Err(AppError::spotiflac_challenge_timeout());
-        }
-
-        child.send_grant(grant).await
-    }
-
-    /// URL challenge đang chờ của một job, để hộp thoại dựng lại được sau khi
-    /// giao diện tải lại (trạng thái này chỉ nằm trong bộ nhớ).
-    pub async fn pending_challenge(&self, job_id: &str) -> Option<String> {
-        let running = self.running.lock().await;
-        running
-            .get(job_id)
-            .and_then(|entry| entry.challenge.as_ref())
-            .map(|challenge| challenge.challenge_url.clone())
-    }
 
     /// Người dùng đổi số luồng trong Cài đặt. Đánh thức dispatcher ngay để
     /// việc tăng số luồng có hiệu lực tức thì thay vì đợi hết nhịp tick.
@@ -567,7 +491,6 @@ async fn start_job(handles: &QueueHandles, job: DownloadJob) -> Result<(), AppEr
             RunningJob {
                 cancel_tx,
                 run_id,
-                challenge: None,
             },
         );
 
@@ -724,9 +647,6 @@ async fn run_job(
 ) -> Result<(), AppError> {
     if job.media_type == MediaType::Gallery {
         return run_gallery_job(handles, job, cancel_rx).await;
-    }
-    if job.media_type == MediaType::Music {
-        return run_music_job(handles, job, cancel_rx).await;
     }
 
     let naming = resolve_output_naming(&job).await;
@@ -942,26 +862,10 @@ async fn index_library_file(
     title: String,
     thumbnail_path: Option<String>,
 ) -> Result<(), AppError> {
-    index_library_file_from(handles, job, file_path, title, thumbnail_path, None).await
-}
-
-/// Biến thể nhận thêm `source_provider` — chỉ đường tải nhạc SpotiFLAC dùng
-/// (provider thật sự đã giao file); mọi engine khác đi qua wrapper ở trên với
-/// `None`.
-async fn index_library_file_from(
-    handles: &QueueHandles,
-    job: &DownloadJob,
-    file_path: &str,
-    title: String,
-    thumbnail_path: Option<String>,
-    source_provider: Option<String>,
-) -> Result<(), AppError> {
     let file_size_bytes = tokio::fs::metadata(file_path)
         .await
         .map(|meta| meta.len() as i64)
         .unwrap_or(0);
-    // Làm tròn xuống về giây: hợp đồng với giao diện là số nguyên giây, và
-    // phần lẻ của một bản ghi 3 phút không có người xem nào phân biệt được.
     let duration_seconds = probe_media_duration_secs(file_path)
         .await
         .map(|secs| secs as i64);
@@ -977,7 +881,6 @@ async fn index_library_file_from(
         source_url: job.source_url.clone(),
         duration_seconds,
         thumbnail_path,
-        source_provider,
     })
 }
 
@@ -1279,429 +1182,6 @@ async fn run_gallery_job(
     );
 
     Ok(())
-}
-
-/// Tải một bài nhạc lossless qua engine SpotiFLAC (specs/006).
-///
-/// Nhánh thứ ba của `run_job`, cạnh yt-dlp và gallery-dl. Mỗi job = đúng một
-/// track (album/playlist đã được fan-out thành nhiều job từ `preview_media`),
-/// nên hàm này spawn worker đúng một lần và dịch luồng event của nó sang
-/// trạng thái/tiến trình của hàng đợi.
-///
-/// Huỷ đi qua stdin (`cancel`) trước, kill-fallback sau: worker cần một nhịp
-/// để dọn file `.part` dở, nhưng một worker treo không đọc stdin nữa thì lệnh
-/// đó không tới nơi — nên không bao giờ chỉ dựa vào nó.
-async fn run_music_job(
-    handles: &QueueHandles,
-    job: DownloadJob,
-    mut cancel_rx: watch::Receiver<bool>,
-) -> Result<(), AppError> {
-    let settings = handles.db.get_settings()?;
-    let tier = job
-        .audio_quality
-        .clone()
-        .unwrap_or_else(|| settings.spotiflac_quality.clone());
-
-    // JS extensions chỉ chạy được khi máy có Node. KHÔNG để module tự cài Node
-    // (nó sẽ gọi brew/apt/winget kèm prompt sudo/UAC giữa một lần tải nhạc —
-    // research.md R5); thiếu Node thì chạy native-only kèm một dòng cảnh báo.
-    let node_present = spotiflac::node_available();
-    let extensions_fallback = settings.spotiflac_extensions_fallback && node_present;
-    if settings.spotiflac_extensions_fallback && !node_present {
-        log_event(
-            &handles.app,
-            "WARN",
-            format!(
-                "Job {}: [{}] Node.js not found in PATH — JS extension fallback is off for this run; \
-                 install Node.js to enable it",
-                job.id,
-                crate::error::SPOTIFLAC_NODE_MISSING_CODE
-            ),
-        );
-    }
-
-    // Tải vào một thư mục riêng của job rồi mới chuyển ra: worker tự đặt tên
-    // file từ metadata (`{title} - {artist}.flac`), nên đây là cách duy nhất
-    // biết chắc file nào là của lần chạy này khi thư mục đích dùng chung.
-    let job_dir = format!("{}/.spotiflac-{}", job.output_directory, &job.id[..8]);
-    tokio::fs::create_dir_all(&job_dir)
-        .await
-        .map_err(AppError::internal)?;
-
-    let params = spotiflac::MusicDownloadParams {
-        track_url: job.source_url.clone(),
-        output_dir: job_dir.clone(),
-        services: settings.spotiflac_service_order.clone(),
-        tier: tier.clone(),
-        extensions_fallback,
-        tg_bot_token: settings.tg_bot_token.clone(),
-        tg_chat_id: settings.tg_chat_id.clone(),
-    };
-
-    let job_id_for_events = job.id.clone();
-    let app_for_events = handles.app.clone();
-    let db_for_events = Arc::clone(&handles.db);
-    let current_provider = Arc::new(std::sync::Mutex::new(None::<String>));
-    let provider_for_events = Arc::clone(&current_provider);
-    let child_slot: Arc<AsyncMutex<Option<spotiflac::SpotiflacChild>>> =
-        Arc::new(AsyncMutex::new(None));
-    let child_slot_for_spawn = Arc::clone(&child_slot);
-
-    // Callback của worker là đồng bộ, còn việc đổi trạng thái job cần chạm
-    // `running` (AsyncMutex) và DB — nên nó chỉ ĐẨY TIN qua kênh này, còn
-    // vòng select bên dưới mới là nơi thật sự xử lý.
-    let (signal_tx, mut signal_rx) = tokio::sync::mpsc::unbounded_channel::<ChallengeSignal>();
-    let signal_tx_for_events = signal_tx.clone();
-    // Chỉ phát `Resumed` cho nhịp progress ĐẦU TIÊN sau một challenge: progress
-    // tới vài lần mỗi giây, và mỗi tin là một lần đổi trạng thái + emit event.
-    let challenge_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let challenge_active_for_events = Arc::clone(&challenge_active);
-
-    let download_fut = spotiflac::run_music_download(
-        &handles.app,
-        &params,
-        move |child| {
-            // `try_lock` chứ không `blocking_lock`: callback này chạy trên
-            // runtime tokio, và slot chưa từng bị ai giữ ở thời điểm spawn.
-            if let Ok(mut slot) = child_slot_for_spawn.try_lock() {
-                *slot = Some(child);
-            }
-        },
-        move |event| match event {
-            spotiflac::WorkerEvent::TrackStart { provider } => {
-                *provider_for_events.lock().expect("provider mutex poisoned") =
-                    Some(provider.clone());
-                log_event(
-                    &app_for_events,
-                    "INFO",
-                    format!("Job {job_id_for_events}: trying provider {provider}"),
-                );
-            }
-            spotiflac::WorkerEvent::ProviderSwitch { from, to, reason } => {
-                log_event(
-                    &app_for_events,
-                    "INFO",
-                    format!(
-                        "Job {job_id_for_events}: provider {from} → {to}{}",
-                        reason
-                            .as_deref()
-                            .map(|r| format!(" ({r})"))
-                            .unwrap_or_default()
-                    ),
-                );
-            }
-            spotiflac::WorkerEvent::CloudflareChallenge { challenge_url } => {
-                let _ = signal_tx_for_events.send(ChallengeSignal::Raised {
-                    challenge_url: challenge_url.clone(),
-                });
-            }
-            spotiflac::WorkerEvent::Progress {
-                percent,
-                downloaded_bytes,
-                speed_bps,
-            } => {
-                // Byte lại chảy = grant vừa được chấp nhận. Đây là tín hiệu
-                // DUY NHẤT worker cho biết điều đó (giao thức không có event
-                // "grant accepted" riêng).
-                if challenge_active_for_events.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                    let _ = signal_tx_for_events.send(ChallengeSignal::Resumed);
-                }
-                let _ = db_for_events.update_job_progress(
-                    &job_id_for_events,
-                    *percent,
-                    *speed_bps,
-                    None,
-                );
-                let provider = provider_for_events
-                    .lock()
-                    .expect("provider mutex poisoned")
-                    .clone();
-                emit_music_progress(
-                    &app_for_events,
-                    &job_id_for_events,
-                    *percent,
-                    *downloaded_bytes,
-                    *speed_bps,
-                    provider,
-                );
-            }
-            _ => {}
-        },
-    );
-
-    tokio::pin!(download_fut);
-    // `Some` chỉ trong lúc job đứng ở `waiting_input` — cũng là cờ bật nhánh
-    // timeout của select bên dưới.
-    let mut challenge_deadline: Option<tokio::time::Instant> = None;
-
-    let download_result = loop {
-        tokio::select! {
-            result = &mut download_fut => break result,
-            _ = cancel_rx.changed() => {
-                clear_challenge(handles, &job.id).await;
-                if let Some(child) = child_slot.lock().await.as_ref() {
-                    let _ = child.send_cancel().await;
-                    // Worker treo (không còn đọc stdin) thì lệnh trên rơi vào
-                    // hư không — kill là thứ luôn tới nơi.
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    child.kill().await;
-                }
-                let _ = tokio::fs::remove_dir_all(&job_dir).await;
-                return Err(canceled("music download"));
-            }
-            Some(signal) = signal_rx.recv() => match signal {
-                ChallengeSignal::Raised { challenge_url } => {
-                    challenge_active.store(true, std::sync::atomic::Ordering::Relaxed);
-                    challenge_deadline = Some(
-                        tokio::time::Instant::now()
-                            + std::time::Duration::from_secs(CHALLENGE_TIMEOUT_SECS),
-                    );
-                    let child = child_slot.lock().await.clone();
-                    raise_challenge(handles, &job.id, &challenge_url, child).await;
-                }
-                ChallengeSignal::Resumed => {
-                    challenge_deadline = None;
-                    clear_challenge(handles, &job.id).await;
-                    let _ = handles
-                        .db
-                        .update_job_status(&job.id, JobStatus::Downloading, None);
-                    emit_status_changed(
-                        &handles.app,
-                        &job.id,
-                        JobStatus::Downloading,
-                        None,
-                        None,
-                    );
-                }
-            },
-            // Trần thời gian ở `waiting_input` (data-model.md §2): giữ slot
-            // vô thời hạn vì một hộp thoại bị bỏ quên là cách hàng đợi đứng
-            // im mà không có gì nói tại sao.
-            _ = tokio::time::sleep_until(challenge_deadline.unwrap_or_else(tokio::time::Instant::now)),
-                if challenge_deadline.is_some() =>
-            {
-                clear_challenge(handles, &job.id).await;
-                if let Some(child) = child_slot.lock().await.as_ref() {
-                    child.kill().await;
-                }
-                let _ = tokio::fs::remove_dir_all(&job_dir).await;
-                return Err(AppError::spotiflac_challenge_timeout());
-            }
-        }
-    };
-
-    let done = match download_result {
-        Ok(done) => done,
-        Err(err) => {
-            let _ = tokio::fs::remove_dir_all(&job_dir).await;
-            return Err(err);
-        }
-    };
-
-    // Tier MP3 320: engine chỉ giao FLAC từ các provider lossless (MP3 chỉ có
-    // ở SoundCloud/YouTube/Pandora, vốn không đi đường này), nên bước chuyển
-    // mã bằng ffmpeg đã bundle là cách duy nhất giữ đúng lời hứa của FR-003 —
-    // và tải bản lossless rồi hạ xuống cho chất lượng tốt hơn bất kỳ nguồn
-    // MP3 nào (research.md R3).
-    let downloaded_path = if tier == MP3_320_TIER {
-        transcode_to_mp3_320(&done.file_path).await?
-    } else {
-        done.file_path.clone()
-    };
-
-    // Chuyển ra khỏi thư mục tạm về đúng thư mục người dùng chọn, chống ghi đè
-    // bằng cùng bộ dedupe mà nhánh yt-dlp dùng (FR-215).
-    let output_path = move_music_output(&job, &downloaded_path).await?;
-    let _ = tokio::fs::remove_dir_all(&job_dir).await;
-
-    let provider = done.provider.or_else(|| {
-        current_provider
-            .lock()
-            .expect("provider mutex poisoned")
-            .clone()
-    });
-
-    index_library_file_from(
-        handles,
-        &job,
-        &output_path,
-        library_title(&job, &output_path),
-        None,
-        provider,
-    )
-    .await?;
-
-    handles.db.set_job_output_file(&job.id, &output_path)?;
-    handles
-        .db
-        .update_job_status(&job.id, JobStatus::Completed, None)?;
-    crate::notify::notify_job_finished(
-        &handles.app,
-        &JobStatus::Completed,
-        job.title.as_deref().unwrap_or(&job.source_url),
-        None,
-    );
-    emit_status_changed(
-        &handles.app,
-        &job.id,
-        JobStatus::Completed,
-        None,
-        Some(output_path),
-    );
-
-    Ok(())
-}
-
-/// Tin nhắn từ callback đồng bộ của worker về vòng điều khiển của
-/// `run_music_job` — xem chú thích tại chỗ tạo kênh.
-enum ChallengeSignal {
-    Raised { challenge_url: String },
-    Resumed,
-}
-
-/// Job gặp Cloudflare challenge: ghi vào `running`, chuyển sang
-/// `waiting_input`, và báo giao diện mở hộp thoại nhập grant.
-async fn raise_challenge(
-    handles: &QueueHandles,
-    job_id: &str,
-    challenge_url: &str,
-    child: Option<spotiflac::SpotiflacChild>,
-) {
-    let Some(child) = child else {
-        // Không có handle worker thì không có chỗ nào bơm grant vào — để
-        // worker tự xoay (Telegram bridge của module vẫn hoạt động).
-        log_event(
-            &handles.app,
-            "WARN",
-            format!("Job {job_id}: Cloudflare challenge raised before the worker handle was ready"),
-        );
-        return;
-    };
-    {
-        let mut running = handles.running.lock().await;
-        if let Some(entry) = running.get_mut(job_id) {
-            // Challenge lặp lại = grant vừa nhập bị từ chối; giữ nguyên bộ
-            // đếm để lần thứ ba thật sự là lần cuối.
-            let attempts = entry
-                .challenge
-                .as_ref()
-                .map(|c| c.attempts)
-                .unwrap_or(0);
-            entry.challenge = Some(PendingChallenge {
-                challenge_url: challenge_url.to_string(),
-                child,
-                attempts,
-            });
-        }
-    }
-    let _ = handles
-        .db
-        .update_job_status(job_id, JobStatus::WaitingInput, None);
-    let _ = handles.app.emit(
-        "job:cloudflare_challenge",
-        JobCloudflareChallengeEvent {
-            job_id: job_id.to_string(),
-            challenge_url: challenge_url.to_string(),
-        },
-    );
-    emit_status_changed(&handles.app, job_id, JobStatus::WaitingInput, None, None);
-    log_event(
-        &handles.app,
-        "WARN",
-        format!("Job {job_id}: waiting for a Cloudflare grant code ({challenge_url})"),
-    );
-}
-
-/// Gỡ challenge khỏi `running` — gọi ở MỌI đường thoát khỏi `waiting_input`
-/// (grant được nhận, huỷ, hết giờ), nếu không hộp thoại sẽ khôi phục lại một
-/// challenge đã chết ở lần `get_pending_challenge` sau.
-async fn clear_challenge(handles: &QueueHandles, job_id: &str) {
-    let mut running = handles.running.lock().await;
-    if let Some(entry) = running.get_mut(job_id) {
-        entry.challenge = None;
-    }
-}
-
-/// Sự kiện báo giao diện mở hộp thoại nhập grant (contracts/tauri-interface
-/// §3).
-#[derive(Clone, serde::Serialize)]
-struct JobCloudflareChallengeEvent {
-    job_id: String,
-    challenge_url: String,
-}
-
-/// Tier duy nhất cần bước hậu xử lý sau khi worker giao file.
-const MP3_320_TIER: &str = "mp3_320";
-
-/// Tham số ffmpeg cho bước hạ FLAC → MP3 320kbps CBR, giữ nguyên tag và ảnh
-/// bìa. Tách khỏi hàm chạy để kiểm thử được mà không cần một file thật.
-///
-/// `-map 0:a` + `-map 0:v?` là điểm mấu chốt: ảnh bìa nằm trong FLAC dưới
-/// dạng một luồng video ảnh tĩnh, nên map audio không thôi sẽ lặng lẽ vứt bìa
-/// đi. `?` để một file không bìa vẫn chạy bình thường thay vì ffmpeg báo lỗi
-/// "stream không tồn tại".
-fn mp3_320_args(input: &str, output: &str) -> Vec<String> {
-    [
-        "-y", "-i", input, "-map", "0:a", "-map", "0:v?", "-c:a", "libmp3lame", "-b:a", "320k",
-        "-c:v", "copy", "-id3v2_version", "3", "-map_metadata", "0", output,
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
-}
-
-/// Chạy bước chuyển mã MP3 320 và trả về đường dẫn file mới; xoá bản FLAC
-/// trung gian khi thành công.
-async fn transcode_to_mp3_320(flac_path: &str) -> Result<String, AppError> {
-    let ffmpeg_path = ytdlp_binary::resolve_ffmpeg_path()?;
-    let output_path = Path::new(flac_path).with_extension("mp3");
-    let output = output_path.to_string_lossy().into_owned();
-
-    let result = tokio::process::Command::new(&ffmpeg_path)
-        .args(mp3_320_args(flac_path, &output))
-        .output()
-        .await
-        .map_err(AppError::internal)?;
-
-    if !result.status.success() {
-        let _ = tokio::fs::remove_file(&output_path).await;
-        return Err(AppError::new(
-            "DOWNLOAD_FAILED",
-            format!(
-                "Converting the downloaded track to MP3 320kbps failed: {}",
-                String::from_utf8_lossy(&result.stderr).trim()
-            ),
-        ));
-    }
-
-    let _ = tokio::fs::remove_file(flac_path).await;
-    Ok(output)
-}
-
-/// Chuyển file worker vừa tải từ thư mục tạm của job về thư mục đích, giữ
-/// nguyên tên do worker đặt (nó dựng tên từ metadata thật) và né tên đã bị
-/// chiếm thay vì ghi đè (FR-215).
-async fn move_music_output(job: &DownloadJob, downloaded_path: &str) -> Result<String, AppError> {
-    let source = Path::new(downloaded_path);
-    let file_name = source
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| AppError::internal("spotiflac worker returned a path with no file name"))?;
-
-    let destination = filename::deduplicate_path(
-        &Path::new(&job.output_directory).join(file_name),
-        |candidate| candidate.exists(),
-    );
-    // `rename` hỏng khi thư mục tạm và thư mục đích nằm trên hai volume khác
-    // nhau — không xảy ra ở đây (thư mục tạm là con của chính thư mục đích)
-    // nhưng copy+xoá là đường lui rẻ và luôn đúng.
-    if tokio::fs::rename(source, &destination).await.is_err() {
-        tokio::fs::copy(source, &destination)
-            .await
-            .map_err(AppError::internal)?;
-        let _ = tokio::fs::remove_file(source).await;
-    }
-    Ok(destination.to_string_lossy().into_owned())
 }
 
 /// Strips characters invalid in a filename on at least one of
@@ -2160,9 +1640,6 @@ fn expected_extension(job: &DownloadJob) -> Option<&'static str> {
         MediaType::Audio => job.output_options.audio.ytdlp_audio_format(),
         MediaType::Video => job.output_options.video_container.merge_output_format(),
         MediaType::Gallery => None,
-        // Đuôi file do worker/tier quyết định (`.flac`, hoặc `.mp3` sau bước
-        // transcode) — không đi qua bộ dựng tên yt-dlp này.
-        MediaType::Music => None,
     }
 }
 
@@ -2296,10 +1773,6 @@ fn thumbnail_support(job: &DownloadJob) -> ThumbnailSupport {
         MediaType::Gallery => ThumbnailSupport::Unsupported(
             "gallery downloads do not go through yt-dlp".to_string(),
         ),
-        // Engine SpotiFLAC tự nhúng cover art vào FLAC (FR-006 của specs/006).
-        MediaType::Music => ThumbnailSupport::Unsupported(
-            "music downloads do not go through yt-dlp".to_string(),
-        ),
     }
 }
 
@@ -2329,9 +1802,6 @@ fn subtitle_embed_support(job: &DownloadJob) -> SubtitleEmbedSupport {
         ),
         MediaType::Gallery => SubtitleEmbedSupport::Unsupported(
             "gallery downloads do not go through yt-dlp".to_string(),
-        ),
-        MediaType::Music => SubtitleEmbedSupport::Unsupported(
-            "music downloads do not go through yt-dlp".to_string(),
         ),
     }
 }
@@ -2577,13 +2047,6 @@ fn build_ytdlp_args(job: &DownloadJob, rate_limit_kbps: u32) -> Result<YtdlpPlan
                 "build_ytdlp_args called for a MediaType::Gallery job",
             ))
         }
-        // Cùng bất biến với Gallery: `run_job` rẽ sang `run_music_job`
-        // (spotiflac-worker) trước khi hàm này được gọi cho job nhạc.
-        MediaType::Music => {
-            return Err(AppError::internal(
-                "build_ytdlp_args called for a MediaType::Music job",
-            ))
-        }
     }
 
     // FR-208. yt-dlp lấy các trường này thẳng từ metadata nguồn, nên trường nào
@@ -2667,33 +2130,6 @@ fn emit_progress(app: &AppHandle, job_id: &str, update: &ytdlp::ProgressUpdate) 
             downloaded_bytes: update.downloaded_bytes,
             speed_bytes_per_sec: update.speed_bytes_per_sec,
             eta_seconds: update.eta_seconds,
-            provider: None,
-        },
-    );
-}
-
-/// Tiến trình của một job nhạc. Khác `emit_progress` ở đúng một điểm: nó mang
-/// theo provider đang phục vụ (FR-009 đòi hiển thị "nhà cung cấp đang dùng"),
-/// thứ chỉ tồn tại ở engine SpotiFLAC.
-fn emit_music_progress(
-    app: &AppHandle,
-    job_id: &str,
-    percent: Option<f64>,
-    downloaded_bytes: Option<i64>,
-    speed_bytes_per_sec: Option<i64>,
-    provider: Option<String>,
-) {
-    let _ = app.emit(
-        "job:progress",
-        JobProgressEvent {
-            job_id: job_id.to_string(),
-            progress_percent: percent,
-            downloaded_bytes,
-            speed_bytes_per_sec,
-            // Worker không báo ETA: module không lộ ra con số đó, và tự tính
-            // từ tốc độ tức thời là bịa (FR-211).
-            eta_seconds: None,
-            provider,
         },
     );
 }
@@ -2742,51 +2178,6 @@ fn emit_completed(
 #[cfg(test)]
 mod tests {
 
-    // ---- specs/006-spotiflac-integration: engine nhạc -------------------
-
-    #[test]
-    fn the_mp3_transcode_keeps_the_cover_art_and_the_tags() {
-        // `-map 0:a` một mình sẽ lặng lẽ vứt ảnh bìa: trong FLAC nó là một
-        // luồng video ảnh tĩnh, không phải metadata.
-        let args = mp3_320_args("/tmp/song.flac", "/tmp/song.mp3");
-
-        let joined = args.join(" ");
-        assert!(joined.contains("-map 0:a"), "{joined}");
-        assert!(
-            joined.contains("-map 0:v?"),
-            "ảnh bìa phải được map, và `?` để file không bìa vẫn chạy: {joined}"
-        );
-        assert!(joined.contains("-c:a libmp3lame -b:a 320k"), "{joined}");
-        assert!(joined.contains("-map_metadata 0"), "{joined}");
-        assert_eq!(args.first().map(String::as_str), Some("-y"));
-        assert_eq!(args.last().map(String::as_str), Some("/tmp/song.mp3"));
-    }
-
-    #[test]
-    fn only_the_mp3_tier_triggers_a_transcode() {
-        // Hằng này là điều kiện duy nhất bật bước hậu xử lý trong
-        // `run_music_job`; gõ lệch nó nghĩa là tier MP3 âm thầm ra file FLAC.
-        assert_eq!(MP3_320_TIER, "mp3_320");
-    }
-
-    #[test]
-    fn the_challenge_timeout_is_bounded_and_attempts_are_finite() {
-        // Cả hai trần này tồn tại để một hộp thoại bị bỏ quên không giữ vĩnh
-        // viễn một trong tối đa 8 slot của hàng đợi (data-model.md §2).
-        assert_eq!(CHALLENGE_TIMEOUT_SECS, 15 * 60);
-        assert_eq!(MAX_GRANT_ATTEMPTS, 3);
-    }
-
-    #[test]
-    fn a_music_job_never_reaches_the_ytdlp_argument_builder() {
-        // `run_job` rẽ sang `run_music_job` trước đó; nhánh này chỉ tồn tại để
-        // bất biến ấy vỡ ra thành lỗi rõ ràng thay vì một lệnh yt-dlp vô nghĩa.
-        let job = sample_job(MediaType::Music, Some("flac16"), None);
-
-        let err = build_ytdlp_args(&job, 0).expect_err("job nhạc không đi qua yt-dlp");
-        assert_eq!(err.code, "INTERNAL");
-        assert!(err.message.contains("Music"), "{}", err.message);
-    }
     use super::*;
     use crate::models::{OutputOptions, SubtitleOptions};
 
