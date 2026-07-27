@@ -1,0 +1,74 @@
+name: Update Homebrew Cask
+
+# Bumps Casks/media-downloader.rb's version/sha256/url whenever a release is
+# published, so the cask never drifts out of sync with what a `brew install`
+# would actually fetch — manually editing three fields by hand every release
+# is exactly the kind of thing that gets forgotten under time pressure.
+#
+# Deliberately does NOT reconstruct the asset filename from the release tag.
+# v0.1.1 shipped a real rebuild (different sha256) while tauri.conf.json's
+# version was never bumped, so its dmg is still literally named
+# "..._0.1.0_aarch64.dmg" — a tag-based filename guess would have 404'd.
+# Discovering the real asset name and download URL from the release's own
+# asset list sidesteps that mismatch entirely, whether or not it recurs.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  update-cask:
+    if: ${{ !github.event.release.prerelease && !github.event.release.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find the macOS asset and its real download URL
+        id: asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ASSET_JSON=$(gh release view "${{ github.event.release.tag_name }}" \
+            --repo ${{ github.repository }} \
+            --json assets \
+            --jq '.assets[] | select(.name | endswith("aarch64.dmg"))')
+          if [ -z "$ASSET_JSON" ]; then
+            echo "::error::No aarch64 .dmg asset found on ${{ github.event.release.tag_name }} — skipping cask update"
+            exit 1
+          fi
+          NAME=$(echo "$ASSET_JSON" | jq -r '.name')
+          URL=$(echo "$ASSET_JSON" | jq -r '.url')
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Download it and compute the checksum
+        run: |
+          curl -fL "${{ steps.asset.outputs.url }}" -o asset.dmg
+          echo "sha256=$(shasum -a 256 asset.dmg | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Update Casks/media-downloader.rb
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          ASSET_NAME: ${{ steps.asset.outputs.name }}
+        run: |
+          VERSION="${TAG#v}"
+          sed -i \
+            -e "s/^  version \".*\"/  version \"$VERSION\"/" \
+            -e "s/^  sha256 \".*\"/  sha256 \"$sha256\"/" \
+            -e "s#^  url \".*\"#  url \"https://github.com/${{ github.repository }}/releases/download/$TAG/$ASSET_NAME\"#" \
+            Casks/media-downloader.rb
+          cat Casks/media-downloader.rb
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet Casks/media-downloader.rb; then
+            echo "Cask already up to date"
+            exit 0
+          fi
+          git add Casks/media-downloader.rb
+          git commit -m "chore: bump Homebrew Cask to ${{ github.event.release.tag_name }} [skip ci]"
+          git push

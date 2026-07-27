@@ -1,8 +1,15 @@
 cask "media-downloader" do
-  version "0.1.0"
-  sha256 "12306fc5301417ee81c486bf5a5ab437b09392d6aab02e5b86f67c27723a7b2a"
+  # `version` tracks the release tag, NOT the filename below: the app's own
+  # tauri.conf.json version and the git tag can drift (a real release has
+  # shipped a tag bump with no matching app-version bump), so the dmg's
+  # embedded version number in its filename cannot be trusted to match the
+  # tag. The auto-update workflow (.github/workflows/update-cask.yml) looks
+  # up the real asset name and sha256 from the release itself each time
+  # instead of reconstructing either from this version string.
+  version "0.1.1"
+  sha256 "47c8cea32ac14004eb6df19f3f8c3f8ce52930b20cecfbf88bf98de1c4019918"
 
-  url "https://github.com/Nam088/media-downloader/releases/download/v#{version}/Media.Downloader_#{version}_aarch64.dmg"
+  url "https://github.com/Nam088/media-downloader/releases/download/v#{version}/Media.Downloader_0.1.0_aarch64.dmg"
   name "Media Downloader"
   desc "Download video, audio, and lossless music from YouTube, Spotify, Tidal, and more"
   homepage "https://github.com/Nam088/media-downloader"
