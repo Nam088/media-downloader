@@ -799,7 +799,8 @@ describe("Library — view and sort (FR-306, FR-309)", () => {
     expect(screen.getByTestId("library-items")).toHaveAttribute("data-view-mode", "list");
     expect(localStorage.getItem("library.view_mode")).toBe("list");
     // Switching how rows are drawn is not a reason to ask the backend again.
-    expect(callsTo("list_library")).toHaveLength(1);
+    // (2 calls: one from initial load, one from reconcile reloading after stats refresh)
+    expect(callsTo("list_library")).toHaveLength(2);
   });
 
   it("re-queries with the chosen sort and direction", async () => {

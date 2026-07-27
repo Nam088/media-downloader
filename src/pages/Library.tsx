@@ -20,6 +20,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { useLibraryStore } from "@/stores/library-store";
+import type { JobStatusChangedEvent } from "@/types/download";
 import type { LibraryItem, LibraryReconciledEvent } from "@/types/library";
 
 /** Tên file (không kèm thư mục) — thứ `rename_library_item` nhận. Truyền cả
@@ -45,6 +46,8 @@ export function Library({ active }: { active: boolean }) {
   const reconciling = useLibraryStore((state) => state.reconciling);
   const ensureLoaded = useLibraryStore((state) => state.ensureLoaded);
   const reconcile = useLibraryStore((state) => state.reconcile);
+  const reload = useLibraryStore((state) => state.reload);
+  const initialized = useLibraryStore((state) => state.initialized);
   const applyReconciled = useLibraryStore((state) => state.applyReconciled);
   const setError = useLibraryStore((state) => state.setError);
   const selectAllVisible = useLibraryStore((state) => state.selectAllVisible);
@@ -87,6 +90,20 @@ export function Library({ active }: { active: boolean }) {
       void unlisten.then((stop) => stop());
     };
   }, [applyReconciled]);
+
+  // Khi một download hoàn thành, nạp lại trang thư viện hiện tại nếu đã khởi
+  // tạo để mục mới xuất hiện ngay而不 cần chuyển tab hay bấm refresh.
+  useEffect(() => {
+    if (!initialized) return;
+    const unlisten = listen<JobStatusChangedEvent>("job:status_changed", (event) => {
+      if (event.payload.status === "completed") {
+        void reload();
+      }
+    });
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
+  }, [initialized, reload]);
 
   /** FR-316 + edge case "xoá mục đang phát": dừng trước khi file biến mất dưới
    * chân trình phát, chứ không để nó phát vào một đường dẫn không còn tồn tại. */

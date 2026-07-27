@@ -504,6 +504,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => {
       }
       set({ reconciling: false });
       await refreshStats();
+      await loadPage(get().page);
     },
 
     // Sự kiện chỉ mang danh sách id ĐÃ ĐỔI trạng thái, nên "đổi" ở đây đúng
