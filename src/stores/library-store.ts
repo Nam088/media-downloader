@@ -587,7 +587,11 @@ export const useLibraryStore = create<LibraryState>((set, get) => {
 
     revealItem: async (itemId) => {
       const revealed = await guard(() => invoke<void>("reveal_library_item", { itemId }));
-      return revealed !== null;
+      if (revealed === null) {
+        toast.error(i18n.t("errors.INTERNAL"));
+        return false;
+      }
+      return true;
     },
 
     exportPlaylist: async (itemIds, destinationPath) => {

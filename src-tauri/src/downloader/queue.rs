@@ -1225,8 +1225,10 @@ async fn probe_media_duration_secs_with(
     ffmpeg_path: &std::path::Path,
     media_path: &str,
 ) -> Option<f64> {
-    let output = tokio::process::Command::new(ffmpeg_path)
-        .args(["-i", media_path])
+    let mut cmd = tokio::process::Command::new(ffmpeg_path);
+    cmd.args(["-i", media_path]);
+    crate::downloader::hide_cmd_window(&mut cmd);
+    let output = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -1382,6 +1384,7 @@ async fn merge_gallery_slideshow(
 
     let mut cmd = tokio::process::Command::new(&ffmpeg_path);
     cmd.current_dir(job_dir).arg("-y");
+    crate::downloader::hide_cmd_window(&mut cmd);
 
     // Each image needs to stay on-screen for its own display time PLUS the
     // transition it crossfades into the next one with (xfade consumes that
@@ -1447,7 +1450,10 @@ async fn merge_gallery_slideshow(
         ));
     }
 
-    Ok(format!("{job_dir}/{output_file_name}"))
+    Ok(std::path::Path::new(job_dir)
+        .join(output_file_name)
+        .to_string_lossy()
+        .into_owned())
 }
 
 /// Last-resort recovery for the documented yt-dlp/TikTok audio-loss bug
@@ -1486,21 +1492,23 @@ async fn recover_missing_audio(
 
     let muxed_path = format!("{video_path}.muxed.mp4");
     let ffmpeg_path = ytdlp_binary::resolve_ffmpeg_path()?;
-    let status = tokio::process::Command::new(&ffmpeg_path)
-        .args([
-            "-y",
-            "-i",
-            video_path,
-            "-i",
-            &audio_path,
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
-            "-c",
-            "copy",
-            &muxed_path,
-        ])
+    let mut cmd = tokio::process::Command::new(&ffmpeg_path);
+    cmd.args([
+        "-y",
+        "-i",
+        video_path,
+        "-i",
+        &audio_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c",
+        "copy",
+        &muxed_path,
+    ]);
+    crate::downloader::hide_cmd_window(&mut cmd);
+    let status = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

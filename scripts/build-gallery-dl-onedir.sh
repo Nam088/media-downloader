@@ -49,7 +49,7 @@ esac
 GALLERY_DL_PKG_DIR="$("$VENV_BIN/python" -c 'import gallery_dl, os; print(os.path.dirname(gallery_dl.__file__))')"
 
 "$VENV_BIN/pyinstaller" \
-  --onedir --console --name gallery-dl \
+  --onedir --windowed --name gallery-dl \
   --exclude-module pkg_resources \
   --additional-hooks-dir "$REPO_ROOT/scripts/pyinstaller-hooks" \
   --distpath "$BUILD_ROOT/dist" \

@@ -95,9 +95,10 @@ const FILE_DONE_MARKER: &str = "MEDIA_DOWNLOADER_GALLERY_FILE_DONE::";
 
 async fn spawn_gallery_dl(app: &AppHandle, args: Vec<String>) -> Result<Child, AppError> {
     let exe_path = resolve_gallery_dl_executable(app).await?;
-    Command::new(&exe_path)
-        .args(args)
-        .stdin(Stdio::null())
+    let mut cmd = Command::new(&exe_path);
+    cmd.args(args);
+    super::hide_cmd_window(&mut cmd);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)

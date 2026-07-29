@@ -111,6 +111,7 @@ pub fn run() {
             commands::history::count_history,
             commands::history::clear_history,
             commands::history::open_containing_folder,
+            commands::history::open_file,
             commands::library::list_library,
             commands::library::library_stats,
             commands::library::library_items_for_job,

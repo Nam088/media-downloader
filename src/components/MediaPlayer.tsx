@@ -1,8 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import type { SyntheticEvent } from "react";
 import { useTranslation } from "react-i18next";
-import { convertFileSrc } from "@tauri-apps/api/core";
-import { openPath } from "@tauri-apps/plugin-opener";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { ExternalLink, Pause, Play, Volume2, VolumeX } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -254,7 +253,7 @@ function MediaPlayerInner({ filePath, title, kind, autoPlay, className }: MediaP
   const openExternally = useCallback(async () => {
     try {
       setOpenFailed(false);
-      await openPath(filePath);
+      await invoke("open_file", { path: filePath });
     } catch {
       setOpenFailed(true);
     }

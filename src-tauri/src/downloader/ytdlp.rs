@@ -61,9 +61,10 @@ fn base_process_args() -> Vec<String> {
 
 async fn spawn_ytdlp(app: &AppHandle, args: Vec<String>) -> Result<Child, AppError> {
     let ytdlp_path = resolve_ytdlp_executable(app).await?;
-    Command::new(&ytdlp_path)
-        .args(args)
-        .stdin(Stdio::null())
+    let mut cmd = Command::new(&ytdlp_path);
+    cmd.args(args);
+    crate::downloader::hide_cmd_window(&mut cmd);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -194,9 +195,10 @@ pub async fn output_has_audio_stream(file_path: &str) -> bool {
     let Ok(ffmpeg_path) = resolve_ffmpeg_path() else {
         return true; // fail open: don't block a completed download over a probe we can't even run
     };
-    Command::new(&ffmpeg_path)
-        .args(["-v", "error", "-i", file_path, "-map", "0:a", "-c", "copy", "-f", "null", "-"])
-        .stdin(Stdio::null())
+    let mut cmd = Command::new(&ffmpeg_path);
+    cmd.args(["-v", "error", "-i", file_path, "-map", "0:a", "-c", "copy", "-f", "null", "-"]);
+    super::hide_cmd_window(&mut cmd);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

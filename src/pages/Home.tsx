@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import { DownloadForm } from "@/components/DownloadForm";
 import { QueueList } from "@/components/QueueList";
+import { toast } from "sonner";
 import { formatPlatformLabel } from "@/lib/format";
 import { openExternalUrl } from "@/lib/open-url";
 import { useQueueStore } from "@/stores/queue-store";
@@ -16,7 +17,11 @@ export function Home() {
   const completedJobs = Object.values(jobs).filter((job) => job.status === "completed");
 
   async function handleOpenFolder(jobId: string) {
-    await invoke("open_containing_folder", { jobId });
+    try {
+      await invoke("open_containing_folder", { jobId });
+    } catch (err: any) {
+      toast.error(err?.message ?? "Failed to open folder");
+    }
   }
 
   return (

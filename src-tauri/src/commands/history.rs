@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tauri::{AppHandle, State};
+#[cfg(not(windows))]
 use tauri_plugin_opener::OpenerExt;
 
 use crate::db::Db;
@@ -58,7 +59,52 @@ pub fn open_containing_folder(
         .output_file_path
         .ok_or_else(|| AppError::new("NOT_FOUND", "This job has no downloaded file yet"))?;
 
+    reveal_item_in_dir(&app, &file_path)
+}
+
+#[cfg(windows)]
+pub fn reveal_item_in_dir(_app: &AppHandle, path: &str) -> Result<(), AppError> {
+    use std::process::Command;
+
+    let path = std::path::Path::new(path);
+    if !path.exists() {
+        return Err(AppError::not_found("File"));
+    }
+
+    Command::new("explorer")
+        .arg(format!("/select,{}", path.display()))
+        .spawn()
+        .map_err(|e| AppError::internal(format!("Failed to launch explorer: {e}")))?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn reveal_item_in_dir(app: &AppHandle, path: &str) -> Result<(), AppError> {
     app.opener()
-        .reveal_item_in_dir(&file_path)
+        .reveal_item_in_dir(path)
         .map_err(AppError::internal)
+}
+
+/// Mở file bằng ứng dụng mặc định của hệ thống.
+#[tauri::command]
+pub fn open_file(path: String) -> Result<(), AppError> {
+    use std::process::Command;
+
+    let path = std::path::Path::new(&path);
+    if !path.exists() {
+        return Err(AppError::not_found("File"));
+    }
+
+    #[cfg(windows)]
+    let cmd = "explorer";
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(target_os = "linux")]
+    let cmd = "xdg-open";
+
+    Command::new(cmd)
+        .arg(path)
+        .spawn()
+        .map_err(|e| AppError::internal(format!("Failed to open file: {e}")))?;
+    Ok(())
 }

@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
-use tauri_plugin_opener::OpenerExt;
 
 use crate::db::{Db, LibraryFileState, FILE_EXISTS_ERROR_CODE};
 use crate::downloader::filename::sanitize_filename;
@@ -385,9 +384,7 @@ pub fn reveal_library_item(
     item_id: String,
 ) -> Result<(), AppError> {
     let item = require_item(&db, &item_id)?;
-    app.opener()
-        .reveal_item_in_dir(&item.file_path)
-        .map_err(AppError::internal)
+    super::history::reveal_item_in_dir(&app, &item.file_path)
 }
 
 // ---- xuất danh sách phát -------------------------------------------------

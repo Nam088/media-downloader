@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
+import { toast } from "sonner";
 import { openExternalUrl } from "@/lib/open-url";
 import {
   FolderOpen,
@@ -188,7 +189,11 @@ export function HistoryList({
   }
 
   async function handleOpenFolder(jobId: string) {
-    await invoke("open_containing_folder", { jobId });
+    try {
+      await invoke("open_containing_folder", { jobId });
+    } catch (err: any) {
+      toast.error(err?.message ?? "Failed to open folder");
+    }
   }
 
   async function handleRetry(jobId: string) {
