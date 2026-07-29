@@ -64,6 +64,14 @@ async fn spawn_ytdlp(app: &AppHandle, args: Vec<String>) -> Result<Child, AppErr
     let mut cmd = Command::new(&ytdlp_path);
     cmd.args(args);
     crate::downloader::hide_cmd_window(&mut cmd);
+    // yt-dlp ships as a frozen Python (PyInstaller) executable. When its
+    // stdout/stderr are piped rather than attached to a real console, Python
+    // can fall back to the legacy Windows ANSI codepage for its output
+    // encoding instead of UTF-8, so a video title with non-ASCII characters
+    // gets written as raw codepage bytes. Forcing UTF-8 mode here stops that
+    // at the source; `read_all`/the stdout line reader below still tolerate
+    // it if it happens anyway (e.g. on older yt-dlp builds).
+    cmd.env("PYTHONUTF8", "1").env("PYTHONIOENCODING", "utf-8");
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -157,8 +165,23 @@ pub async fn run_download(
     let stderr_task = tokio::spawn(read_all(stderr));
 
     let mut output_path: Option<String> = None;
-    let mut lines = BufReader::new(stdout).lines();
-    while let Some(line) = lines.next_line().await.map_err(AppError::internal)? {
+    let mut reader = BufReader::new(stdout);
+    let mut raw_line = Vec::new();
+    // Not `.lines()`: that requires strictly valid UTF-8 and aborts the
+    // whole download (see `spawn_ytdlp`'s comment) the instant one stray byte
+    // shows up anywhere in yt-dlp's output. Lossily converting per line means
+    // a garbled title corrupts at most that one line instead of killing an
+    // otherwise-successful download.
+    loop {
+        raw_line.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut raw_line)
+            .await
+            .map_err(AppError::internal)?;
+        if bytes_read == 0 {
+            break;
+        }
+        let line = String::from_utf8_lossy(&raw_line);
         let line = line.trim();
         if let Some(path) = line.strip_prefix(FILEPATH_MARKER) {
             output_path = Some(path.to_string());
@@ -209,9 +232,16 @@ pub async fn output_has_audio_stream(file_path: &str) -> bool {
 
 async fn read_all(mut reader: impl tokio::io::AsyncRead + Unpin) -> String {
     use tokio::io::AsyncReadExt;
-    let mut buf = String::new();
-    let _ = reader.read_to_string(&mut buf).await;
-    buf
+    // `read_to_string` requires strictly valid UTF-8 and, on hitting invalid
+    // bytes, discards everything read so far back to an empty string — so a
+    // single garbled byte anywhere in yt-dlp's stderr (e.g. a mangled video
+    // title) would silently turn a real error message into "", masking the
+    // actual failure reason behind a generic one. Reading raw bytes and
+    // converting lossily keeps whatever *is* valid instead of throwing it all
+    // away.
+    let mut buf = Vec::new();
+    let _ = reader.read_to_end(&mut buf).await;
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 #[cfg(unix)]

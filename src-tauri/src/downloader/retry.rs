@@ -31,7 +31,7 @@ const BASE_BACKOFF_SECONDS: u64 = 5;
 /// bình thường. Chỉ dùng `"network"` hay `"timeout"` trần là quá rộng: tên đài
 /// truyền hình "Network Ten" trong thông báo chặn bản quyền sẽ bị hiểu thành sự
 /// cố đường truyền và bị thử lại vô ích, đúng cái mà SC-106 cấm.
-const NETWORK_ERROR_MARKERS: [&str; 15] = [
+const NETWORK_ERROR_MARKERS: [&str; 17] = [
     "network is unreachable",
     "network unreachable",
     "network error",
@@ -47,6 +47,18 @@ const NETWORK_ERROR_MARKERS: [&str; 15] = [
     "http error 429",
     "http error 502",
     "http error 503",
+    // Not a network error in the literal sense, but the same "retry and it
+    // often just works" shape: TikTok's own webpage/API structure shifts
+    // under yt-dlp intermittently, and yt-dlp has no fix for it as of the
+    // latest release (2026.07.04, confirmed still the current stable release
+    // as of 2026-07-29 — this is an open, unresolved upstream issue, not
+    // something an outdated bundled binary would fix). Reported across many
+    // yt-dlp GitHub issues (#10919, #12574, #14508, #15418, #15506, #15566,
+    // #15629) as intermittent — the same request commonly succeeds on a
+    // later attempt — and gallery-dl's own fix for the equivalent failure
+    // (mikf/gallery-dl#7191) is literally a retry loop, not a parsing fix.
+    "unable to extract universal data for rehydration",
+    "unable to extract webpage video data",
 ];
 
 /// Lỗi có đáng thử lại không, dựa trên mã lỗi ổn định của `AppError`.
@@ -127,7 +139,7 @@ mod tests {
     /// ("network timeout" chạm cả `network` lẫn `timeout`) nên xoá 8 trong 12
     /// dấu hiệu mà bộ test vẫn xanh. Với bộ mẫu này, xoá bất kỳ dấu hiệu nào
     /// cũng làm đỏ.
-    const NETWORK_ERROR_SAMPLES: [&str; 15] = [
+    const NETWORK_ERROR_SAMPLES: [&str; 17] = [
         "ERROR: [Errno 101] Network is unreachable",
         "ERROR: send failed: network unreachable",
         "ERROR: urlopen: Network error while fetching the manifest",
@@ -143,6 +155,8 @@ mod tests {
         "ERROR: Unable to download webpage: HTTP Error 429: Too Many Requests",
         "ERROR: Unable to download webpage: HTTP Error 502: Bad Gateway",
         "ERROR: Unable to download webpage: HTTP Error 503: Service Unavailable",
+        "ERROR: [TikTok] 7667565735589334290: Unable to extract universal data for rehydration; please report this issue",
+        "ERROR: [TikTok] 7524203120394554629: Unable to extract webpage video data",
     ];
 
     #[test]

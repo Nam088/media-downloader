@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use chrono::Utc;
 use tauri::{AppHandle, Emitter};
@@ -22,12 +22,37 @@ use super::scheduler::{available_slots, TICK_INTERVAL_MS};
 use super::ytdlp;
 use super::ytdlp_binary;
 
+/// Upper bound on attempts for the audio-only recovery fetch itself (see
+/// `recover_missing_audio`). It used to be a single, unretried shot: once
+/// `MAX_NO_AUDIO_ATTEMPTS` was exhausted on the main video download, the
+/// "last resort" audio-only request got exactly one try at the very same
+/// intermittent source that had just failed 3 times in a row, so it carried
+/// no better odds than one more plain retry would have. A separate request
+/// for just the audio track is cheap (seconds, not minutes), so retrying it
+/// too costs little and gives the intermittency a few more independent
+/// chances to land on a working response.
+const MAX_AUDIO_RECOVERY_ATTEMPTS: u32 = 3;
+
+/// Delay between "no audio" retries of the main download (see
+/// `MAX_NO_AUDIO_ATTEMPTS`). The loop used to retry with zero delay,
+/// back-to-back against the same source in well under a second — plausible
+/// for a purely random per-request inconsistency, but if the CDN/extraction
+/// glitch is instead tied to a short-lived edge node or cached response, a
+/// few seconds of real gap gives the next attempt a better chance of
+/// actually hitting different upstream state instead of the same one.
+const NO_AUDIO_RETRY_DELAY_SECS: u64 = 3;
+
 /// Upper bound on redownload attempts when the output has no audio track
-/// (see `ytdlp::output_has_audio_stream`). yt-dlp issue #15891: TikTok's CDN
-/// can intermittently serve a video-only file under a format id whose
-/// metadata still claims `acodec=aac`; maintainers confirmed re-downloading
-/// commonly gets a different, correct file, so a couple of retries is a real
-/// fix here, not just a delay.
+/// (see `ytdlp::output_has_audio_stream`). Originally documented against
+/// yt-dlp issue #15891 (TikTok's CDN can intermittently serve a video-only
+/// file under a format id whose metadata still claims `acodec=aac`), but the
+/// same symptom is now also confirmed on YouTube (yt-dlp issues #16128,
+/// #12482): YouTube's rollout of SABR streaming means which formats a
+/// request actually gets back — DASH audio-only tracks included or not — can
+/// vary between otherwise-identical requests for the same video. In both
+/// cases maintainers confirmed re-requesting commonly gets a different,
+/// correct result, so a couple of retries is a real fix here, not just a
+/// delay.
 ///
 /// Đây là cơ chế riêng, KHÔNG phải retry vì lỗi tạm thời: lỗi ở đây là một
 /// lần tải "thành công" nhưng cho ra file thiếu tiếng, nên không có mã lỗi nào
@@ -106,6 +131,9 @@ pub struct DownloadQueue {
     max_concurrent: Arc<AtomicUsize>,
     /// Đánh thức dispatcher khi có việc mới, để không phải đợi hết nhịp tick.
     wake: Arc<Notify>,
+    /// Tên gốc (thư mục + stem, chưa phần mở rộng) đang được MỘT job còn
+    /// đang chạy giữ chỗ — xem chú thích ở `claim_output_stem`.
+    claimed_stems: Arc<StdMutex<HashSet<String>>>,
 }
 
 /// Bản sao các handle dùng chung, để task nền không phải giữ `&DownloadQueue`.
@@ -116,6 +144,7 @@ struct QueueHandles {
     running: Arc<AsyncMutex<HashMap<String, RunningJob>>>,
     max_concurrent: Arc<AtomicUsize>,
     wake: Arc<Notify>,
+    claimed_stems: Arc<StdMutex<HashSet<String>>>,
 }
 
 impl DownloadQueue {
@@ -126,6 +155,7 @@ impl DownloadQueue {
             running: Arc::new(AsyncMutex::new(HashMap::new())),
             max_concurrent: Arc::new(AtomicUsize::new(max_concurrent.clamp(1, 8))),
             wake: Arc::new(Notify::new()),
+            claimed_stems: Arc::new(StdMutex::new(HashSet::new())),
         };
         queue.spawn_dispatcher();
         queue
@@ -147,6 +177,7 @@ impl DownloadQueue {
             running: Arc::clone(&self.running),
             max_concurrent: Arc::clone(&self.max_concurrent),
             wake: Arc::clone(&self.wake),
+            claimed_stems: Arc::clone(&self.claimed_stems),
         }
     }
 
@@ -649,7 +680,11 @@ async fn run_job(
         return run_gallery_job(handles, job, cancel_rx).await;
     }
 
-    let naming = resolve_output_naming(&job).await;
+    // `_stem_claim` isn't read anywhere — it exists purely to stay alive
+    // until `run_job` returns (any path: success, `?` error, cancel), so its
+    // `Drop` releases the claimed name for the next job. See
+    // `claim_output_stem`.
+    let (naming, _stem_claim) = resolve_output_naming(handles, &job).await;
     let output_template = naming.main.clone();
     // Đọc lại mỗi lần chạy chứ không cache lúc dựng hàng đợi: người dùng đổi
     // giới hạn tốc độ thì job được khởi chạy sau đó phải dùng giá trị mới.
@@ -729,7 +764,27 @@ async fn run_job(
             result = download_fut => result,
             _ = cancel_rx.changed() => return Err(canceled("download")),
         };
-        let path = download_result?;
+        let reported_path = download_result?;
+        let path = match recover_actual_output_path(&job.output_directory, &reported_path, &naming).await {
+            Some(real_path) => {
+                if real_path != reported_path {
+                    log_event(
+                        &handles.app,
+                        "WARN",
+                        format!(
+                            "Job {}: yt-dlp's reported output path didn't exist on disk (likely a Windows console-encoding issue with non-ASCII characters in the title); recovered the real file from disk instead",
+                            job.id
+                        ),
+                    );
+                }
+                real_path
+            }
+            None => {
+                return Err(AppError::internal(
+                    "yt-dlp reported an output path that doesn't exist, and the real file couldn't be found on disk either",
+                ));
+            }
+        };
 
         // Only muxed video jobs are at risk of a *silent* audio loss: an
         // audio-only extraction (`-x`) fails loudly instead (ffmpeg can't
@@ -740,9 +795,13 @@ async fn run_job(
                 log_event(
                     &handles.app,
                     "WARN",
-                    format!("Job {} attempt {attempt}/{MAX_NO_AUDIO_ATTEMPTS}: downloaded video had no audio track, retrying", job.id),
+                    format!("Job {} attempt {attempt}/{MAX_NO_AUDIO_ATTEMPTS}: downloaded video had no audio track, retrying in {NO_AUDIO_RETRY_DELAY_SECS}s", job.id),
                 );
                 let _ = tokio::fs::remove_file(&path).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(NO_AUDIO_RETRY_DELAY_SECS)) => {}
+                    _ = cancel_rx.changed() => return Err(canceled("download")),
+                }
                 continue;
             }
             // Last attempt still missing audio. Per the community workaround
@@ -752,17 +811,49 @@ async fn run_job(
             // guaranteed to help): separately fetch just the best audio
             // track and mux it onto the otherwise-good video, rather than
             // discarding a mostly-fine download over its audio track alone.
-            match recover_missing_audio(&handles.app, &job.source_url, &path).await {
+            let mut recovery_result = recover_missing_audio(&handles.app, &job.source_url, &path).await;
+            for recovery_attempt in 2..=MAX_AUDIO_RECOVERY_ATTEMPTS {
+                let Err(recovery_err) = &recovery_result else {
+                    break;
+                };
+                log_event(
+                    &handles.app,
+                    "WARN",
+                    format!(
+                        "Job {} audio recovery attempt {}/{MAX_AUDIO_RECOVERY_ATTEMPTS} failed, retrying: [{}] {}",
+                        job.id, recovery_attempt - 1, recovery_err.code, recovery_err.message
+                    ),
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(NO_AUDIO_RETRY_DELAY_SECS)) => {}
+                    _ = cancel_rx.changed() => return Err(canceled("download")),
+                }
+                recovery_result = recover_missing_audio(&handles.app, &job.source_url, &path).await;
+            }
+
+            match recovery_result {
                 Ok(fixed_path) => {
                     output_path = Some(fixed_path);
                     break;
                 }
-                Err(_) => {
-                    let _ = tokio::fs::remove_file(&path).await;
-                    return Err(AppError::new(
-                        "DOWNLOAD_FAILED",
-                        "The source served a video with no audio track after multiple attempts, and no separate audio track could be recovered. Please try again.",
-                    ));
+                Err(recovery_err) => {
+                    // No audio could be recovered after every attempt — used
+                    // to fail the whole job here. Per user preference, a
+                    // video-only file is still a usable result (silent
+                    // video beats no video), so this now delivers it as a
+                    // completed job instead of an error. The reason is still
+                    // logged so it's visible *why* the file has no sound,
+                    // rather than silently shipping a mystery-silent file.
+                    log_event(
+                        &handles.app,
+                        "WARN",
+                        format!(
+                            "Job {} audio recovery failed after {MAX_AUDIO_RECOVERY_ATTEMPTS} attempts ([{}] {}); delivering the video without audio instead of failing the job",
+                            job.id, recovery_err.code, recovery_err.message
+                        ),
+                    );
+                    output_path = Some(path);
+                    break;
                 }
             }
         }
@@ -1456,19 +1547,18 @@ async fn merge_gallery_slideshow(
         .into_owned())
 }
 
-/// Last-resort recovery for the documented yt-dlp/TikTok audio-loss bug
-/// (yt-dlp issues #15891, #15642): separately fetch just the best audio
-/// track for the same URL and mux it onto the already-downloaded (but
+/// Last-resort recovery for the documented yt-dlp audio-loss bug, seen on
+/// both TikTok (issues #15891, #15642) and, via YouTube's SABR streaming
+/// rollout, YouTube (issues #16128, #12482): separately fetch just the best
+/// audio track for the same URL and mux it onto the already-downloaded (but
 /// audio-less) video in place. This mirrors the workaround multiple
 /// reporters on those issues converged on independently — after
-/// maintainers confirmed TikTok's CDN itself serves inconsistent media
-/// (the same format id sometimes has audio, sometimes doesn't, despite
-/// identical metadata) and closed both issues with no code fix in yt-dlp —
-/// since re-requesting the *exact same* video format isn't guaranteed to
-/// get a different result (notably on videos where TikTok disables
-/// downloads, where it was reported as consistently silent), but a
-/// differently-scoped audio-only request has an independent chance of
-/// landing on a working response.
+/// maintainers confirmed the source itself serves inconsistent media (the
+/// same format id/request sometimes has audio, sometimes doesn't, despite
+/// identical metadata) with no code fix possible in yt-dlp — since
+/// re-requesting the *exact same* video format isn't guaranteed to get a
+/// different result, but a differently-scoped audio-only request has an
+/// independent chance of landing on a working response.
 async fn recover_missing_audio(
     app: &AppHandle,
     source_url: &str,
@@ -1480,7 +1570,35 @@ async fn recover_missing_audio(
         "-f".to_string(),
         "bestaudio/best".to_string(),
     ];
-    let audio_path = ytdlp::run_download(app, source_url, &audio_template, audio_args, |_| {}).await?;
+    let reported_audio_path =
+        ytdlp::run_download(app, source_url, &audio_template, audio_args, |_| {}).await?;
+    // Same Windows console-encoding issue as the main download's reported
+    // path (see `recover_actual_output_path`'s doc comment): the audio-only
+    // file is still written to disk with the correct name, only yt-dlp's own
+    // printed confirmation of that name can come back mangled. The expected
+    // name is known exactly (it's the literal `-o` template above), so a
+    // directory scan for that prefix is enough — no need for the fuzzier
+    // diff/mtime fallback the main download path uses.
+    let audio_path = if tokio::fs::try_exists(&reported_audio_path).await.unwrap_or(false) {
+        reported_audio_path
+    } else {
+        let video_file_name = Path::new(video_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let dir = Path::new(video_path)
+            .parent()
+            .map(|parent| parent.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        find_file_starting_with(&dir, &format!("{video_file_name}.audio-only."))
+            .await
+            .ok_or_else(|| {
+                AppError::new(
+                    "DOWNLOAD_FAILED",
+                    "Recovered audio file couldn't be located on disk",
+                )
+            })?
+    };
 
     if !ytdlp::output_has_audio_stream(&audio_path).await {
         let _ = tokio::fs::remove_file(&audio_path).await;
@@ -1555,6 +1673,12 @@ struct OutputNaming {
     /// Tên file đã có trong thư mục đích TRƯỚC khi tải, để phần đếm chương
     /// không tính nhầm file của lần chạy trước hay của một tác vụ khác.
     files_before: HashSet<String>,
+    /// Tên file (KHÔNG mã hoá `%`, KHÔNG phần mở rộng) mà `main` được dựng
+    /// từ đó — `None` khi để yt-dlp tự đặt tên. Giữ lại bản thô này để
+    /// `recover_actual_output_path` so khớp trực tiếp với tên file thật trên
+    /// đĩa, vì bản đã escape trong `main` không còn khớp ký tự với tên file
+    /// yt-dlp thực sự ghi ra.
+    stem: Option<String>,
 }
 
 /// Phần thuần của [`resolve_output_naming`]: dựng mẫu từ một cái tên đã chốt.
@@ -1577,6 +1701,7 @@ fn compose_output_naming(
             chapter: None,
             chapter_prefix: None,
             files_before: HashSet::new(),
+            stem: None,
         };
     };
 
@@ -1591,20 +1716,32 @@ fn compose_output_naming(
         }),
         chapter_prefix: splits_chapters.then(|| format!("{stem} - ")),
         files_before: HashSet::new(),
+        stem: Some(stem.to_string()),
     }
 }
 
-async fn resolve_output_naming(job: &DownloadJob) -> OutputNaming {
+/// Trả kèm `StemClaimGuard`: giữ ở biến cục bộ suốt vòng đời `run_job` thì
+/// chỗ vừa giữ tự nhả khi hàm đó kết thúc, dù bằng đường nào (thành công,
+/// `?` lỗi sớm, huỷ) — xem chú thích ở `claim_output_stem`.
+async fn resolve_output_naming(
+    handles: &QueueHandles,
+    job: &DownloadJob,
+) -> (OutputNaming, Option<StemClaimGuard>) {
     let splits_chapters = job.output_options.segment.splits_chapters();
     let Some(stem) = render_output_stem(job) else {
-        return compose_output_naming(&job.output_directory, None, splits_chapters);
+        return (compose_output_naming(&job.output_directory, None, splits_chapters), None);
     };
 
     let existing = read_file_names(&job.output_directory).await;
-    let stem = unique_stem(&job.output_directory, &stem, &file_stems(&existing));
+    let (stem, guard) = claim_output_stem(
+        &job.output_directory,
+        &stem,
+        &file_stems(&existing),
+        &handles.claimed_stems,
+    );
     let mut naming = compose_output_naming(&job.output_directory, Some(&stem), splits_chapters);
     naming.files_before = existing.into_iter().collect();
-    naming
+    (naming, Some(guard))
 }
 
 /// Tên file (chưa có phần mở rộng) mà tác vụ này nên ghi ra, hoặc `None` khi
@@ -1685,6 +1822,149 @@ fn unique_stem(output_directory: &str, stem: &str, taken: &HashSet<String>) -> S
         .and_then(|name| name.to_str())
         .unwrap_or(stem)
         .to_string()
+}
+
+/// Nhả chỗ một stem đã giữ khi job kết thúc — thành công, lỗi sớm qua `?`,
+/// huỷ, panic, bất kể đường nào — vì đây là logic `Drop` chạy vô điều kiện
+/// khi biến giữ nó (một local trong `run_job`) ra khỏi scope, không phải dọn
+/// tay ở từng điểm return dễ sót.
+struct StemClaimGuard {
+    registry: Arc<StdMutex<HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for StemClaimGuard {
+    fn drop(&mut self) {
+        if let Ok(mut claimed) = self.registry.lock() {
+            claimed.remove(&self.key);
+        }
+    }
+}
+
+fn stem_claim_key(output_directory: &str, stem: &str) -> String {
+    format!("{output_directory}\u{0}{stem}")
+}
+
+/// Như `unique_stem`, nhưng cũng loại trừ tên đang được MỘT job KHÁC (chạy
+/// cùng lúc) giữ chỗ, rồi giữ luôn tên thắng cuộc trước khi trả về.
+///
+/// `unique_stem` chỉ nhìn vào đĩa — hai job cho CÙNG một URL (người dùng bấm
+/// tải/thử lại nhiều lần khi lần trước còn đang chạy) khởi động gần như đồng
+/// thời sẽ cùng chụp ảnh thư mục TRƯỚC KHI job nào kịp ghi ra bất cứ gì, cả
+/// hai thấy tên gốc đang "trống" như nhau, cùng chọn ĐÚNG MỘT tên, rồi giẫm
+/// lên file tạm của nhau giữa chừng (`.fXXX.mp4`, `.temp.mp4`). Xác nhận trực
+/// tiếp từ nhật ký người dùng: `WinError 2` (job A xoá file mảnh vừa tải
+/// xong để ghép, ngay lúc job B — cùng tên — vẫn đang tải/đọc chính file đó)
+/// và `WinError 183` (hai job cùng đổi tên `.temp.mp4` sang cùng một tên
+/// đích, job đến sau thấy đích đã bị job kia chiếm).
+fn claim_output_stem(
+    output_directory: &str,
+    stem: &str,
+    taken: &HashSet<String>,
+    registry: &Arc<StdMutex<HashSet<String>>>,
+) -> (String, StemClaimGuard) {
+    let desired = Path::new(output_directory).join(stem);
+    let mut claimed = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let unique = filename::deduplicate_path(&desired, |candidate| {
+        candidate
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                taken.contains(name) || claimed.contains(&stem_claim_key(output_directory, name))
+            })
+    });
+    let winner = unique
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(stem)
+        .to_string();
+    let key = stem_claim_key(output_directory, &winner);
+    claimed.insert(key.clone());
+    drop(claimed);
+    (winner, StemClaimGuard { registry: Arc::clone(registry), key })
+}
+
+/// `reported_path` (`yt-dlp`'s own `--print after_move:...` text) is not
+/// trustworthy on Windows: confirmed live against a real Vietnamese-titled
+/// video that its plain-text output silently mangles non-ASCII characters
+/// (accents dropped or corrupted into different, wrong characters) — byte-
+/// identical whether or not `PYTHONUTF8`/`PYTHONIOENCODING`/`--encoding
+/// utf-8` are set, so nothing on our side of the pipe can force it straight.
+/// The file itself is still written with the correct Unicode name (yt-dlp's
+/// own file I/O never goes through that same broken text-output path), so
+/// when the reported path doesn't actually exist, the true name is
+/// recovered straight from the filesystem instead — first by matching our
+/// own known (never round-tripped through yt-dlp's text output) stem, then
+/// by falling back to a before/after directory diff, the same technique
+/// `record_chapter_files` already relies on for chapter files.
+///
+/// Silently trusting a wrong path here is what made "Open file"/"Open
+/// containing folder" (`commands::history`) and the Library grid
+/// (`commands::library`) report "file not found" right after a download
+/// that had, in fact, completed onto a perfectly real file on disk.
+async fn recover_actual_output_path(
+    output_directory: &str,
+    reported_path: &str,
+    naming: &OutputNaming,
+) -> Option<String> {
+    if tokio::fs::try_exists(reported_path).await.unwrap_or(false) {
+        return Some(reported_path.to_string());
+    }
+
+    let after = read_file_names(output_directory).await;
+
+    if let Some(stem) = &naming.stem {
+        if let Some(exact) = after.iter().find(|name| {
+            Path::new(name).file_stem().and_then(|s| s.to_str()) == Some(stem.as_str())
+        }) {
+            return Some(Path::new(output_directory).join(exact).to_string_lossy().into_owned());
+        }
+    }
+
+    let is_chapter_file = |name: &str| {
+        naming
+            .chapter_prefix
+            .as_deref()
+            .is_some_and(|prefix| name.starts_with(prefix))
+    };
+    let mut candidates: Vec<String> = after
+        .into_iter()
+        .filter(|name| !naming.files_before.contains(name) && !is_chapter_file(name))
+        .collect();
+
+    if candidates.len() == 1 {
+        return Some(Path::new(output_directory).join(candidates.remove(0)).to_string_lossy().into_owned());
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // More than one candidate left (rare — e.g. a stem match failed AND
+    // multiple non-chapter files appeared) — the main output is whichever
+    // was written to last, since post-processing (metadata/thumbnail
+    // embedding) always touches it after everything else is in place.
+    let mut newest: Option<(String, std::time::SystemTime)> = None;
+    for name in candidates {
+        let full = Path::new(output_directory).join(&name);
+        let Ok(modified) = tokio::fs::metadata(&full).await.and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        if newest.as_ref().map(|(_, t)| modified > *t).unwrap_or(true) {
+            newest = Some((name, modified));
+        }
+    }
+    newest.map(|(name, _)| Path::new(output_directory).join(name).to_string_lossy().into_owned())
+}
+
+/// Tìm file đầu tiên trong `dir` có tên bắt đầu bằng `prefix` — dùng khi biết
+/// chính xác tiền tố mong đợi (xem `recover_missing_audio`) nên không cần đến
+/// kiểu so khớp mơ hồ hơn (diff/mtime) của `recover_actual_output_path`.
+async fn find_file_starting_with(dir: &str, prefix: &str) -> Option<String> {
+    read_file_names(dir)
+        .await
+        .into_iter()
+        .find(|name| name.starts_with(prefix))
+        .map(|name| Path::new(dir).join(name).to_string_lossy().into_owned())
 }
 
 /// Tên file đang có trong thư mục đích. Thư mục chưa tồn tại hoặc không đọc
@@ -2815,6 +3095,34 @@ mod tests {
 
         assert_eq!(unique_stem("/tmp", "Bài hát", &taken), "Bài hát (2)");
         assert_eq!(unique_stem("/tmp", "Bài hát khác", &taken), "Bài hát khác");
+    }
+
+    #[test]
+    fn two_jobs_for_the_same_title_never_claim_the_same_stem() {
+        // The bug this exists for: two jobs for the same URL, both started
+        // before either had written anything to disk, both saw an "empty"
+        // directory and both picked the identical stem — then stomped on
+        // each other's yt-dlp temp fragment files mid-download (`WinError 2`
+        // deleting a file the other job was still reading, `WinError 183`
+        // renaming a `.temp.mp4` onto a name the other job's rename had
+        // already claimed). `unique_stem` alone can't catch this — it only
+        // looks at what's already on disk, and neither job has written
+        // anything yet at the moment both check.
+        let registry = Arc::new(StdMutex::new(HashSet::new()));
+        let empty = HashSet::new();
+
+        let (first, _first_guard) = claim_output_stem("/tmp", "Bài hát", &empty, &registry);
+        let (second, _second_guard) = claim_output_stem("/tmp", "Bài hát", &empty, &registry);
+        assert_ne!(first, second, "two concurrent jobs must not land on the same stem");
+        assert_eq!(first, "Bài hát");
+        assert_eq!(second, "Bài hát (2)");
+
+        // Once the first job's guard is dropped (its `run_job` returned —
+        // success, error, or cancel), that name is free again for a later
+        // job to pick.
+        drop(_first_guard);
+        let (third, _third_guard) = claim_output_stem("/tmp", "Bài hát", &empty, &registry);
+        assert_eq!(third, "Bài hát", "a released claim must become available again");
     }
 
     // ---- specs/003-media-output: phụ đề (FR-217→FR-221) -------------------

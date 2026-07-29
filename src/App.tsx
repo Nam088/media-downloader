@@ -76,7 +76,7 @@ function AppShell() {
   ];
 
   return (
-    <div className="min-h-screen w-full max-w-full overflow-x-hidden overscroll-none bg-background text-foreground flex flex-col font-sans selection:bg-primary/20 selection:text-primary">
+    <div className="h-screen w-full max-w-full overflow-x-hidden overscroll-none bg-background text-foreground flex flex-col font-sans selection:bg-primary/20 selection:text-primary">
       <ComplianceDisclaimer />
       
       <header className="fixed top-0 left-0 right-0 z-50 w-full select-none border-b border-border/70 bg-background/85 backdrop-blur-xl transition-all shadow-2xs">
@@ -128,7 +128,7 @@ function AppShell() {
         </div>
       </header>
 
-      <main className="flex-1 pt-16 py-4">
+      <main className="flex-1 pt-16 py-4 overflow-y-auto">
         <div className={effectiveRoute === "home" ? "block animate-in fade-in-50 duration-150" : "hidden"}>
           <Home />
         </div>

@@ -125,6 +125,11 @@ pub async fn preview_media(
     let (source, playlist_entry_urls) = match result {
         Ok(raw) => {
             if is_login_required(&raw) {
+                log_event(
+                    &app,
+                    "WARN",
+                    format!("preview_media: {source_url} requires login or is private/DRM"),
+                );
                 return Err(AppError::access_denied(
                     "This content requires login or is private/DRM-protected",
                 ));
@@ -200,7 +205,21 @@ pub async fn preview_media(
                 }
             }
         }
-        Err(err) => return Err(err),
+        // Every OTHER yt-dlp failure (access denied, network error, a real
+        // "this URL is broken") used to return straight to the frontend with
+        // no log line at all — the only two preview failures ever logged
+        // were the gallery-dl-fallback branches above. That silently blinded
+        // the app's own Logs page (its whole reason to exist — see the
+        // module doc on `LogBuffer`) to what is, in practice, the most
+        // common way a preview fails.
+        Err(err) => {
+            log_event(
+                &app,
+                "WARN",
+                format!("preview_media failed for {source_url}: [{}] {}", err.code, err.message),
+            );
+            return Err(err);
+        }
     };
 
     cache.store(source.clone(), playlist_entry_urls);

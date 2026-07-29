@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Media Downloader",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "identifier": "io.github.nam088.mediadownloader",
   "build": {
     "beforeDevCommand": "pnpm dev",

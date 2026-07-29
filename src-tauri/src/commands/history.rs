@@ -6,6 +6,7 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::db::Db;
 use crate::error::AppError;
+use crate::logging::log_event;
 use crate::models::{DownloadJob, HistoryQuery, JobStatus};
 
 const ACTIVE_STATUSES: [JobStatus; 4] = [
@@ -63,18 +64,39 @@ pub fn open_containing_folder(
 }
 
 #[cfg(windows)]
-pub fn reveal_item_in_dir(_app: &AppHandle, path: &str) -> Result<(), AppError> {
+pub fn reveal_item_in_dir(app: &AppHandle, path: &str) -> Result<(), AppError> {
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
 
-    let path = std::path::Path::new(path);
-    if !path.exists() {
+    let path_obj = std::path::Path::new(path);
+    if !path_obj.exists() {
+        // The frontend only ever shows a localized one-liner ("This item
+        // could not be found") for `NOT_FOUND` — it never had the actual
+        // path to show. Logging it here means the reason (and which exact
+        // path was checked) shows up in the same in-app log panel every
+        // other failure in this app already reports through, instead of
+        // only being visible by re-deriving it from scratch.
+        log_event(app, "WARN", format!("Reveal failed: file does not exist on disk: {path}"));
         return Err(AppError::not_found("File"));
     }
 
+    // `explorer /select,<path>` needs quotes ONLY around `<path>` (Microsoft's
+    // documented syntax). `.arg(format!("/select,{path}"))` instead hands the
+    // WHOLE string to Rust's own Windows argument quoting, which wraps the
+    // entire thing (comma included) in one pair of quotes the moment `<path>`
+    // contains a space — true for virtually every real download. Explorer
+    // then can't find its own `/select,` token inside that single quoted
+    // blob and silently opens a plain window at the default folder instead
+    // of revealing the file — reproduced live: it opened Documents instead
+    // of the actual download folder. `raw_arg` bypasses Rust's quoting
+    // entirely so the command line matches Microsoft's syntax exactly.
     Command::new("explorer")
-        .arg(format!("/select,{}", path.display()))
+        .raw_arg(format!("/select,\"{path}\""))
         .spawn()
-        .map_err(|e| AppError::internal(format!("Failed to launch explorer: {e}")))?;
+        .map_err(|e| {
+            log_event(app, "ERROR", format!("Reveal failed: could not launch explorer for {path}: {e}"));
+            AppError::internal(format!("Failed to launch explorer: {e}"))
+        })?;
     Ok(())
 }
 

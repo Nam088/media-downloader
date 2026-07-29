@@ -586,9 +586,25 @@ export const useLibraryStore = create<LibraryState>((set, get) => {
     },
 
     revealItem: async (itemId) => {
-      const revealed = await guard(() => invoke<void>("reveal_library_item", { itemId }));
+      // `guard` treats a `null` result as "the operation threw" — but a
+      // Tauri command returning `Result<(), AppError>` serializes its `Ok(())`
+      // as JSON `null` over IPC, so `invoke<void>(...)` resolves to `null` on
+      // a genuine SUCCESS too. Without the `.then(() => true)`, `revealed`
+      // would be `null` whether the reveal worked or not — confirmed live:
+      // Explorer opened the correct folder every time, yet the toast still
+      // fired as if it had failed. Coercing the resolved value to a definite
+      // `true` keeps `null` meaning only what `guard` intends it to mean.
+      const revealed = await guard(() =>
+        invoke<void>("reveal_library_item", { itemId }).then(() => true as const),
+      );
       if (revealed === null) {
-        toast.error(i18n.t("errors.INTERNAL"));
+        // `guard` already captured the real `{ code, message }` into
+        // `state.error` (e.g. `NOT_FOUND` when the file was moved/deleted
+        // outside the app) — showing a hardcoded `errors.INTERNAL` toast
+        // here regardless of that meant every failure read as "Something
+        // went wrong", even ones with a specific, more useful reason.
+        const err = get().error;
+        toast.error(err ? i18n.t(`errors.${err.code}`, { defaultValue: err.message }) : i18n.t("errors.INTERNAL"));
         return false;
       }
       return true;
