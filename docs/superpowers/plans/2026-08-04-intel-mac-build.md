@@ -471,17 +471,19 @@ with:
           sed -i -e "s/^  version \".*\"/  version \"$VERSION\"/" Casks/media-downloader.rb
 
           export NEW_BLOCK=$(cat <<EOF
-          # CASK_ARCH_URLS_START
-          on_arm do
-            url "$ARM_URL"
-            sha256 "$arm_sha256"
-          end
+            # CASK_ARCH_URLS_START
+            on_arm do
+              sha256 "$arm_sha256"
 
-          on_intel do
-            url "$INTEL_URL"
-            sha256 "$intel_sha256"
-          end
-          # CASK_ARCH_URLS_END
+              url "$ARM_URL"
+            end
+            on_intel do
+              sha256 "$intel_sha256"
+
+              url "$INTEL_URL"
+            end
+
+            # CASK_ARCH_URLS_END
           EOF
           )
 
@@ -493,8 +495,19 @@ with:
 > `export`ed in the same shell script that then invokes `perl`, so `perl`
 > (a child process of that same script) inherits it and can read it back via
 > `$ENV{NEW_BLOCK}` — no separate GitHub Actions `env:` field is needed or
-> valid here (a step can only have one `env:` key). Test this locally in
-> Task 6 Step 5 below before trusting it in CI.
+> valid here (a step can only have one `env:` key).
+>
+> **The heredoc body is indented 2 extra spaces beyond the surrounding
+> script (12 spaces vs. the script's 10), and nested `sha256`/`url` lines 2
+> more again (14).** YAML's `run: |` block strips a *uniform* leading indent
+> from every line based on the block's own indentation — it does not know
+> about the heredoc inside it. Write the heredoc body flush with the rest of
+> the script (as looks natural in the YAML source) and the stripped result
+> loses its 2-space Ruby-file indentation entirely; this was caught by
+> extracting the real parsed `run:` string with `yaml.safe_load` and
+> executing it against a copy of the Cask file, not by eyeballing the YAML.
+> Verify with the same technique (Step 5 below) rather than trusting the
+> indentation by inspection.
 
 - [ ] **Step 4: Verify the YAML still parses**
 
@@ -503,30 +516,35 @@ Expected: `OK`
 
 - [ ] **Step 5: Dry-run the Cask rewrite locally against a copy of the file**
 
-This exercises the exact `perl` substitution the workflow will run, without
-needing a real GitHub release.
+Don't hand-retype the heredoc for this test — that sidesteps the exact bug
+described in Step 3's note (wrong indentation is easy to type correctly by
+accident when you're not going through YAML's stripping). Instead extract
+the real parsed `run:` string from the YAML file and execute that:
 
 ```bash
+python3 -c "
+import yaml
+d = yaml.safe_load(open('.github/workflows/update-cask.yml'))
+for s in d['jobs']['update-cask']['steps']:
+    if s.get('name') == 'Update Casks/media-downloader.rb':
+        script = s['run'].replace('\${{ github.repository }}', 'Nam088/media-downloader')
+        open('/tmp/update-cask-step.sh', 'w').write(script)
+"
 cp Casks/media-downloader.rb /tmp/media-downloader-test.rb
-export NEW_BLOCK='  # CASK_ARCH_URLS_START
-  on_arm do
-    url "https://example.com/arm-test.dmg"
-    sha256 "1111111111111111111111111111111111111111111111111111111111111111"
-  end
-
-  on_intel do
-    url "https://example.com/intel-test.dmg"
-    sha256 "2222222222222222222222222222222222222222222222222222222222222222"
-  end
-  # CASK_ARCH_URLS_END'
-perl -0777 -pi -e 's/  # CASK_ARCH_URLS_START.*?# CASK_ARCH_URLS_END/$ENV{NEW_BLOCK}/s' /tmp/media-downloader-test.rb
-cat /tmp/media-downloader-test.rb
+TAG="v9.9.9" ARM_NAME="Media.Downloader_9.9.9_aarch64.dmg" \
+  INTEL_NAME="Media.Downloader_9.9.9_x64.dmg" arm_sha256="aaaa" intel_sha256="bbbb" \
+  bash -c "$(sed 's#Casks/media-downloader.rb#/tmp/media-downloader-test.rb#g' /tmp/update-cask-step.sh)"
 ruby -c /tmp/media-downloader-test.rb
-rm /tmp/media-downloader-test.rb
+rm /tmp/update-cask-step.sh /tmp/media-downloader-test.rb
 ```
 
-Expected: the printed file shows `arm-test.dmg`/`1111...` inside `on_arm`
-and `intel-test.dmg`/`2222...` inside `on_intel`, and `ruby -c` reports
+(On macOS, `sed -i` needs `sed -i ""` — adjust the `sed -i -e` line inside
+the extracted script if testing on macOS rather than the Linux runner CI
+actually uses.)
+
+Expected: the printed file shows `Media.Downloader_9.9.9_aarch64.dmg` inside
+`on_arm`'s url and `Media.Downloader_9.9.9_x64.dmg` inside `on_intel`'s url,
+both with correct 2/4-space Ruby indentation, and `ruby -c` reports
 `Syntax OK`.
 
 - [ ] **Step 6: Commit**
