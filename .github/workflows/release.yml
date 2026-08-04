@@ -144,6 +144,11 @@ jobs:
         shell: bash
         run: bash scripts/build-gallery-dl-onedir.sh
 
+      - name: Smoke-test onedir binaries run natively (macOS)
+        if: matrix.platform == 'macos-latest' || matrix.platform == 'macos-13'
+        run: |
+          "src-tauri/binaries/yt-dlp-onedir/${{ matrix.ytdlp_exe_name }}" --version
+          "src-tauri/binaries/gallery-dl-onedir/gallery-dl" --version
 
       # ---- ffmpeg sidecar ---------------------------------------------
       # Linux/Windows: BtbN/FFmpeg-Builds "gpl" static builds — no shared
