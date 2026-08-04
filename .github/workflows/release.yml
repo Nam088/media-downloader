@@ -194,7 +194,7 @@ jobs:
       # local dev script copies the system ffmpeg by design, so this guard is
       # what keeps that convenience from ever reaching a release.
       - name: Verify the ffmpeg sidecar is self-contained
-        if: matrix.platform == 'macos-latest'
+        if: matrix.platform == 'macos-latest' || matrix.platform == 'macos-13'
         run: |
           LEAKED=$(otool -L "src-tauri/binaries/${{ matrix.ffmpeg_dest_name }}" | tail -n +2 | grep -vE '/System/|/usr/lib/' || true)
           if [ -n "$LEAKED" ]; then
@@ -203,8 +203,8 @@ jobs:
             exit 1
           fi
           ARCH=$(lipo -archs "src-tauri/binaries/${{ matrix.ffmpeg_dest_name }}")
-          if [ "$ARCH" != "arm64" ]; then
-            echo "::error::ffmpeg sidecar is $ARCH, but the target is aarch64-apple-darwin"
+          if [ "$ARCH" != "${{ matrix.expected_lipo_arch }}" ]; then
+            echo "::error::ffmpeg sidecar is $ARCH, but the target is ${{ matrix.target }}"
             exit 1
           fi
 
