@@ -42,8 +42,11 @@ Grab the installer for your OS from the [Releases](../../releases) page — ever
 | OS | Formats |
 |---|---|
 | Windows | `.msi`, `.exe` (NSIS) |
-| macOS (Apple Silicon) | `.dmg` |
+| macOS (Apple Silicon) | `.dmg` (filename ends in `_aarch64.dmg`) |
+| macOS (Intel) | `.dmg` (filename ends in `_x64.dmg`) |
 | Linux | `.deb`, `.rpm`, `.AppImage` |
+
+Not sure which Mac you have? Apple menu → **About This Mac** → **Chip**: "Apple M1/M2/M3/M4" is Apple Silicon, "Intel" is Intel.
 
 No need to separately install Python, Node.js, or ffmpeg — everything is bundled in the installer.
 

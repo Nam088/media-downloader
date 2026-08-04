@@ -42,8 +42,11 @@ Tải bản cài đặt cho hệ điều hành của bạn tại trang [Releases
 | Hệ điều hành | Định dạng |
 |---|---|
 | Windows | `.msi`, `.exe` (NSIS) |
-| macOS (Apple Silicon) | `.dmg` |
+| macOS (Apple Silicon) | `.dmg` (tên file kết thúc bằng `_aarch64.dmg`) |
+| macOS (Intel) | `.dmg` (tên file kết thúc bằng `_x64.dmg`) |
 | Linux | `.deb`, `.rpm`, `.AppImage` |
+
+Không biết Mac của bạn dùng chip gì? Vào menu Apple → **About This Mac** → **Chip**: "Apple M1/M2/M3/M4" là Apple Silicon, "Intel" là Intel.
 
 Không cần cài Python, Node.js hay ffmpeg riêng — toàn bộ đã được đóng gói sẵn trong bộ cài.
 
