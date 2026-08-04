@@ -46,11 +46,28 @@ jobs:
             ytdlp_zip_asset: yt-dlp_linux.zip
             ytdlp_exe_name: yt-dlp_linux
             ffmpeg_dest_name: ffmpeg-x86_64-unknown-linux-gnu
+          # macos-latest is an Apple Silicon runner. macos-13 below is a
+          # genuine Intel runner — not a cross-compile — so the x86_64 build
+          # can be smoke-tested by actually running it (see the smoke-test
+          # step further down).
           - platform: macos-latest
             target: aarch64-apple-darwin
             ytdlp_zip_asset: yt-dlp_macos.zip
             ytdlp_exe_name: yt-dlp_macos
             ffmpeg_dest_name: ffmpeg-aarch64-apple-darwin
+            ffmpeg_arch: arm64
+            expected_lipo_arch: arm64
+          - platform: macos-13
+            target: x86_64-apple-darwin
+            ytdlp_zip_asset: yt-dlp_macos.zip
+            ytdlp_exe_name: yt-dlp_macos
+            ffmpeg_dest_name: ffmpeg-x86_64-apple-darwin
+            # martin-riedl.de's URL path segment is "amd64", not "x64" —
+            # verified by hand: the "x64" segment 404s, "amd64" resolves.
+            ffmpeg_arch: amd64
+            # `lipo -archs` reports "x86_64" for this build, a different
+            # string than the URL's "amd64" segment above.
+            expected_lipo_arch: x86_64
 
     runs-on: ${{ matrix.platform }}
     steps:
