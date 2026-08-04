@@ -19,6 +19,17 @@ from `steps.asset.outputs.tag` (derived from
 `github.event.workflow_run.head_branch`), not `github.event.release.tag_name`.
 Task 6 below is written against this new baseline.
 
+**Task 1-4 superseded during live validation (2026-08-04):** Task 7's real
+CI run exposed that `macos-13` (Tasks 1-4's Intel runner) was retired by
+GitHub on 2025-12-04 — the job queued forever with no runner ever picking it
+up. Rather than move to `macos-15-intel` (a runner GitHub itself says it
+will also remove, by 2027-08, since Apple ended Intel support), both macOS
+legs now run on `macos-latest` and the `x86_64-apple-darwin` one is
+cross-compiled with Rosetta 2 installed for smoke-testing. Tasks 1-4's code
+blocks below are kept for the historical record of what was actually typed
+and committed, not as the current state — see `.github/workflows/release.yml`
+directly for that.
+
 ---
 
 ## File Structure

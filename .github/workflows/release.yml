@@ -46,10 +46,16 @@ jobs:
             ytdlp_zip_asset: yt-dlp_linux.zip
             ytdlp_exe_name: yt-dlp_linux
             ffmpeg_dest_name: ffmpeg-x86_64-unknown-linux-gnu
-          # macos-latest is an Apple Silicon runner. macos-13 below is a
-          # genuine Intel runner — not a cross-compile — so the x86_64 build
-          # can be smoke-tested by actually running it (see the smoke-test
-          # step further down).
+          # Both macOS legs run on the same Apple Silicon runner. There is
+          # no dedicated Intel macOS runner anymore — macos-13 (the last one)
+          # was retired by GitHub on 2025-12-04, and its replacement label
+          # (macos-15-intel) is itself only guaranteed until 2027-08 (Apple
+          # has ended Intel support; GitHub is winding the whole lineage
+          # down). Cross-compiling x86_64-apple-darwin from this arm64 host
+          # instead — via Rosetta 2, installed in a dedicated step further
+          # down — has no such expiration: it only depends on Apple
+          # continuing to ship Rosetta, which every Apple Silicon Mac still
+          # needs for its own Intel app compatibility.
           - platform: macos-latest
             target: aarch64-apple-darwin
             ytdlp_zip_asset: yt-dlp_macos.zip
@@ -57,7 +63,7 @@ jobs:
             ffmpeg_dest_name: ffmpeg-aarch64-apple-darwin
             ffmpeg_arch: arm64
             expected_lipo_arch: arm64
-          - platform: macos-13
+          - platform: macos-latest
             target: x86_64-apple-darwin
             ytdlp_zip_asset: yt-dlp_macos.zip
             ytdlp_exe_name: yt-dlp_macos
@@ -134,18 +140,48 @@ jobs:
           unzip -q yt-dlp-onedir.zip -d src-tauri/binaries/yt-dlp-onedir
           chmod +x "src-tauri/binaries/yt-dlp-onedir/${{ matrix.ytdlp_exe_name }}" || true
 
+      # PyInstaller bundles whatever architecture the Python interpreter
+      # invoking it actually is — it does not take a "--target-arch" that
+      # reliably overrides that on macOS. actions/setup-python's arm64
+      # interpreter (above) would make PyInstaller produce an arm64
+      # gallery-dl even on the x86_64-apple-darwin leg, defeating the whole
+      # point of this leg existing.
+      #
+      # `arch -x86_64 python3` on a universal2 interpreter is the tempting
+      # shortcut, but multiple open actions/setup-python and PyInstaller
+      # issues report it silently not being honored by the tools invoked
+      # underneath — unreliable enough not to build a release pipeline on.
+      #
+      # Installing a *second*, genuinely single-arch x86_64 Homebrew into
+      # /usr/local (the arm64 one already on this runner lives at
+      # /opt/homebrew — Homebrew's own documented convention for running
+      # both side by side) and getting Python from it sidesteps the
+      # ambiguity entirely: that Python binary has only one Mach-O slice, so
+      # macOS routes every process spawned from it through Rosetta with no
+      # arch selection for any downstream tool to get wrong.
+      - name: Install Rosetta 2 and an x86_64 Homebrew Python (Intel cross-build only)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          softwareupdate --install-rosetta --agree-to-license
+          arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          arch -x86_64 /usr/local/bin/brew install python@3.12
+          echo "PYTHON_BIN=/usr/local/bin/python3.12" >> "$GITHUB_ENV"
+
       # gallery-dl has no official standalone build for macOS, and its
       # official Windows/Linux builds are PyInstaller `--onefile` (same
       # slow-relaunch problem yt-dlp had before onedir). Self-building
       # `--onedir` for every platform, using gallery-dl's own official
       # PyInstaller hook (scripts/pyinstaller-hooks/hook-gallery_dl.py),
       # sidesteps both — see scripts/build-gallery-dl-onedir.sh.
+      #
+      # PYTHON_BIN is only set (above) on the x86_64-apple-darwin leg; every
+      # other leg falls back to the script's own `python3` default.
       - name: Build gallery-dl onedir resource (${{ matrix.platform }})
         shell: bash
         run: bash scripts/build-gallery-dl-onedir.sh
 
       - name: Smoke-test onedir binaries run natively (macOS)
-        if: matrix.platform == 'macos-latest' || matrix.platform == 'macos-13'
+        if: endsWith(matrix.target, 'apple-darwin')
         run: |
           "src-tauri/binaries/yt-dlp-onedir/${{ matrix.ytdlp_exe_name }}" --version
           "src-tauri/binaries/gallery-dl-onedir/gallery-dl" --version
@@ -186,7 +222,7 @@ jobs:
       # outside /System and /usr/lib, so it carries no dependency the target
       # machine has to already have.
       - name: Fetch ffmpeg sidecar (macOS)
-        if: matrix.platform == 'macos-latest' || matrix.platform == 'macos-13'
+        if: endsWith(matrix.target, 'apple-darwin')
         run: |
           curl -fL "https://ffmpeg.martin-riedl.de/redirect/latest/macos/${{ matrix.ffmpeg_arch }}/release/ffmpeg.zip" -o ffmpeg.zip
           unzip -q ffmpeg.zip
@@ -199,7 +235,7 @@ jobs:
       # local dev script copies the system ffmpeg by design, so this guard is
       # what keeps that convenience from ever reaching a release.
       - name: Verify the ffmpeg sidecar is self-contained
-        if: matrix.platform == 'macos-latest' || matrix.platform == 'macos-13'
+        if: endsWith(matrix.target, 'apple-darwin')
         run: |
           LEAKED=$(otool -L "src-tauri/binaries/${{ matrix.ffmpeg_dest_name }}" | tail -n +2 | grep -vE '/System/|/usr/lib/' || true)
           if [ -n "$LEAKED" ]; then

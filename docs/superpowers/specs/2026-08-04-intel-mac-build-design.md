@@ -1,5 +1,18 @@
 # Intel Mac (x86_64-apple-darwin) build support
 
+> **Superseded during implementation (2026-08-04):** this spec's design used
+> `macos-13` as a genuine Intel runner. That plan hit reality during Task 7's
+> live CI validation: `macos-13` was retired by GitHub on 2025-12-04 (its
+> replacement, `macos-15-intel`, only lasts until 2027-08 before GitHub drops
+> Intel macOS runners entirely, per Apple ending Intel support). The build
+> was reworked to cross-compile `x86_64-apple-darwin` from the same
+> `macos-latest` (Apple Silicon) runner via Rosetta 2, which has no
+> expiration tied to GitHub's runner lineup. Every mention of `macos-13`
+> below is the original (now-abandoned) design — kept for the record of what
+> was tried and why it didn't survive contact with real CI, not as current
+> instructions. See `.github/workflows/release.yml`'s own comments for the
+> actual current design.
+
 ## Problem
 
 Release CI (`.github/workflows/release.yml`) only builds macOS for
