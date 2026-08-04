@@ -7,17 +7,31 @@ cask "media-downloader" do
   # up the real asset name and sha256 from the release itself each time
   # instead of reconstructing either from this version string.
   version "0.1.4"
-  sha256 "544dc8de2ed1af8f1e392794774ecd253bff26463aafb98a696cf44f28cf5d32"
 
-  url "https://github.com/Nam088/media-downloader/releases/download/v#{version}/Media.Downloader_0.1.4_aarch64.dmg"
+  # update-cask.yml rewrites everything between these two markers wholesale
+  # on every published release — don't hand-edit the URLs/checksums here,
+  # they'll be overwritten on the next release anyway. on_intel is a
+  # placeholder pointing at the arm64 asset until release CI actually builds
+  # an Intel dmg (see docs/superpowers/plans/2026-08-04-intel-mac-build.md).
+  # CASK_ARCH_URLS_START
+  on_arm do
+    sha256 "544dc8de2ed1af8f1e392794774ecd253bff26463aafb98a696cf44f28cf5d32"
+
+    url "https://github.com/Nam088/media-downloader/releases/download/v#{version}/Media.Downloader_0.1.4_aarch64.dmg"
+  end
+  on_intel do
+    sha256 "544dc8de2ed1af8f1e392794774ecd253bff26463aafb98a696cf44f28cf5d32"
+
+    url "https://github.com/Nam088/media-downloader/releases/download/v#{version}/Media.Downloader_0.1.4_aarch64.dmg"
+  end
+
+  # CASK_ARCH_URLS_END
+
   name "Media Downloader"
   desc "Download video and audio from YouTube and 1000+ other sites"
   homepage "https://github.com/Nam088/media-downloader"
 
-  # Release CI only builds aarch64-apple-darwin today — installing this cask
-  # on an Intel Mac would silently ship a binary that can't run at all, so
-  # fail the install with a clear reason instead.
-  depends_on arch: :arm64
+  depends_on :macos
 
   app "Media Downloader.app"
 
