@@ -48,42 +48,77 @@ jobs:
           # even if the asset lookup had succeeded.
           ref: main
 
-      - name: Find the macOS asset and its real download URL
+      - name: Find the macOS assets and their real download URLs
         id: asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.event.workflow_run.head_branch }}
         run: |
-          ASSET_JSON=$(gh release view "$TAG" \
-            --repo ${{ github.repository }} \
-            --json assets \
-            --jq '.assets[] | select(.name | endswith("aarch64.dmg"))')
-          if [ -z "$ASSET_JSON" ]; then
+          find_asset() {
+            local suffix="$1"
+            gh release view "$TAG" \
+              --repo ${{ github.repository }} \
+              --json assets \
+              --jq ".assets[] | select(.name | endswith(\"$suffix\"))"
+          }
+
+          ARM_JSON=$(find_asset "aarch64.dmg")
+          if [ -z "$ARM_JSON" ]; then
             echo "::error::No aarch64 .dmg asset found on $TAG — skipping cask update"
             exit 1
           fi
-          NAME=$(echo "$ASSET_JSON" | jq -r '.name')
-          URL=$(echo "$ASSET_JSON" | jq -r '.url')
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "name=$NAME" >> "$GITHUB_OUTPUT"
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
 
-      - name: Download it and compute the checksum
+          # Tauri's dmg filename suffix for x86_64-apple-darwin, confirmed
+          # against a real release build before relying on it in production.
+          INTEL_JSON=$(find_asset "x64.dmg")
+          if [ -z "$INTEL_JSON" ]; then
+            echo "::error::No x64 .dmg asset found on $TAG — skipping cask update"
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "arm_name=$(echo "$ARM_JSON" | jq -r '.name')" >> "$GITHUB_OUTPUT"
+          echo "arm_url=$(echo "$ARM_JSON" | jq -r '.url')" >> "$GITHUB_OUTPUT"
+          echo "intel_name=$(echo "$INTEL_JSON" | jq -r '.name')" >> "$GITHUB_OUTPUT"
+          echo "intel_url=$(echo "$INTEL_JSON" | jq -r '.url')" >> "$GITHUB_OUTPUT"
+
+      - name: Download both assets and compute their checksums
         run: |
-          curl -fL "${{ steps.asset.outputs.url }}" -o asset.dmg
-          echo "sha256=$(shasum -a 256 asset.dmg | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          curl -fL "${{ steps.asset.outputs.arm_url }}" -o arm.dmg
+          curl -fL "${{ steps.asset.outputs.intel_url }}" -o intel.dmg
+          echo "arm_sha256=$(shasum -a 256 arm.dmg | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          echo "intel_sha256=$(shasum -a 256 intel.dmg | cut -d' ' -f1)" >> "$GITHUB_ENV"
 
       - name: Update Casks/media-downloader.rb
         env:
           TAG: ${{ steps.asset.outputs.tag }}
-          ASSET_NAME: ${{ steps.asset.outputs.name }}
+          ARM_NAME: ${{ steps.asset.outputs.arm_name }}
+          INTEL_NAME: ${{ steps.asset.outputs.intel_name }}
         run: |
           VERSION="${TAG#v}"
-          sed -i \
-            -e "s/^  version \".*\"/  version \"$VERSION\"/" \
-            -e "s/^  sha256 \".*\"/  sha256 \"$sha256\"/" \
-            -e "s#^  url \".*\"#  url \"https://github.com/${{ github.repository }}/releases/download/$TAG/$ASSET_NAME\"#" \
-            Casks/media-downloader.rb
+          ARM_URL="https://github.com/${{ github.repository }}/releases/download/$TAG/$ARM_NAME"
+          INTEL_URL="https://github.com/${{ github.repository }}/releases/download/$TAG/$INTEL_NAME"
+
+          sed -i -e "s/^  version \".*\"/  version \"$VERSION\"/" Casks/media-downloader.rb
+
+          export NEW_BLOCK=$(cat <<EOF
+            # CASK_ARCH_URLS_START
+            on_arm do
+              sha256 "$arm_sha256"
+
+              url "$ARM_URL"
+            end
+            on_intel do
+              sha256 "$intel_sha256"
+
+              url "$INTEL_URL"
+            end
+
+            # CASK_ARCH_URLS_END
+          EOF
+          )
+
+          perl -0777 -pi -e 's/  # CASK_ARCH_URLS_START.*?# CASK_ARCH_URLS_END/$ENV{NEW_BLOCK}/s' Casks/media-downloader.rb
           cat Casks/media-downloader.rb
 
       - name: Commit and push
