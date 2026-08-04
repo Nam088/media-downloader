@@ -10,6 +10,15 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-04-intel-mac-build-design.md`
 
+**Prerequisite fix already applied (commits `f716bb3`, `8f34970`):** the Cask
+was 3 releases stale (still pointing at v0.1.1) because `update-cask.yml`'s
+`release: published` trigger never reliably fired — it raced ahead of asset
+uploads for v0.1.3 and never fired at all for v0.1.4. The trigger is now
+`workflow_run` off `release.yml`'s completion, and the tag name is sourced
+from `steps.asset.outputs.tag` (derived from
+`github.event.workflow_run.head_branch`), not `github.event.release.tag_name`.
+Task 6 below is written against this new baseline.
+
 ---
 
 ## File Structure
@@ -326,25 +335,36 @@ git commit -m "chore: split Cask url/sha256 into on_arm/on_intel blocks"
 
 - [ ] **Step 1: Replace the single-asset lookup with a two-asset lookup**
 
-Replace the `Find the macOS asset and its real download URL` step (current
-lines 28-44):
+> **Baseline note:** `update-cask.yml`'s trigger was changed from
+> `release: published` to `workflow_run` (off `release.yml` completing) in a
+> prerequisite fix, because the `release` webhook proved unreliable in
+> production (raced ahead of asset uploads for v0.1.3, never fired at all
+> for v0.1.4). The tag name is now available as `steps.asset.outputs.tag`
+> (sourced from `github.event.workflow_run.head_branch` inside this same
+> step), not `github.event.release.tag_name`. The step below already
+> reflects that baseline — this task only adds the second (Intel) asset
+> lookup on top of it.
+
+Replace the current `Find the macOS asset and its real download URL` step:
 
 ```yaml
       - name: Find the macOS asset and its real download URL
         id: asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.workflow_run.head_branch }}
         run: |
-          ASSET_JSON=$(gh release view "${{ github.event.release.tag_name }}" \
+          ASSET_JSON=$(gh release view "$TAG" \
             --repo ${{ github.repository }} \
             --json assets \
             --jq '.assets[] | select(.name | endswith("aarch64.dmg"))')
           if [ -z "$ASSET_JSON" ]; then
-            echo "::error::No aarch64 .dmg asset found on ${{ github.event.release.tag_name }} — skipping cask update"
+            echo "::error::No aarch64 .dmg asset found on $TAG — skipping cask update"
             exit 1
           fi
           NAME=$(echo "$ASSET_JSON" | jq -r '.name')
           URL=$(echo "$ASSET_JSON" | jq -r '.url')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "url=$URL" >> "$GITHUB_OUTPUT"
 ```
@@ -356,10 +376,11 @@ with:
         id: asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.workflow_run.head_branch }}
         run: |
           find_asset() {
             local suffix="$1"
-            gh release view "${{ github.event.release.tag_name }}" \
+            gh release view "$TAG" \
               --repo ${{ github.repository }} \
               --json assets \
               --jq ".assets[] | select(.name | endswith(\"$suffix\"))"
@@ -367,7 +388,7 @@ with:
 
           ARM_JSON=$(find_asset "aarch64.dmg")
           if [ -z "$ARM_JSON" ]; then
-            echo "::error::No aarch64 .dmg asset found on ${{ github.event.release.tag_name }} — skipping cask update"
+            echo "::error::No aarch64 .dmg asset found on $TAG — skipping cask update"
             exit 1
           fi
 
@@ -375,10 +396,11 @@ with:
           # against a real release build before relying on it in production.
           INTEL_JSON=$(find_asset "x64.dmg")
           if [ -z "$INTEL_JSON" ]; then
-            echo "::error::No x64 .dmg asset found on ${{ github.event.release.tag_name }} — skipping cask update"
+            echo "::error::No x64 .dmg asset found on $TAG — skipping cask update"
             exit 1
           fi
 
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "arm_name=$(echo "$ARM_JSON" | jq -r '.name')" >> "$GITHUB_OUTPUT"
           echo "arm_url=$(echo "$ARM_JSON" | jq -r '.url')" >> "$GITHUB_OUTPUT"
           echo "intel_name=$(echo "$INTEL_JSON" | jq -r '.name')" >> "$GITHUB_OUTPUT"
@@ -416,12 +438,12 @@ with:
 
 - [ ] **Step 3: Rewrite the Cask's version field and the marked arch block**
 
-Replace the `Update Casks/media-downloader.rb` step:
+Replace the current `Update Casks/media-downloader.rb` step:
 
 ```yaml
       - name: Update Casks/media-downloader.rb
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ steps.asset.outputs.tag }}
           ASSET_NAME: ${{ steps.asset.outputs.name }}
         run: |
           VERSION="${TAG#v}"
@@ -438,7 +460,7 @@ with:
 ```yaml
       - name: Update Casks/media-downloader.rb
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ steps.asset.outputs.tag }}
           ARM_NAME: ${{ steps.asset.outputs.arm_name }}
           INTEL_NAME: ${{ steps.asset.outputs.intel_name }}
         run: |
