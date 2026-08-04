@@ -144,11 +144,18 @@ inside conditional blocks).
 
 ## Risks / open questions
 
-- `macos-13` is an older GitHub-hosted image; GitHub has signaled eventual
-  deprecation of Intel macOS runners industry-wide. When that happens this
-  leg will need a different Intel-capable runner or fall back to
-  cross-compilation + `otool`/`lipo`-only verification (no native smoke
-  test). Not a blocker today.
-- The Intel `.dmg` asset's exact filename/suffix from Tauri is unverified
-  until the first CI run produces it — `update-cask.yml`'s asset-matching
-  pattern must be checked against the real name before relying on it.
+- ~~`macos-13` is an older GitHub-hosted image...~~ **Resolved, the hard
+  way:** this happened during Task 7's live validation, not on a schedule —
+  `macos-13` was already fully retired (2025-12-04) by the time this was
+  implemented, and the Intel leg queued forever with no runner ever picking
+  it up. Replaced with cross-compile + Rosetta 2 on `macos-latest`, which
+  has no comparable expiration. See
+  `docs/superpowers/plans/2026-08-04-intel-mac-build.md`'s "superseded"
+  note and `.github/workflows/release.yml` for the real, current design.
+- ~~The Intel `.dmg` asset's exact filename/suffix from Tauri is
+  unverified...~~ **Confirmed by the real v0.1.5 release:** Tauri names it
+  `Media.Downloader_<version>_x64.dmg` — exactly the `"x64.dmg"` suffix
+  `update-cask.yml` was already matching on. No change needed there.
+  `update-cask.yml`'s own run
+  (https://github.com/Nam088/media-downloader/actions/runs/30882885329)
+  confirms it found both assets and rewrote the Cask correctly.
