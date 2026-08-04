@@ -181,9 +181,9 @@ jobs:
       # outside /System and /usr/lib, so it carries no dependency the target
       # machine has to already have.
       - name: Fetch ffmpeg sidecar (macOS)
-        if: matrix.platform == 'macos-latest'
+        if: matrix.platform == 'macos-latest' || matrix.platform == 'macos-13'
         run: |
-          curl -fL "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip" -o ffmpeg.zip
+          curl -fL "https://ffmpeg.martin-riedl.de/redirect/latest/macos/${{ matrix.ffmpeg_arch }}/release/ffmpeg.zip" -o ffmpeg.zip
           unzip -q ffmpeg.zip
           cp ffmpeg "src-tauri/binaries/${{ matrix.ffmpeg_dest_name }}"
           chmod +x "src-tauri/binaries/${{ matrix.ffmpeg_dest_name }}"
