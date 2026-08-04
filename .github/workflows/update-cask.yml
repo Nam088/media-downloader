@@ -5,6 +5,14 @@ name: Update Homebrew Cask
 # would actually fetch — manually editing three fields by hand every release
 # is exactly the kind of thing that gets forgotten under time pressure.
 #
+# Triggered by release.yml finishing, not by the `release: published` webhook
+# directly: that webhook fired once during v0.1.3's rollout before the dmg
+# assets had finished uploading (a real failure in production — see run
+# 30420045671, "No aarch64 .dmg asset found") and never fired at all for
+# v0.1.4 (no run exists for it whatsoever). workflow_run only fires after
+# release.yml's own job has fully completed, so by the time this runs the
+# assets it uploaded are guaranteed to already exist.
+#
 # Deliberately does NOT reconstruct the asset filename from the release tag.
 # v0.1.1 shipped a real rebuild (different sha256) while tauri.conf.json's
 # version was never bumped, so its dmg is still literally named
@@ -12,34 +20,51 @@ name: Update Homebrew Cask
 # Discovering the real asset name and download URL from the release's own
 # asset list sidesteps that mismatch entirely, whether or not it recurs.
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
 
 permissions:
   contents: write
 
 jobs:
   update-cask:
-    if: ${{ !github.event.release.prerelease && !github.event.release.draft }}
+    # Only proceed for a run that (a) actually succeeded, and (b) came from
+    # a version-tag push, matching release.yml's own `on: push: tags: v*`
+    # trigger — a workflow_dispatch run on a branch has no release to look
+    # up. head_branch holds the tag name for tag-triggered runs.
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Explicit, not left to the trigger event's default: this job
+          # commits and pushes to main, and must never end up in a
+          # detached-HEAD checkout of a tag. The old `release: published`
+          # trigger checked out the tag by default, which would have made
+          # `git push` below fail outright ("not currently on a branch")
+          # even if the asset lookup had succeeded.
+          ref: main
 
       - name: Find the macOS asset and its real download URL
         id: asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.workflow_run.head_branch }}
         run: |
-          ASSET_JSON=$(gh release view "${{ github.event.release.tag_name }}" \
+          ASSET_JSON=$(gh release view "$TAG" \
             --repo ${{ github.repository }} \
             --json assets \
             --jq '.assets[] | select(.name | endswith("aarch64.dmg"))')
           if [ -z "$ASSET_JSON" ]; then
-            echo "::error::No aarch64 .dmg asset found on ${{ github.event.release.tag_name }} — skipping cask update"
+            echo "::error::No aarch64 .dmg asset found on $TAG — skipping cask update"
             exit 1
           fi
           NAME=$(echo "$ASSET_JSON" | jq -r '.name')
           URL=$(echo "$ASSET_JSON" | jq -r '.url')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "url=$URL" >> "$GITHUB_OUTPUT"
 
@@ -50,7 +75,7 @@ jobs:
 
       - name: Update Casks/media-downloader.rb
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ steps.asset.outputs.tag }}
           ASSET_NAME: ${{ steps.asset.outputs.name }}
         run: |
           VERSION="${TAG#v}"
@@ -70,5 +95,5 @@ jobs:
             exit 0
           fi
           git add Casks/media-downloader.rb
-          git commit -m "chore: bump Homebrew Cask to ${{ github.event.release.tag_name }} [skip ci]"
+          git commit -m "chore: bump Homebrew Cask to ${{ steps.asset.outputs.tag }} [skip ci]"
           git push
