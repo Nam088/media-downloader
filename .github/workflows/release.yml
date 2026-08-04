@@ -164,7 +164,16 @@ jobs:
         run: |
           softwareupdate --install-rosetta --agree-to-license
           arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-          arch -x86_64 /usr/local/bin/brew install python@3.12
+          # The runner image ships an Apple/python.org system Python whose
+          # installer already symlinked python3.12/pip3.12/etc. into
+          # /usr/local/bin — the same prefix our x86_64 Homebrew uses. `brew
+          # install` builds python@3.12 successfully but then exits non-zero
+          # when its own final `link` step hits those pre-existing files, so
+          # `|| true` past that and finish the link explicitly with
+          # --overwrite (safe: these are stock symlinks on an ephemeral
+          # runner, not anything of ours worth preserving).
+          arch -x86_64 /usr/local/bin/brew install python@3.12 || true
+          arch -x86_64 /usr/local/bin/brew link --overwrite --force python@3.12
           echo "PYTHON_BIN=/usr/local/bin/python3.12" >> "$GITHUB_ENV"
 
       # gallery-dl has no official standalone build for macOS, and its
