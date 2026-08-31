@@ -23,10 +23,14 @@ name: Release
 # of three OS runners per push on every feature branch costs far more than
 # it catches.
 #
-# Publishing is a separate job. For `main` pushes the prepare job creates
-# the `v<version>` tag itself; manual tags still work too. Either way the
-# release job verifies the commit is on `main` rather than trusting the
-# tag name — a tag can point at any commit on any branch.
+# Publishing is a separate job. For `main` pushes the prepare job acts as a
+# release bot: scripts/auto-release.mjs reads the conventional commits since
+# the last release tag to pick the next version (feat -> minor, fix/perf ->
+# patch, BREAKING CHANGE -> major) and writes the CHANGELOG.md entry for it;
+# prepare then bumps the version files, commits all of that back to main, and
+# creates the `v<version>` tag. No manual version bump, tag, or changelog
+# editing. Manual tags still work too. Either way the release job verifies
+# the commit is on `main` rather than trusting the tag name.
 on:
   workflow_dispatch:
   push:
@@ -35,17 +39,32 @@ on:
     tags:
       - "v*"
 
+# Serialise runs: two overlapping `main` pushes would otherwise race while
+# both bump the version and push to main. Queue instead of cancel so neither
+# push's release is dropped.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  # Decides what this run is for. `main` pushes release automatically: the
-  # version in tauri.conf.json becomes `v<version>`, and if that tag does not
-  # exist yet it is created here — no manual `git tag` needed anymore. If it
-  # already exists the version was released before, so the whole run is
-  # skipped rather than rebuilding identical installers on every unrelated
-  # push to main. Manual `v*` tag pushes and workflow_dispatch runs on tag
-  # refs publish that tag; workflow_dispatch on any other ref builds only.
+  # Decides what this run is for. Pushes to `main` release automatically,
+  # like a release bot: scripts/auto-release.mjs classifies the conventional
+  # commits since the last release tag (feat -> minor, fix/perf -> patch,
+  # BREAKING CHANGE -> major), picks the next version, and writes the
+  # CHANGELOG.md entry plus RELEASE_NOTES.md. This job then bumps the four
+  # version files, commits everything back to main as
+  # `chore(release): x.y.z`, and tags the bump commit `vx.y.z`.
   #
-  # Tags pushed with GITHUB_TOKEN deliberately do not re-trigger workflows,
-  # which is exactly what prevents the auto-tag from looping back into here.
+  # A push with no feat/fix/perf/breaking commits (docs, chore, ci, ...)
+  # releases nothing — the script emits skip=true and the whole pipeline
+  # stops, so doc-only pushes do not spam releases.
+  #
+  # Manual `v*` tag pushes publish that tag unchanged; workflow_dispatch on
+  # any other ref builds only.
+  #
+  # Commits and tags pushed with GITHUB_TOKEN deliberately do not re-trigger
+  # workflows, which is what prevents the bump commit and the tag from
+  # looping back into here.
   prepare:
     runs-on: ubuntu-latest
     permissions:
@@ -53,8 +72,21 @@ jobs:
     outputs:
       run: ${{ steps.resolve.outputs.run }}
       tag: ${{ steps.resolve.outputs.tag }}
+      notes: ${{ steps.resolve.outputs.notes }}
     steps:
+      # ref: main (not the triggering SHA): queued runs must release on top
+      # of whatever main points at now, including a bump commit a previous
+      # run just pushed. fetch-depth: 0 because the release script needs the
+      # full history since the last tag, and the ancestry check further down
+      # needs main and the release commit in the same clone.
       - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
       - id: resolve
         shell: bash
@@ -62,16 +94,44 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
           elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
-            VERSION=$(jq -r .version src-tauri/tauri.conf.json)
-            TAG="v$VERSION"
-            if git ls-remote --tags origin "refs/tags/$TAG" | grep -q .; then
-              echo "Version $VERSION is already released ($TAG exists). Bump the version in tauri.conf.json/package.json/Cargo.toml to release again — skipping."
+            OUT=$(node scripts/auto-release.mjs "$(date -u +%F)")
+            echo "$OUT"
+            if grep -q '^skip=true' <<< "$OUT"; then
+              echo "No feat/fix/perf/breaking commits since the last release — nothing to release."
               echo "run=skip" >> "$GITHUB_OUTPUT"
               exit 0
             fi
+            NEW=$(grep '^version=' <<< "$OUT" | cut -d= -f2)
+            TAG="v$NEW"
+
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+
+            jq ".version = \"$NEW\"" package.json > package.json.tmp && mv package.json.tmp package.json
+            jq ".version = \"$NEW\"" src-tauri/tauri.conf.json > src-tauri/tauri.conf.json.tmp && mv src-tauri/tauri.conf.json.tmp src-tauri/tauri.conf.json
+            sed -i "0,/^version = \".*\"/s//version = \"$NEW\"/" src-tauri/Cargo.toml
+            python3 - "$NEW" <<'EOF'
+          import re, sys
+          new = sys.argv[1]
+          path = "src-tauri/Cargo.lock"
+          content = open(path).read()
+          content = re.sub(r'(name = "media-downloader"\nversion = )"[^"]+"', r'\g<1>"%s"' % new, content, count=1)
+          open(path, "w").write(content)
+          EOF
+
+            git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock CHANGELOG.md
+            git commit -m "chore(release): $NEW [skip ci]"
+            git push origin main
             git tag "$TAG"
             git push origin "$TAG"
-            echo "Created and pushed $TAG from tauri.conf.json version $VERSION"
+            echo "Released $NEW as $TAG"
+
+            # Multiline output for the release job's body.
+            {
+              echo 'notes<<__NOTES_EOF__'
+              cat RELEASE_NOTES.md
+              echo '__NOTES_EOF__'
+            } >> "$GITHUB_OUTPUT"
           else
             echo "workflow_dispatch on a non-tag ref: build only, nothing will be published."
             echo "run=go" >> "$GITHUB_OUTPUT"
@@ -128,7 +188,12 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
+      # Check out the tag prepare resolved, not the triggering SHA: for
+      # main-push releases the tag is the bump commit that carries the new
+      # version strings and CHANGELOG.md the installers must embed.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag || github.sha }}
 
       # Node 20 broke the build: with no `packageManager` field in
       # package.json, corepack resolved pnpm to whatever was newest — 11.17.0 —
@@ -408,9 +473,12 @@ jobs:
         with:
           # The run may be keyed on `main`, not on the tag itself (the
           # prepare job created the tag), so name and target come from its
-          # outputs rather than from github.ref.
+          # outputs rather than from github.ref. The body is the changelog
+          # entry the release bot generated; for manual-tag runs it is empty
+          # and generate_release_notes takes over.
           tag_name: ${{ needs.prepare.outputs.tag }}
           target_commitish: ${{ github.sha }}
+          body: ${{ needs.prepare.outputs.notes }}
           files: artifacts/**/*
           fail_on_unmatched_files: true
           generate_release_notes: true

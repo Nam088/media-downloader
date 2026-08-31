@@ -67,3 +67,7 @@ __pycache__/
 scripts/build/
 scripts/dist/
 scripts/*.spec
+
+# Transient release-bot output (scripts/auto-release.mjs); the content ends
+# up in CHANGELOG.md and on the GitHub release, never in the repo itself.
+RELEASE_NOTES.md
