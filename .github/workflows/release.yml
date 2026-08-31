@@ -15,11 +15,9 @@ name: Release
 # additionally has no official standalone build for macOS at all, so its
 # onedir build is compiled ourselves in CI for every platform
 # (scripts/build-gallery-dl-onedir.sh) rather than downloaded.
-# `main` and `develop` build on every push so a broken build is caught on the
-# branch that caused it. Any other branch can still be built on demand from the
-# Actions tab — `workflow_dispatch` lets you pick the ref — but is not built
-# automatically, because a matrix of three OS runners per push on every feature
-# branch costs far more than it catches.
+# The build runs on demand from the Actions tab (workflow_dispatch, any ref)
+# or on a `v*` tag push. Regular pushes do not build — a matrix of three OS
+# runners per push on every branch costs far more than it catches.
 #
 # Publishing is a separate job and happens only for a `v*` tag whose commit is
 # on `main`. The tag alone is not enough: a tag can point at any commit on any
@@ -198,9 +196,8 @@ jobs:
       # ---- ffmpeg sidecar ---------------------------------------------
       # Linux/Windows: BtbN/FFmpeg-Builds "gpl" static builds — no shared
       # library dependencies, safe to redistribute inside the installer.
-      # NOTE: pin to a specific release tag instead of "latest" before a
-      # real production release, so builds are reproducible and don't
-      # silently pick up an upstream ffmpeg regression.
+      # Tracks "latest" deliberately, same policy as yt-dlp and gallery-dl:
+      # every release should ship current upstream fixes.
       - name: Fetch ffmpeg sidecar (Linux)
         if: matrix.platform == 'ubuntu-latest'
         run: |

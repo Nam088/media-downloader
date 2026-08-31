@@ -26,9 +26,10 @@ DEST_DIR="$REPO_ROOT/src-tauri/binaries/gallery-dl-onedir"
 BUILD_ROOT="$(mktemp -d -t gallery-dl-build.XXXXXX)"
 trap 'rm -rf "$BUILD_ROOT"' EXIT
 
-GALLERY_DL_VERSION="${GALLERY_DL_VERSION:-1.32.8}"
-
-echo "Building gallery-dl $GALLERY_DL_VERSION onedir binary (target: $(uname -s))..."
+# Default to latest, same policy as yt-dlp and ffmpeg in the release pipeline:
+# every build should ship current upstream fixes. Set GALLERY_DL_VERSION to pin
+# a specific release (e.g. to work around an upstream regression).
+GALLERY_DL_VERSION="${GALLERY_DL_VERSION:-latest}"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 "$PYTHON_BIN" -m venv "$BUILD_ROOT/venv"
@@ -44,7 +45,14 @@ esac
 # the following command". It works on macOS and Linux, which is exactly why
 # this only ever broke on the Windows CI runner.
 "$VENV_BIN/python" -m pip install --quiet --upgrade pip
-"$VENV_BIN/python" -m pip install --quiet "gallery-dl==$GALLERY_DL_VERSION" pyinstaller
+if [ "$GALLERY_DL_VERSION" = "latest" ]; then
+  "$VENV_BIN/python" -m pip install --quiet gallery-dl pyinstaller
+else
+  "$VENV_BIN/python" -m pip install --quiet "gallery-dl==$GALLERY_DL_VERSION" pyinstaller
+fi
+
+GALLERY_DL_RESOLVED="$("$VENV_BIN/python" -c 'import gallery_dl; print(gallery_dl.version.__version__)')"
+echo "Building gallery-dl $GALLERY_DL_RESOLVED onedir binary (target: $(uname -s))..."
 
 GALLERY_DL_PKG_DIR="$("$VENV_BIN/python" -c 'import gallery_dl, os; print(os.path.dirname(gallery_dl.__file__))')"
 
