@@ -5,7 +5,8 @@ name: Release
 # data directory at first run by ytdlp_binary::resolve_ytdlp_executable /
 # gallery_dl_binary::resolve_gallery_dl_executable) and ffmpeg bundled as an
 # externalBin sidecar (FR-018/SC-008) — end users never install anything
-# beyond this one installer. Triggered manually or on a version tag.
+# beyond this one installer. Triggered by pushes to `main` (auto-tagged), by
+# a manual `v*` tag, or manually from the Actions tab.
 #
 # Both ship as onedir (executable + a pre-unpacked Python runtime folder)
 # rather than the single-file "onefile" build: onefile re-extracts its entire
@@ -15,21 +16,73 @@ name: Release
 # additionally has no official standalone build for macOS at all, so its
 # onedir build is compiled ourselves in CI for every platform
 # (scripts/build-gallery-dl-onedir.sh) rather than downloaded.
-# The build runs on demand from the Actions tab (workflow_dispatch, any ref)
-# or on a `v*` tag push. Regular pushes do not build — a matrix of three OS
-# runners per push on every branch costs far more than it catches.
+# Pushes to `main` build — and release, if the version in tauri.conf.json
+# has not been released yet (see the prepare job below). Any other branch
+# can still be built on demand from the Actions tab (`workflow_dispatch`
+# lets you pick the ref) but is not built automatically, because a matrix
+# of three OS runners per push on every feature branch costs far more than
+# it catches.
 #
-# Publishing is a separate job and happens only for a `v*` tag whose commit is
-# on `main`. The tag alone is not enough: a tag can point at any commit on any
-# branch, so the release job verifies ancestry rather than trusting the name.
+# Publishing is a separate job. For `main` pushes the prepare job creates
+# the `v<version>` tag itself; manual tags still work too. Either way the
+# release job verifies the commit is on `main` rather than trusting the
+# tag name — a tag can point at any commit on any branch.
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - "v*"
 
 jobs:
+  # Decides what this run is for. `main` pushes release automatically: the
+  # version in tauri.conf.json becomes `v<version>`, and if that tag does not
+  # exist yet it is created here — no manual `git tag` needed anymore. If it
+  # already exists the version was released before, so the whole run is
+  # skipped rather than rebuilding identical installers on every unrelated
+  # push to main. Manual `v*` tag pushes and workflow_dispatch runs on tag
+  # refs publish that tag; workflow_dispatch on any other ref builds only.
+  #
+  # Tags pushed with GITHUB_TOKEN deliberately do not re-trigger workflows,
+  # which is exactly what prevents the auto-tag from looping back into here.
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      run: ${{ steps.resolve.outputs.run }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: resolve
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            VERSION=$(jq -r .version src-tauri/tauri.conf.json)
+            TAG="v$VERSION"
+            if git ls-remote --tags origin "refs/tags/$TAG" | grep -q .; then
+              echo "Version $VERSION is already released ($TAG exists). Bump the version in tauri.conf.json/package.json/Cargo.toml to release again — skipping."
+              echo "run=skip" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            git tag "$TAG"
+            git push origin "$TAG"
+            echo "Created and pushed $TAG from tauri.conf.json version $VERSION"
+          else
+            echo "workflow_dispatch on a non-tag ref: build only, nothing will be published."
+            echo "run=go" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "run=go" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: prepare
+    if: needs.prepare.outputs.run == 'go'
     strategy:
       fail-fast: false
       matrix:
@@ -322,8 +375,8 @@ jobs:
   # matrix would publish whichever runner finished first, then race the others
   # into the same release.
   release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [prepare, build]
+    if: needs.prepare.outputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -342,7 +395,7 @@ jobs:
         run: |
           git fetch origin main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::Tag $GITHUB_REF_NAME points at a commit that is not on main. Merge to main first, then tag."
+            echo "::error::Tag ${{ needs.prepare.outputs.tag }} points at a commit that is not on main. Merge to main first, then release."
             exit 1
           fi
 
@@ -353,6 +406,11 @@ jobs:
       - name: Publish the installers
         uses: softprops/action-gh-release@v2
         with:
+          # The run may be keyed on `main`, not on the tag itself (the
+          # prepare job created the tag), so name and target come from its
+          # outputs rather than from github.ref.
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: artifacts/**/*
           fail_on_unmatched_files: true
           generate_release_notes: true

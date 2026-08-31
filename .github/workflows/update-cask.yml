@@ -29,13 +29,12 @@ permissions:
 
 jobs:
   update-cask:
-    # Only proceed for a run that (a) actually succeeded, and (b) came from
-    # a version-tag push, matching release.yml's own `on: push: tags: v*`
-    # trigger — a workflow_dispatch run on a branch has no release to look
-    # up. head_branch holds the tag name for tag-triggered runs.
-    if: >
-      github.event.workflow_run.conclusion == 'success' &&
-      startsWith(github.event.workflow_run.head_branch, 'v')
+    # Only proceed for a run that actually succeeded. It used to also require
+    # a version-tag head_branch, but release.yml now releases from pushes to
+    # `main` too (head_branch `main`), so the tag is resolved below instead:
+    # use the head_branch when it is a tag, else fall back to the newest
+    # published release.
+    if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,8 +51,15 @@ jobs:
         id: asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.workflow_run.head_branch }}
         run: |
+          TAG="${{ github.event.workflow_run.head_branch }}"
+          if [[ "$TAG" != v* ]]; then
+            # main-triggered release (or a build-only dispatch): resolve the
+            # newest published release instead of trusting head_branch.
+            TAG=$(gh release view --repo ${{ github.repository }} --json tagName -q .tagName)
+          fi
+          echo "Updating cask for release $TAG"
+
           find_asset() {
             local suffix="$1"
             gh release view "$TAG" \
