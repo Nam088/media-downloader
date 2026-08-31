@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Media Downloader",
-  "version": "0.1.6",
+  "version": "1.0.0",
   "identifier": "io.github.nam088.mediadownloader",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -39,7 +39,13 @@
       "assetProtocol": {
         "enable": true,
         "scope": {
-          "allow": ["$DOWNLOAD/**", "$VIDEO/**", "$AUDIO/**", "$PICTURE/**", "$APPDATA/thumbnails/**"],
+          "allow": [
+            "$DOWNLOAD/**",
+            "$VIDEO/**",
+            "$AUDIO/**",
+            "$PICTURE/**",
+            "$APPDATA/thumbnails/**"
+          ],
           "deny": [],
           "requireLiteralLeadingDot": true
         }
@@ -56,7 +62,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/ffmpeg"],
+    "externalBin": [
+      "binaries/ffmpeg"
+    ],
     "resources": {
       "binaries/yt-dlp-onedir": "yt-dlp-onedir",
       "binaries/gallery-dl-onedir": "gallery-dl-onedir"
