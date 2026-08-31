@@ -1,6 +1,6 @@
 [package]
 name = "media-downloader"
-version = "1.0.0"
+version = "0.1.6"
 description = "Cross-platform desktop media downloader"
 authors = ["nam088"]
 edition = "2021"
