@@ -46,7 +46,12 @@ const perfs = [];
 for (const record of raw.split("\x01").filter(Boolean)) {
   const [hash, subject, body] = record.replace(/^\n/, "").split("\x00");
   const commit = { hash, subject };
-  if (/BREAKING[ -]CHANGE/.test(body || "") || CONV.exec(subject)?.[3] === "!") {
+  // A breaking change must be declared as a real trailer ("BREAKING CHANGE:"
+  // at the start of a line) or a `!` suffix on the type. Matching the phrase
+  // anywhere in the body false-positives on prose that merely mentions it —
+  // that once shipped an accidental 1.0.0.
+  const hasBreakingTrailer = /^BREAKING[ -]CHANGE:/m.test(body || "");
+  if (hasBreakingTrailer || CONV.exec(subject)?.[3] === "!") {
     breaking.push(commit);
     continue;
   }
