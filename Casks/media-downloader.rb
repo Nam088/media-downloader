@@ -6,7 +6,7 @@ cask "media-downloader" do
   # tag. The auto-update workflow (.github/workflows/update-cask.yml) looks
   # up the real asset name and sha256 from the release itself each time
   # instead of reconstructing either from this version string.
-  version "0.1.5"
+  version "0.1.7"
 
   # update-cask.yml rewrites everything between these two markers wholesale
   # on every published release — don't hand-edit the URLs/checksums here,
@@ -15,14 +15,14 @@ cask "media-downloader" do
   # an Intel dmg (see docs/superpowers/plans/2026-08-04-intel-mac-build.md).
   # CASK_ARCH_URLS_START
   on_arm do
-    sha256 "3023c2b48cba35a0b7439b635b336455351a3cf266723386395d3b452c59a06d"
+    sha256 "4e8b635feedf935c6bdf0949adb6335b9ed9934eaa857a582e8e3dfab2e5553d"
 
-    url "https://github.com/Nam088/media-downloader/releases/download/v0.1.5/Media.Downloader_0.1.5_aarch64.dmg"
+    url "https://github.com/Nam088/media-downloader/releases/download/v0.1.7/Media.Downloader_0.1.7_aarch64.dmg"
   end
   on_intel do
-    sha256 "c9de649716445550483ae80c46ac229b64080baf9c2e653dbacc0c7bd59da67b"
+    sha256 "a7a0ff23fc19eb2b33f8e0f9ee409cafb27bf4e4ca1af24b5c960ff6c9e7d120"
 
-    url "https://github.com/Nam088/media-downloader/releases/download/v0.1.5/Media.Downloader_0.1.5_x64.dmg"
+    url "https://github.com/Nam088/media-downloader/releases/download/v0.1.7/Media.Downloader_0.1.7_x64.dmg"
   end
 
   # CASK_ARCH_URLS_END
